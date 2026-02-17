@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { Check, Loader2, Search, FileCode, GitMerge } from "lucide-react";
+import { Check, Loader2, Search, GitMerge } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useEffect, useState, useRef } from "react";
 import { getJobStatus, type JobStatus } from "@/lib/api";
@@ -15,10 +15,8 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
   const pollRef = useRef<NodeJS.Timeout | null>(null);
 
   const steps = [
-    { id: "learning", title: "Learning Patterns", icon: Search, desc: "Analyzing existing URL mappings..." },
-    { id: "slug", title: "Slug Analysis", icon: Search, desc: "Comparing URL path structures..." },
-    { id: "meta", title: "Metadata Extraction", icon: FileCode, desc: "Analyzing <title> and og:tags..." },
-    { id: "structure", title: "Structure Matching", icon: GitMerge, desc: "Evaluating DOM depth and class signatures..." },
+    { id: "learning", title: "Learning Patterns", icon: Search, desc: "Extracting URL patterns from reference rows..." },
+    { id: "matching", title: "URL Matching", icon: GitMerge, desc: "Constructing & verifying target URLs..." },
   ];
 
   useEffect(() => {
@@ -53,8 +51,8 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
 
   const progress = job ? (job.totalUrls > 0 ? Math.round((job.processedUrls / job.totalUrls) * 100) : 0) : 0;
 
-  const currentStepId = job?.currentStep || "slug";
-  const stepOrder = ["learning", "slug", "meta", "structure", "done"];
+  const currentStepId = job?.currentStep || "learning";
+  const stepOrder = ["learning", "matching", "done"];
   const currentStepIndex = stepOrder.indexOf(currentStepId);
 
   return (
@@ -84,7 +82,7 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
       </div>
 
       <div className="p-6 grid gap-6">
-        <div className="grid grid-cols-4 gap-3">
+        <div className="grid grid-cols-2 gap-3">
           {steps.map((step, idx) => {
             const isActive = step.id === currentStepId;
             const isCompleted = currentStepIndex > idx || job?.status === "completed";

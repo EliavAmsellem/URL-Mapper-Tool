@@ -6,12 +6,12 @@ import path from "path";
 import fs from "fs";
 import { storage } from "./storage";
 import {
-  fetchPageMetadata,
-  findBestMatchOptimized,
-  learnPatternsFromExistingMappings,
-  learnSegmentMappings,
+  learnTabPatterns,
+  batchConstructUrls,
+  validatePatterns,
+  batchHeadCheck,
   clearCaches,
-  type UrlPattern,
+  type TabPatterns,
 } from "./scraper";
 import { log } from "./index";
 
@@ -86,7 +86,7 @@ export async function registerRoutes(
       const control = { cancel: false };
       activeJobs.set(jobId, control);
 
-      await storage.updateJob(jobId, { status: "processing", currentStep: "slug" });
+      await storage.updateJob(jobId, { status: "processing", currentStep: "learning" });
 
       res.json({ message: "Processing started" });
 
@@ -183,7 +183,10 @@ export async function registerRoutes(
   return httpServer;
 }
 
-async function processJob(jobId: string, threshold: number, control: { cancel: boolean }) {
+const DB_BATCH_SIZE = 200;
+const SAMPLE_SIZE = 5;
+
+async function processJob(jobId: string, _threshold: number, control: { cancel: boolean }) {
   const filePath = `/tmp/uploads/${jobId}.xlsx`;
   if (!fs.existsSync(filePath)) {
     throw new Error("Source file not found");
@@ -198,38 +201,7 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
   const targetLangs = (job.targetLanguages || ["en", "fr"]) as ("en" | "fr" | "ru" | "ar")[];
   let processedCount = 0;
   let matchedCount = 0;
-
-  await storage.updateJob(jobId, { currentStep: "learning" });
-  log("Phase 1: Learning URL patterns from existing mappings...");
-
-  const referenceRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[] = [];
-  for (const sheetName of workbook.SheetNames) {
-    const ws = workbook.Sheets[sheetName];
-    const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
-    for (let i = 1; i < data.length; i++) {
-      const row = data[i];
-      const sourceUrl = (row[1] || "").toString().trim();
-      const enUrl = (row[2] || "").toString().trim();
-      const frUrl = (row[3] || "").toString().trim();
-      if (sourceUrl && sourceUrl.startsWith("http") && (enUrl || frUrl)) {
-        referenceRows.push({
-          sourceUrl,
-          enUrl: enUrl || undefined,
-          frUrl: frUrl || undefined,
-        });
-      }
-    }
-  }
-
-  const patterns = learnPatternsFromExistingMappings(referenceRows);
-  const segmentMap = learnSegmentMappings(referenceRows);
-
-  log(`Phase 1 complete: ${referenceRows.length} reference rows, ${patterns.length} patterns learned`);
-  await storage.updateJob(jobId, { currentStep: "slug" });
-
-  const resultBatch: any[] = [];
-  const BATCH_SIZE = 50;
-  const STATUS_UPDATE_INTERVAL = 5;
+  const startTime = Date.now();
 
   for (const sheetName of workbook.SheetNames) {
     if (control.cancel) break;
@@ -238,124 +210,216 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
     const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
     if (data.length < 2) continue;
 
-    for (let i = 1; i < data.length; i++) {
-      if (control.cancel) break;
+    const tabStartTime = Date.now();
+    log(`\n=== Processing tab: "${sheetName}" (${data.length - 1} rows) ===`);
+    await storage.updateJob(jobId, { currentStep: "learning" });
 
+    const tabRefRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[] = [];
+    const allRows: {
+      rowIndex: number;
+      title: string;
+      sourceUrl: string;
+      existingEn: string;
+      existingFr: string;
+      needsEn: boolean;
+      needsFr: boolean;
+    }[] = [];
+
+    for (let i = 1; i < data.length; i++) {
       const row = data[i];
       const title = (row[0] || "").toString().trim();
-      const sourceUrl = (row[1] || "").toString().trim();
+      const rawSource = (row[1] || "").toString().trim();
       const existingEn = (row[2] || "").toString().trim();
       const existingFr = (row[3] || "").toString().trim();
 
-      processedCount++;
+      let sourceUrl = rawSource;
+      if (!sourceUrl.startsWith("http") && sourceUrl.includes("|")) {
+        const afterPipe = sourceUrl.split("|").pop()?.trim() || "";
+        if (afterPipe.startsWith("http")) sourceUrl = afterPipe;
+      }
 
-      if (!sourceUrl || !sourceUrl.startsWith("http")) {
-        continue;
+      if (!sourceUrl || !sourceUrl.startsWith("http")) continue;
+
+      if (existingEn || existingFr) {
+        tabRefRows.push({
+          sourceUrl,
+          enUrl: existingEn || undefined,
+          frUrl: existingFr || undefined,
+        });
       }
 
       const needsEn = targetLangs.includes("en") && !existingEn;
       const needsFr = targetLangs.includes("fr") && !existingFr;
 
-      if (!needsEn && !needsFr) {
-        resultBatch.push({
-          jobId,
-          sheetName,
-          rowIndex: i,
-          title,
-          sourceUrl,
-          englishUrl: existingEn || null,
-          frenchUrl: existingFr || null,
-          russianUrl: null,
-          arabicUrl: null,
-          confidenceEn: null,
-          confidenceFr: null,
-          matchMethodEn: existingEn ? "existing" : null,
-          matchMethodFr: existingFr ? "existing" : null,
-          details: {},
-        });
+      allRows.push({ rowIndex: i, title, sourceUrl, existingEn, existingFr, needsEn, needsFr });
+    }
 
-        if (resultBatch.length >= BATCH_SIZE) {
+    const tabPatterns = learnTabPatterns(tabRefRows);
+    log(`Tab "${sheetName}": ${tabRefRows.length} reference rows, ${allRows.length} total rows`);
+
+    const needsMatching = allRows.filter((r) => r.needsEn || r.needsFr);
+
+    if (needsMatching.length > 0 && (tabPatterns.enRoot.length > 0 || tabPatterns.frRoot.length > 0)) {
+      await storage.updateJob(jobId, { currentStep: "matching" });
+
+      const sampleUrls: { sourceUrl: string; lang: "en" | "fr" }[] = [];
+      const sampleCount = Math.min(SAMPLE_SIZE, needsMatching.length);
+      const step = Math.max(1, Math.floor(needsMatching.length / sampleCount));
+      for (let i = 0; i < sampleCount; i++) {
+        const row = needsMatching[i * step];
+        if (row.needsEn && tabPatterns.enRoot.length > 0) {
+          sampleUrls.push({ sourceUrl: row.sourceUrl, lang: "en" });
+        }
+        if (row.needsFr && tabPatterns.frRoot.length > 0) {
+          sampleUrls.push({ sourceUrl: row.sourceUrl, lang: "fr" });
+        }
+      }
+
+      if (tabRefRows.length >= 1) {
+        if (tabPatterns.enRoot.length > 0) tabPatterns.patternValidated.en = true;
+        if (tabPatterns.frRoot.length > 0) tabPatterns.patternValidated.fr = true;
+        log(`  Trusting patterns from ${tabRefRows.length} reference rows (EN=${tabPatterns.patternValidated.en}, FR=${tabPatterns.patternValidated.fr})`);
+      } else {
+        log(`  Validating patterns with ${sampleUrls.length} sample URLs...`);
+        await validatePatterns(tabPatterns, sampleUrls);
+        log(`  Pattern validation result: EN=${tabPatterns.patternValidated.en}, FR=${tabPatterns.patternValidated.fr}`);
+      }
+
+      const matchResults = batchConstructUrls(
+        needsMatching.map((r) => ({
+          sourceUrl: r.sourceUrl,
+          needsEn: r.needsEn,
+          needsFr: r.needsFr,
+          index: r.rowIndex,
+        })),
+        tabPatterns
+      );
+
+      const urlsToVerify: string[] = [];
+      for (const [, match] of matchResults) {
+        if (match.enUrl) urlsToVerify.push(match.enUrl);
+        if (match.frUrl) urlsToVerify.push(match.frUrl);
+      }
+
+      if (urlsToVerify.length > 0) {
+        log(`  Verifying ${urlsToVerify.length} constructed URLs with HEAD checks...`);
+        const existence = await batchHeadCheck(urlsToVerify);
+        let verified = 0;
+        for (const [, match] of matchResults) {
+          if (match.enUrl && !existence.get(match.enUrl)) {
+            match.enUrl = null;
+            match.confidenceEn = null;
+            match.matchMethodEn = null;
+          } else if (match.enUrl) {
+            verified++;
+          }
+          if (match.frUrl && !existence.get(match.frUrl)) {
+            match.frUrl = null;
+            match.confidenceFr = null;
+            match.matchMethodFr = null;
+          } else if (match.frUrl) {
+            verified++;
+          }
+        }
+        log(`  Verified: ${verified}/${urlsToVerify.length} URLs exist`);
+      }
+
+      const resultBatch: any[] = [];
+
+      for (const row of allRows) {
+        if (control.cancel) break;
+        processedCount++;
+
+        if (!row.needsEn && !row.needsFr) {
+          resultBatch.push({
+            jobId,
+            sheetName,
+            rowIndex: row.rowIndex,
+            title: row.title,
+            sourceUrl: row.sourceUrl,
+            englishUrl: row.existingEn || null,
+            frenchUrl: row.existingFr || null,
+            russianUrl: null,
+            arabicUrl: null,
+            confidenceEn: null,
+            confidenceFr: null,
+            matchMethodEn: row.existingEn ? "existing" : null,
+            matchMethodFr: row.existingFr ? "existing" : null,
+            details: {},
+          });
+        } else {
+          const match = matchResults.get(row.rowIndex);
+
+          let enUrl: string | null = row.existingEn || null;
+          let frUrl: string | null = row.existingFr || null;
+          let confidenceEn: number | null = null;
+          let confidenceFr: number | null = null;
+          let matchMethodEn: string | null = null;
+          let matchMethodFr: string | null = null;
+
+          if (match) {
+            if (match.enUrl && row.needsEn) {
+              enUrl = match.enUrl;
+              confidenceEn = match.confidenceEn;
+              matchMethodEn = match.matchMethodEn;
+              matchedCount++;
+            }
+            if (match.frUrl && row.needsFr) {
+              frUrl = match.frUrl;
+              confidenceFr = match.confidenceFr;
+              matchMethodFr = match.matchMethodFr;
+              matchedCount++;
+            }
+          }
+
+          resultBatch.push({
+            jobId,
+            sheetName,
+            rowIndex: row.rowIndex,
+            title: row.title,
+            sourceUrl: row.sourceUrl,
+            englishUrl: enUrl,
+            frenchUrl: frUrl,
+            russianUrl: null,
+            arabicUrl: null,
+            confidenceEn,
+            confidenceFr,
+            matchMethodEn,
+            matchMethodFr,
+            details: {},
+          });
+        }
+
+        if (resultBatch.length >= DB_BATCH_SIZE) {
           await storage.createResults(resultBatch);
           resultBatch.length = 0;
-        }
-
-        if (processedCount % STATUS_UPDATE_INTERVAL === 0) {
-          await storage.updateJob(jobId, { processedUrls: processedCount, matchedUrls: matchedCount });
-        }
-        continue;
-      }
-
-      const progress = processedCount / job.totalUrls;
-      const currentStep = progress < 0.35 ? "slug" : progress < 0.75 ? "meta" : "structure";
-      if (processedCount % STATUS_UPDATE_INTERVAL === 0) {
-        await storage.updateJob(jobId, { currentStep, processedUrls: processedCount, matchedUrls: matchedCount });
-      }
-
-      let sourceMeta = null;
-      try {
-        sourceMeta = await fetchPageMetadata(sourceUrl);
-      } catch (e: any) {}
-
-      let enUrl: string | null = existingEn || null;
-      let frUrl: string | null = existingFr || null;
-      let confidenceEn: number | null = null;
-      let confidenceFr: number | null = null;
-      let matchMethodEn: string | null = null;
-      let matchMethodFr: string | null = null;
-      let details: any = {};
-
-      if (needsEn) {
-        const enMatch = await findBestMatchOptimized(sourceUrl, sourceMeta, "en", patterns, segmentMap, threshold);
-        if (enMatch) {
-          enUrl = enMatch.url;
-          confidenceEn = enMatch.score.total;
-          matchMethodEn = enMatch.score.method;
-          details.en = enMatch.score;
-          matchedCount++;
+          await storage.updateJob(jobId, {
+            processedUrls: processedCount,
+            matchedUrls: matchedCount,
+            currentStep: "matching",
+          });
         }
       }
 
-      if (needsFr) {
-        const frMatch = await findBestMatchOptimized(sourceUrl, sourceMeta, "fr", patterns, segmentMap, threshold);
-        if (frMatch) {
-          frUrl = frMatch.url;
-          confidenceFr = frMatch.score.total;
-          matchMethodFr = frMatch.score.method;
-          details.fr = frMatch.score;
-          matchedCount++;
-        }
-      }
-
-      resultBatch.push({
-        jobId,
-        sheetName,
-        rowIndex: i,
-        title,
-        sourceUrl,
-        englishUrl: enUrl,
-        frenchUrl: frUrl,
-        russianUrl: null,
-        arabicUrl: null,
-        confidenceEn,
-        confidenceFr,
-        matchMethodEn,
-        matchMethodFr,
-        details,
-      });
-
-      if (resultBatch.length >= BATCH_SIZE) {
+      if (resultBatch.length > 0) {
         await storage.createResults(resultBatch);
         resultBatch.length = 0;
       }
-
-      if (processedCount % 20 === 0) {
-        log(`Processed ${processedCount}/${job.totalUrls} (${matchedCount} matches)`);
+    } else {
+      for (const row of allRows) {
+        if (control.cancel) break;
+        processedCount++;
       }
     }
-  }
 
-  if (resultBatch.length > 0) {
-    await storage.createResults(resultBatch);
+    await storage.updateJob(jobId, {
+      processedUrls: processedCount,
+      matchedUrls: matchedCount,
+      currentStep: "matching",
+    });
+
+    const tabTime = ((Date.now() - tabStartTime) / 1000).toFixed(1);
+    log(`Tab "${sheetName}" done in ${tabTime}s: ${matchedCount} matches so far`);
   }
 
   await storage.updateJob(jobId, {
@@ -367,5 +431,7 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
 
   activeJobs.delete(jobId);
   clearCaches();
-  log(`Job ${jobId} completed: ${matchedCount} matches found out of ${processedCount} URLs`);
+
+  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+  log(`\nJob ${jobId} completed in ${totalTime}s: ${matchedCount} matches found out of ${processedCount} URLs`);
 }

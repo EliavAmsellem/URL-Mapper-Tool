@@ -2,7 +2,7 @@
 
 ## Overview
 
-LinguaMap is a multilingual URL mapping and site structure alignment tool. Users upload Excel/CSV files containing URLs, and the system automatically finds corresponding pages across different language versions of a website. It works by scraping page metadata (titles, og:tags, slugs, DOM structure) and using heuristic matching algorithms to align URLs across languages (primarily English and French, with support for Russian and Arabic).
+LinguaMap is a multilingual URL mapping and site structure alignment tool. Users upload Excel/CSV files containing URLs, and the system automatically finds corresponding pages across different language versions of a website. It uses pattern-based URL construction learned from reference rows in each Excel tab, with HEAD request verification to confirm URL existence.
 
 The app follows a single-page application pattern with a three-phase workflow: file upload → processing with real-time progress → results display with export.
 
@@ -26,7 +26,7 @@ Preferred communication style: Simple, everyday language.
 - **Language**: TypeScript, executed via `tsx` in development
 - **API Pattern**: REST endpoints under `/api/` prefix
 - **File Handling**: Multer for file uploads (stored in `/tmp/uploads/`), XLSX library for parsing Excel/CSV files
-- **Web Scraping**: Cheerio for HTML parsing, native `fetch` for HTTP requests with rate limiting (300ms between requests) and 15s timeout
+- **URL Verification**: Batch HEAD requests with 50 concurrent connections, 3s timeout, and URL existence caching
 - **Job System**: Asynchronous processing with polling — jobs are created on upload, started via API, and clients poll for status updates every 2 seconds
 
 ### Key API Endpoints
@@ -44,26 +44,42 @@ Preferred communication style: Simple, everyday language.
   - `mapping_results` — Stores per-URL mapping results with source/target URLs for each language, confidence scores, and match methods
 - **Push migrations**: Use `npm run db:push` (drizzle-kit push) to sync schema to database
 
-### Scraping Engine (`server/scraper.ts`)
-The scraper extracts metadata from URLs including:
-- Page title and og:title
-- H1 content
-- URL slug tokens
-- Breadcrumb depth
-- Body CSS classes and language attributes
+### Pattern-Based URL Construction Engine (`server/scraper.ts`)
 
-### Matching Algorithm
-Multi-step confidence scoring:
-- **Step 1 (Slug - 30%)**: Jaccard similarity of URL path tokens
-- **Step 2 (Metadata - 50%)**: Best match across title, og:title, and H1
-- **Step 3 (Structure - 20%)**: Breadcrumb depth and CSS class overlap
-- **Threshold**: Only populate cell if total confidence > 85%
+The engine uses a three-step approach:
 
-### Candidate URL Generation
-`inferLanguageUrl()` generates candidate URLs by:
-1. Replacing the first path segment with the target language prefix (e.g., `English%20Homepage`, `French%20homepage`)
-2. Trying different path combinations based on the source URL structure
-3. De-duplicating candidate list
+#### Step 1: Pattern Learning from Reference Rows
+Each Excel tab contains pre-filled reference rows where source URLs already have their EN/FR equivalents. The engine:
+1. Strips `default.aspx` suffixes from both source and target paths
+2. Performs fuzzy tail-matching from the end of path segments (normalizing underscores, spaces, and percent-encoding)
+3. Identifies the "source root" (segments unique to source path) and "target root" (segments unique to target path)
+4. Finds common root mappings across all reference pairs in a tab
+5. Builds segment-level translations for path components that differ
+
+Example: Source `/HaravotBarzel1/Harada_HB/Pages/` → EN `/English%20Homepage/Updates-security-situation/Harada_HB/Pages/`
+- Source root: `HaravotBarzel1`
+- Target root: `English%20Homepage/Updates-security-situation`
+- Tail match: `Harada_HB/Pages`
+
+#### Step 2: URL Construction
+For each source URL needing a target:
+1. Strip `default.aspx` suffix
+2. Replace source root segments with target root segments
+3. Apply segment-level translations to remaining path parts
+4. Construct full target URL
+
+#### Step 3: Batch HEAD Verification
+- All constructed URLs are verified with HTTP HEAD requests (50 concurrent, 3s timeout)
+- URLs returning non-200 status are discarded
+- Verified URLs get confidence score of 90
+
+#### Key Data Structures
+- `TabPatterns`: Contains `enRoot`, `frRoot`, `enSrcRoot`, `frSrcRoot`, `segmentMap`, `patternValidated`
+- `RootMapping`: Contains `sourceRoot` and `targetRoot` arrays
+- Patterns are auto-trusted when derived from reference rows (no sample validation needed)
+
+#### Pipe-separated URL Handling
+Source URL cells may contain Hebrew text prepended with a pipe character (e.g., `ביטוח לאומי|https://...`). The parser extracts the URL from after the pipe.
 
 ### Shared Code
 - `shared/schema.ts` contains Drizzle table definitions, Zod insert schemas, and TypeScript types used by both client and server
@@ -80,7 +96,6 @@ Multi-step confidence scoring:
 
 ### Key NPM Packages
 - `drizzle-orm` + `drizzle-kit` — Database ORM and migration tooling
-- `cheerio` — Server-side HTML parsing for web scraping
 - `xlsx` — Excel file reading and writing
 - `multer` — Multipart file upload handling
 - `framer-motion` — Client-side animations
@@ -88,4 +103,4 @@ Multi-step confidence scoring:
 - `zod` + `drizzle-zod` — Schema validation
 
 ### External Web Requests
-- The scraper makes HTTP requests to user-provided URLs to fetch page metadata. It uses a custom User-Agent string and includes rate limiting (300ms) to avoid overwhelming target servers.
+- The engine makes HTTP HEAD requests to verify constructed target URLs exist. Uses 50 concurrent connections with a 3s timeout per request and an in-memory existence cache to avoid redundant checks.
