@@ -1,7 +1,7 @@
 import type { Express, Request, Response } from "express";
 import { createServer, type Server } from "http";
 import multer from "multer";
-import * as XLSX from "xlsx";
+import XLSX from "xlsx";
 import path from "path";
 import fs from "fs";
 import { storage } from "./storage";
@@ -43,7 +43,8 @@ export async function registerRoutes(
         totalUrls += Math.max(0, data.length - 1);
       }
 
-      const targetLangs = (req.body?.languages as string)?.split(",") || ["en", "fr"];
+      const langStr = typeof req.body?.languages === "string" ? req.body.languages : "";
+      const targetLangs = langStr ? langStr.split(",") : ["en", "fr"];
 
       const job = await storage.createJob({
         fileName: req.file.originalname,
@@ -55,8 +56,10 @@ export async function registerRoutes(
         currentStep: "idle",
       });
 
+      if (!fs.existsSync("/tmp/uploads")) {
+        fs.mkdirSync("/tmp/uploads", { recursive: true });
+      }
       fs.copyFileSync(req.file.path, `/tmp/uploads/${job.id}.xlsx`);
-
       fs.unlinkSync(req.file.path);
 
       res.json({ jobId: job.id, totalUrls, sheets: workbook.SheetNames });
@@ -68,7 +71,7 @@ export async function registerRoutes(
 
   app.post("/api/jobs/:id/start", async (req: Request, res: Response) => {
     try {
-      const jobId = req.params.id;
+      const jobId = req.params.id as string;
       const job = await storage.getJob(jobId);
       if (!job) return res.status(404).json({ message: "Job not found" });
 
@@ -91,7 +94,7 @@ export async function registerRoutes(
 
   app.get("/api/jobs/:id", async (req: Request, res: Response) => {
     try {
-      const job = await storage.getJob(req.params.id);
+      const job = await storage.getJob(req.params.id as string);
       if (!job) return res.status(404).json({ message: "Job not found" });
       res.json(job);
     } catch (error: any) {
@@ -101,7 +104,7 @@ export async function registerRoutes(
 
   app.get("/api/jobs/:id/results", async (req: Request, res: Response) => {
     try {
-      const results = await storage.getResultsByJob(req.params.id);
+      const results = await storage.getResultsByJob(req.params.id as string);
       res.json(results);
     } catch (error: any) {
       res.status(500).json({ message: error.message });
@@ -110,7 +113,7 @@ export async function registerRoutes(
 
   app.get("/api/jobs/:id/download", async (req: Request, res: Response) => {
     try {
-      const jobId = req.params.id;
+      const jobId = req.params.id as string;
       const job = await storage.getJob(jobId);
       if (!job) return res.status(404).json({ message: "Job not found" });
 

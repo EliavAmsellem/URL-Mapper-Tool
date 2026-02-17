@@ -81,9 +81,10 @@ function jaccardSimilarity(a: string[], b: string[]): number {
   if (a.length === 0 && b.length === 0) return 0;
   const setA = new Set(a);
   const setB = new Set(b);
-  const intersection = new Set([...setA].filter((x) => setB.has(x)));
-  const union = new Set([...setA, ...setB]);
-  return union.size === 0 ? 0 : intersection.size / union.size;
+  let intersectionCount = 0;
+  setA.forEach((x) => { if (setB.has(x)) intersectionCount++; });
+  const unionCount = new Set(a.concat(b)).size;
+  return unionCount === 0 ? 0 : intersectionCount / unionCount;
 }
 
 function normalizeText(text: string): string {
@@ -200,7 +201,7 @@ export function inferLanguageUrl(sourceUrl: string, targetLang: "en" | "fr" | "r
   } catch {
   }
 
-  return [...new Set(candidates)];
+  return Array.from(new Set(candidates));
 }
 
 export async function findBestMatch(
