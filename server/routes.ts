@@ -5,7 +5,14 @@ import XLSX from "xlsx";
 import path from "path";
 import fs from "fs";
 import { storage } from "./storage";
-import { fetchPageMetadata, findBestMatch } from "./scraper";
+import {
+  fetchPageMetadata,
+  findBestMatchOptimized,
+  learnPatternsFromExistingMappings,
+  learnSegmentMappings,
+  clearCaches,
+  type UrlPattern,
+} from "./scraper";
 import { log } from "./index";
 
 const upload = multer({
@@ -182,6 +189,8 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
     throw new Error("Source file not found");
   }
 
+  clearCaches();
+
   const workbook = XLSX.readFile(filePath);
   const job = await storage.getJob(jobId);
   if (!job) throw new Error("Job not found");
@@ -190,12 +199,43 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
   let processedCount = 0;
   let matchedCount = 0;
 
+  await storage.updateJob(jobId, { currentStep: "learning" });
+  log("Phase 1: Learning URL patterns from existing mappings...");
+
+  const referenceRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[] = [];
+  for (const sheetName of workbook.SheetNames) {
+    const ws = workbook.Sheets[sheetName];
+    const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      const sourceUrl = (row[1] || "").toString().trim();
+      const enUrl = (row[2] || "").toString().trim();
+      const frUrl = (row[3] || "").toString().trim();
+      if (sourceUrl && sourceUrl.startsWith("http") && (enUrl || frUrl)) {
+        referenceRows.push({
+          sourceUrl,
+          enUrl: enUrl || undefined,
+          frUrl: frUrl || undefined,
+        });
+      }
+    }
+  }
+
+  const patterns = learnPatternsFromExistingMappings(referenceRows);
+  const segmentMap = learnSegmentMappings(referenceRows);
+
+  log(`Phase 1 complete: ${referenceRows.length} reference rows, ${patterns.length} patterns learned`);
+  await storage.updateJob(jobId, { currentStep: "slug" });
+
+  const resultBatch: any[] = [];
+  const BATCH_SIZE = 50;
+  const STATUS_UPDATE_INTERVAL = 5;
+
   for (const sheetName of workbook.SheetNames) {
     if (control.cancel) break;
 
     const ws = workbook.Sheets[sheetName];
     const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
-
     if (data.length < 2) continue;
 
     for (let i = 1; i < data.length; i++) {
@@ -207,9 +247,9 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
       const existingEn = (row[2] || "").toString().trim();
       const existingFr = (row[3] || "").toString().trim();
 
+      processedCount++;
+
       if (!sourceUrl || !sourceUrl.startsWith("http")) {
-        processedCount++;
-        await storage.updateJob(jobId, { processedUrls: processedCount });
         continue;
       }
 
@@ -217,7 +257,7 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
       const needsFr = targetLangs.includes("fr") && !existingFr;
 
       if (!needsEn && !needsFr) {
-        const resultData: any = {
+        resultBatch.push({
           jobId,
           sheetName,
           rowIndex: i,
@@ -225,22 +265,36 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
           sourceUrl,
           englishUrl: existingEn || null,
           frenchUrl: existingFr || null,
-        };
-        await storage.createResult(resultData);
-        processedCount++;
-        await storage.updateJob(jobId, { processedUrls: processedCount });
+          russianUrl: null,
+          arabicUrl: null,
+          confidenceEn: null,
+          confidenceFr: null,
+          matchMethodEn: existingEn ? "existing" : null,
+          matchMethodFr: existingFr ? "existing" : null,
+          details: {},
+        });
+
+        if (resultBatch.length >= BATCH_SIZE) {
+          await storage.createResults(resultBatch);
+          resultBatch.length = 0;
+        }
+
+        if (processedCount % STATUS_UPDATE_INTERVAL === 0) {
+          await storage.updateJob(jobId, { processedUrls: processedCount, matchedUrls: matchedCount });
+        }
         continue;
       }
 
-      const currentStep = processedCount % 3 === 0 ? "slug" : processedCount % 3 === 1 ? "meta" : "structure";
-      await storage.updateJob(jobId, { currentStep });
+      const progress = processedCount / job.totalUrls;
+      const currentStep = progress < 0.35 ? "slug" : progress < 0.75 ? "meta" : "structure";
+      if (processedCount % STATUS_UPDATE_INTERVAL === 0) {
+        await storage.updateJob(jobId, { currentStep, processedUrls: processedCount, matchedUrls: matchedCount });
+      }
 
       let sourceMeta = null;
       try {
         sourceMeta = await fetchPageMetadata(sourceUrl);
-      } catch (e: any) {
-        log(`Failed to fetch source metadata for ${sourceUrl}: ${e.message}`);
-      }
+      } catch (e: any) {}
 
       let enUrl: string | null = existingEn || null;
       let frUrl: string | null = existingFr || null;
@@ -251,7 +305,7 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
       let details: any = {};
 
       if (needsEn) {
-        const enMatch = await findBestMatch(sourceUrl, sourceMeta, "en", threshold);
+        const enMatch = await findBestMatchOptimized(sourceUrl, sourceMeta, "en", patterns, segmentMap, threshold);
         if (enMatch) {
           enUrl = enMatch.url;
           confidenceEn = enMatch.score.total;
@@ -262,7 +316,7 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
       }
 
       if (needsFr) {
-        const frMatch = await findBestMatch(sourceUrl, sourceMeta, "fr", threshold);
+        const frMatch = await findBestMatchOptimized(sourceUrl, sourceMeta, "fr", patterns, segmentMap, threshold);
         if (frMatch) {
           frUrl = frMatch.url;
           confidenceFr = frMatch.score.total;
@@ -272,7 +326,7 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
         }
       }
 
-      await storage.createResult({
+      resultBatch.push({
         jobId,
         sheetName,
         rowIndex: i,
@@ -289,14 +343,19 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
         details,
       });
 
-      processedCount++;
-      await storage.updateJob(jobId, {
-        processedUrls: processedCount,
-        matchedUrls: matchedCount,
-      });
+      if (resultBatch.length >= BATCH_SIZE) {
+        await storage.createResults(resultBatch);
+        resultBatch.length = 0;
+      }
 
-      log(`Processed ${processedCount}/${job.totalUrls}: ${sourceUrl}`);
+      if (processedCount % 20 === 0) {
+        log(`Processed ${processedCount}/${job.totalUrls} (${matchedCount} matches)`);
+      }
     }
+  }
+
+  if (resultBatch.length > 0) {
+    await storage.createResults(resultBatch);
   }
 
   await storage.updateJob(jobId, {
@@ -307,5 +366,6 @@ async function processJob(jobId: string, threshold: number, control: { cancel: b
   });
 
   activeJobs.delete(jobId);
+  clearCaches();
   log(`Job ${jobId} completed: ${matchedCount} matches found out of ${processedCount} URLs`);
 }
