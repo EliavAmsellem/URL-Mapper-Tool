@@ -1,18 +1,42 @@
 import { sql } from "drizzle-orm";
-import { pgTable, text, varchar } from "drizzle-orm/pg-core";
+import { pgTable, text, varchar, integer, jsonb, timestamp } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
-export const users = pgTable("users", {
+export const mappingJobs = pgTable("mapping_jobs", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-  username: text("username").notNull().unique(),
-  password: text("password").notNull(),
+  fileName: text("file_name").notNull(),
+  status: text("status").notNull().default("pending"),
+  totalUrls: integer("total_urls").notNull().default(0),
+  processedUrls: integer("processed_urls").notNull().default(0),
+  matchedUrls: integer("matched_urls").notNull().default(0),
+  targetLanguages: text("target_languages").array().notNull().default(sql`ARRAY['en','fr']`),
+  currentStep: text("current_step").default("idle"),
+  createdAt: timestamp("created_at").defaultNow(),
 });
 
-export const insertUserSchema = createInsertSchema(users).pick({
-  username: true,
-  password: true,
+export const mappingResults = pgTable("mapping_results", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  jobId: varchar("job_id").notNull(),
+  sheetName: text("sheet_name").notNull(),
+  rowIndex: integer("row_index").notNull(),
+  title: text("title"),
+  sourceUrl: text("source_url").notNull(),
+  englishUrl: text("english_url"),
+  frenchUrl: text("french_url"),
+  russianUrl: text("russian_url"),
+  arabicUrl: text("arabic_url"),
+  confidenceEn: integer("confidence_en"),
+  confidenceFr: integer("confidence_fr"),
+  matchMethodEn: text("match_method_en"),
+  matchMethodFr: text("match_method_fr"),
+  details: jsonb("details"),
 });
 
-export type InsertUser = z.infer<typeof insertUserSchema>;
-export type User = typeof users.$inferSelect;
+export const insertMappingJobSchema = createInsertSchema(mappingJobs).omit({ id: true, createdAt: true });
+export const insertMappingResultSchema = createInsertSchema(mappingResults).omit({ id: true });
+
+export type InsertMappingJob = z.infer<typeof insertMappingJobSchema>;
+export type MappingJob = typeof mappingJobs.$inferSelect;
+export type InsertMappingResult = z.infer<typeof insertMappingResultSchema>;
+export type MappingResult = typeof mappingResults.$inferSelect;
