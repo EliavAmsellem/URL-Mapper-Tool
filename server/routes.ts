@@ -425,18 +425,20 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
           let matchMethodFr: string | null = null;
 
           if (match) {
+            let rowHasMatch = false;
             if (match.enUrl && row.needsEn) {
               enUrl = match.enUrl;
               confidenceEn = match.confidenceEn;
               matchMethodEn = match.matchMethodEn;
-              matchedCount++;
+              rowHasMatch = true;
             }
             if (match.frUrl && row.needsFr) {
               frUrl = match.frUrl;
               confidenceFr = match.confidenceFr;
               matchMethodFr = match.matchMethodFr;
-              matchedCount++;
+              rowHasMatch = true;
             }
+            if (rowHasMatch) matchedCount++;
           }
 
           resultBatch.push({
