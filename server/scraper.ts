@@ -1,4 +1,5 @@
 import { log } from "./index";
+import * as cheerio from "cheerio";
 
 export interface MatchScore {
   total: number;
@@ -11,6 +12,10 @@ export interface MatchScore {
 export interface TabPatterns {
   enRoot: string[];
   frRoot: string[];
+  enSrcRoot: string[];
+  frSrcRoot: string[];
+  enCrawlScope: string[];
+  frCrawlScope: string[];
   segmentMap: Map<string, Map<string, string>>;
   patternValidated: { en: boolean; fr: boolean };
 }
@@ -119,9 +124,24 @@ export function learnTabPatterns(
   const enSrcRoot = enMapping ? enMapping.sourceRoot : [];
   const frSrcRoot = frMapping ? frMapping.sourceRoot : [];
 
+  let enCrawlScope = enPairs.length > 0
+    ? findCommonPrefix(enPairs.map((p) => p.tgt))
+    : enRoot;
+  let frCrawlScope = frPairs.length > 0
+    ? findCommonPrefix(frPairs.map((p) => p.tgt))
+    : frRoot;
+  if (enCrawlScope.length > 0 && normalizeSegment(enCrawlScope[enCrawlScope.length - 1]) === "pages") {
+    enCrawlScope = enCrawlScope.slice(0, -1);
+  }
+  if (frCrawlScope.length > 0 && normalizeSegment(frCrawlScope[frCrawlScope.length - 1]) === "pages") {
+    frCrawlScope = frCrawlScope.slice(0, -1);
+  }
+
   log(`Tab patterns learned:`);
   if (enMapping) log(`  EN: /${enSrcRoot.join("/") || "*"}/ → /${enRoot.join("/")}/`);
   if (frMapping) log(`  FR: /${frSrcRoot.join("/") || "*"}/ → /${frRoot.join("/")}/`);
+  if (enCrawlScope.length > enRoot.length) log(`  EN crawl scope: /${enCrawlScope.join("/")}/`);
+  if (frCrawlScope.length > frRoot.length) log(`  FR crawl scope: /${frCrawlScope.join("/")}/`);
   const enSeg = segmentMap.get("en")?.size || 0;
   const frSeg = segmentMap.get("fr")?.size || 0;
   log(`  Segment translations: ${enSeg} EN, ${frSeg} FR`);
@@ -130,6 +150,8 @@ export function learnTabPatterns(
     enRoot, frRoot,
     enSrcRoot: enSrcRoot,
     frSrcRoot: frSrcRoot,
+    enCrawlScope,
+    frCrawlScope,
     segmentMap,
     patternValidated: { en: false, fr: false },
   };
@@ -360,4 +382,248 @@ export function batchConstructUrls(
   }
 
   return results;
+}
+
+const CRAWL_CONCURRENCY = 30;
+const CRAWL_TIMEOUT = 8000;
+const CRAWL_MAX_PAGES = 500;
+
+export interface CrawlInventory {
+  urls: Set<string>;
+  normalizedIndex: Map<string, string>;
+  tailIndex: Map<string, string[]>;
+}
+
+function normalizeUrlPath(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const clean = stripSuffix(parts);
+    return clean.map((p) => normalizeSegment(p)).join("/");
+  } catch {
+    return url.toLowerCase();
+  }
+}
+
+function getUrlTail(url: string, tailLen: number = 2): string {
+  try {
+    const parsed = new URL(url);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const clean = stripSuffix(parts);
+    const tail = clean.slice(-tailLen);
+    return tail.map((p) => normalizeSegment(p)).join("/");
+  } catch {
+    return "";
+  }
+}
+
+async function fetchPage(url: string): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CRAWL_TIMEOUT);
+    const response = await fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; LinguaMap/1.0; URL Mapper Bot)",
+        "Accept": "text/html",
+      },
+      redirect: "follow",
+    });
+    clearTimeout(timeout);
+    if (!response.ok) return null;
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.includes("text/html")) return null;
+    return await response.text();
+  } catch {
+    return null;
+  }
+}
+
+function extractLinks(html: string, baseUrl: string, scopePrefix: string): string[] {
+  const $ = cheerio.load(html);
+  const links: Set<string> = new Set();
+  const base = new URL(baseUrl);
+  const scopeLower = scopePrefix.toLowerCase();
+
+  $("a[href]").each((_, el) => {
+    const href = $(el).attr("href");
+    if (!href) return;
+    try {
+      const resolved = new URL(href, baseUrl);
+      if (resolved.origin !== base.origin) return;
+      resolved.hash = "";
+      resolved.search = "";
+      const cleanUrl = resolved.toString();
+
+      if (resolved.pathname.toLowerCase().startsWith(scopeLower)) {
+        links.add(cleanUrl);
+      }
+    } catch {}
+  });
+
+  return Array.from(links);
+}
+
+export async function crawlDirectory(
+  origin: string,
+  rootPath: string[],
+  onProgress?: (crawled: number, queued: number) => void
+): Promise<CrawlInventory> {
+  const inventory: CrawlInventory = {
+    urls: new Set(),
+    normalizedIndex: new Map(),
+    tailIndex: new Map(),
+  };
+
+  const scopePrefix = "/" + rootPath.join("/");
+  const startUrl = origin + scopePrefix + "/";
+
+  const visited = new Set<string>();
+  const queue: string[] = [startUrl];
+
+  if (rootPath.length > 0) {
+    const defaultUrl = origin + scopePrefix + "/Pages/default.aspx";
+    queue.push(defaultUrl);
+  }
+
+  let crawled = 0;
+
+  while (queue.length > 0 && crawled < CRAWL_MAX_PAGES) {
+    const batch = queue.splice(0, CRAWL_CONCURRENCY);
+    const toFetch = batch.filter((url) => !visited.has(url));
+    for (const url of toFetch) visited.add(url);
+
+    if (toFetch.length === 0) continue;
+
+    const results = await Promise.all(
+      toFetch.map(async (url) => {
+        const html = await fetchPage(url);
+        return { url, html };
+      })
+    );
+
+    for (const { url, html } of results) {
+      crawled++;
+
+      addToInventory(inventory, url);
+
+      if (html) {
+        const links = extractLinks(html, url, scopePrefix);
+        for (const link of links) {
+          addToInventory(inventory, link);
+          if (!visited.has(link)) {
+            queue.push(link);
+          }
+        }
+      }
+    }
+
+    if (onProgress) {
+      onProgress(crawled, queue.length);
+    }
+  }
+
+  return inventory;
+}
+
+function addToInventory(inventory: CrawlInventory, url: string) {
+  if (inventory.urls.has(url)) return;
+  inventory.urls.add(url);
+
+  const normalized = normalizeUrlPath(url);
+  inventory.normalizedIndex.set(normalized, url);
+
+  for (let tailLen = 1; tailLen <= 3; tailLen++) {
+    const tail = getUrlTail(url, tailLen);
+    if (tail) {
+      if (!inventory.tailIndex.has(tail)) {
+        inventory.tailIndex.set(tail, []);
+      }
+      inventory.tailIndex.get(tail)!.push(url);
+    }
+  }
+}
+
+export function matchAgainstInventory(
+  sourceUrl: string,
+  lang: "en" | "fr",
+  tabPatterns: TabPatterns,
+  inventory: CrawlInventory
+): { url: string; confidence: number; method: string } | null {
+  const constructedUrl = constructTargetUrl(sourceUrl, lang, tabPatterns);
+  if (constructedUrl && inventory.urls.has(constructedUrl)) {
+    return { url: constructedUrl, confidence: 95, method: "pattern+crawl" };
+  }
+
+  if (constructedUrl) {
+    const constructedNorm = normalizeUrlPath(constructedUrl);
+    const inventoryUrl = inventory.normalizedIndex.get(constructedNorm);
+    if (inventoryUrl) {
+      return { url: inventoryUrl, confidence: 93, method: "pattern+crawl-norm" };
+    }
+  }
+
+  try {
+    const parsed = new URL(sourceUrl);
+    const srcParts = parsed.pathname.split("/").filter(Boolean);
+    const cleanSrc = stripSuffix(srcParts);
+
+    const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
+
+    let srcTailParts: string[];
+    if (sourceRoot.length > 0) {
+      let matchLen = 0;
+      for (let i = 0; i < sourceRoot.length && i < cleanSrc.length; i++) {
+        if (normalizeSegment(cleanSrc[i]) === normalizeSegment(sourceRoot[i])) {
+          matchLen++;
+        } else break;
+      }
+      srcTailParts = cleanSrc.slice(matchLen);
+    } else {
+      srcTailParts = cleanSrc;
+    }
+
+    if (srcTailParts.length >= 1) {
+      const lastSeg = normalizeSegment(srcTailParts[srcTailParts.length - 1]);
+      if (lastSeg && lastSeg !== "pages") {
+        const tail1 = lastSeg;
+        const candidates = inventory.tailIndex.get(tail1) || [];
+        if (candidates.length === 1) {
+          return { url: candidates[0], confidence: 85, method: "crawl-tail" };
+        }
+
+        if (srcTailParts.length >= 2 && candidates.length > 1) {
+          const tail2 = srcTailParts.slice(-2).map((p) => normalizeSegment(p)).join("/");
+          const candidates2 = inventory.tailIndex.get(tail2) || [];
+          if (candidates2.length === 1) {
+            return { url: candidates2[0], confidence: 88, method: "crawl-tail2" };
+          }
+        }
+      }
+    }
+
+    if (srcTailParts.length >= 2) {
+      const segments = tabPatterns.segmentMap.get(lang);
+      const translatedTail = srcTailParts.map((p) => {
+        const norm = normalizeSegment(p);
+        if (segments && segments.has(norm)) return normalizeSegment(segments.get(norm)!);
+        return norm;
+      });
+
+      for (let tailLen = Math.min(translatedTail.length, 3); tailLen >= 1; tailLen--) {
+        const tailKey = translatedTail.slice(-tailLen).join("/");
+        const candidates = inventory.tailIndex.get(tailKey) || [];
+        if (candidates.length === 1) {
+          return { url: candidates[0], confidence: 86, method: "crawl-translated-tail" };
+        }
+      }
+    }
+  } catch {}
+
+  if (constructedUrl) {
+    urlExistenceCache.set(constructedUrl, false);
+  }
+
+  return null;
 }

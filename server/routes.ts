@@ -8,10 +8,14 @@ import { storage } from "./storage";
 import {
   learnTabPatterns,
   batchConstructUrls,
+  constructTargetUrl,
   validatePatterns,
   batchHeadCheck,
+  crawlDirectory,
+  matchAgainstInventory,
   clearCaches,
   type TabPatterns,
+  type CrawlInventory,
 } from "./scraper";
 import { log } from "./index";
 
@@ -202,6 +206,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
   let processedCount = 0;
   let matchedCount = 0;
   const startTime = Date.now();
+  const crawlCache = new Map<string, CrawlInventory>();
 
   for (const sheetName of workbook.SheetNames) {
     if (control.cancel) break;
@@ -262,67 +267,129 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
     if (needsMatching.length > 0 && (tabPatterns.enRoot.length > 0 || tabPatterns.frRoot.length > 0)) {
       await storage.updateJob(jobId, { currentStep: "matching" });
 
-      const sampleUrls: { sourceUrl: string; lang: "en" | "fr" }[] = [];
-      const sampleCount = Math.min(SAMPLE_SIZE, needsMatching.length);
-      const step = Math.max(1, Math.floor(needsMatching.length / sampleCount));
-      for (let i = 0; i < sampleCount; i++) {
-        const row = needsMatching[i * step];
-        if (row.needsEn && tabPatterns.enRoot.length > 0) {
-          sampleUrls.push({ sourceUrl: row.sourceUrl, lang: "en" });
+      if (tabPatterns.enRoot.length > 0) tabPatterns.patternValidated.en = true;
+      if (tabPatterns.frRoot.length > 0) tabPatterns.patternValidated.fr = true;
+
+      const origin = (() => {
+        for (const ref of tabRefRows) {
+          try { return new URL(ref.sourceUrl).origin; } catch {}
         }
-        if (row.needsFr && tabPatterns.frRoot.length > 0) {
-          sampleUrls.push({ sourceUrl: row.sourceUrl, lang: "fr" });
+        for (const row of allRows) {
+          try { return new URL(row.sourceUrl).origin; } catch {}
+        }
+        return "";
+      })();
+
+      let enInventory: CrawlInventory | null = null;
+      let frInventory: CrawlInventory | null = null;
+
+      const crawlPromises: Promise<void>[] = [];
+      if (origin && tabPatterns.enRoot.length > 0) {
+        const enScope = tabPatterns.enCrawlScope.length > 0 ? tabPatterns.enCrawlScope : tabPatterns.enRoot;
+        const enCacheKey = `en:${enScope.join("/")}`;
+        if (crawlCache.has(enCacheKey)) {
+          enInventory = crawlCache.get(enCacheKey)!;
+          log(`  EN directory cached: ${enInventory.urls.size} URLs (/${enScope.join("/")})`);
+        } else {
+          log(`  Crawling EN directory: /${enScope.join("/")}/`);
+          crawlPromises.push(
+            crawlDirectory(origin, enScope, (c, q) => {
+              if (c % 50 === 0) log(`    EN crawl progress: ${c} pages fetched, ${q} queued`);
+            }).then(inv => { enInventory = inv; crawlCache.set(enCacheKey, inv); log(`  EN crawl complete: ${inv.urls.size} URLs discovered`); })
+          );
         }
       }
 
-      if (tabRefRows.length >= 1) {
-        if (tabPatterns.enRoot.length > 0) tabPatterns.patternValidated.en = true;
-        if (tabPatterns.frRoot.length > 0) tabPatterns.patternValidated.fr = true;
-        log(`  Trusting patterns from ${tabRefRows.length} reference rows (EN=${tabPatterns.patternValidated.en}, FR=${tabPatterns.patternValidated.fr})`);
-      } else {
-        log(`  Validating patterns with ${sampleUrls.length} sample URLs...`);
-        await validatePatterns(tabPatterns, sampleUrls);
-        log(`  Pattern validation result: EN=${tabPatterns.patternValidated.en}, FR=${tabPatterns.patternValidated.fr}`);
+      if (origin && tabPatterns.frRoot.length > 0) {
+        const frScope = tabPatterns.frCrawlScope.length > 0 ? tabPatterns.frCrawlScope : tabPatterns.frRoot;
+        const frCacheKey = `fr:${frScope.join("/")}`;
+        if (crawlCache.has(frCacheKey)) {
+          frInventory = crawlCache.get(frCacheKey)!;
+          log(`  FR directory cached: ${frInventory.urls.size} URLs (/${frScope.join("/")})`);
+        } else {
+          log(`  Crawling FR directory: /${frScope.join("/")}/`);
+          crawlPromises.push(
+            crawlDirectory(origin, frScope, (c, q) => {
+              if (c % 50 === 0) log(`    FR crawl progress: ${c} pages fetched, ${q} queued`);
+            }).then(inv => { frInventory = inv; crawlCache.set(frCacheKey, inv); log(`  FR crawl complete: ${inv.urls.size} URLs discovered`); })
+          );
+        }
       }
 
-      const matchResults = batchConstructUrls(
-        needsMatching.map((r) => ({
-          sourceUrl: r.sourceUrl,
-          needsEn: r.needsEn,
-          needsFr: r.needsFr,
-          index: r.rowIndex,
-        })),
-        tabPatterns
-      );
+      if (crawlPromises.length > 0) await Promise.all(crawlPromises);
 
-      const urlsToVerify: string[] = [];
-      for (const [, match] of matchResults) {
-        if (match.enUrl) urlsToVerify.push(match.enUrl);
-        if (match.frUrl) urlsToVerify.push(match.frUrl);
-      }
+      const matchResults = new Map<number, { enUrl: string | null; frUrl: string | null; confidenceEn: number | null; confidenceFr: number | null; matchMethodEn: string | null; matchMethodFr: string | null }>();
+      const unmatchedForHead: { index: number; lang: "en" | "fr"; constructedUrl: string }[] = [];
+      for (const row of needsMatching) {
+        const result = {
+          enUrl: null as string | null,
+          frUrl: null as string | null,
+          confidenceEn: null as number | null,
+          confidenceFr: null as number | null,
+          matchMethodEn: null as string | null,
+          matchMethodFr: null as string | null,
+        };
 
-      if (urlsToVerify.length > 0) {
-        log(`  Verifying ${urlsToVerify.length} constructed URLs with HEAD checks...`);
-        const existence = await batchHeadCheck(urlsToVerify);
-        let verified = 0;
-        for (const [, match] of matchResults) {
-          if (match.enUrl && !existence.get(match.enUrl)) {
-            match.enUrl = null;
-            match.confidenceEn = null;
-            match.matchMethodEn = null;
-          } else if (match.enUrl) {
-            verified++;
+        if (row.needsEn && tabPatterns.patternValidated.en) {
+          if (enInventory) {
+            const match = matchAgainstInventory(row.sourceUrl, "en", tabPatterns, enInventory);
+            if (match) {
+              result.enUrl = match.url;
+              result.confidenceEn = match.confidence;
+              result.matchMethodEn = match.method;
+            } else {
+              const constructed = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
+              if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: constructed });
+            }
           }
-          if (match.frUrl && !existence.get(match.frUrl)) {
-            match.frUrl = null;
-            match.confidenceFr = null;
-            match.matchMethodFr = null;
-          } else if (match.frUrl) {
-            verified++;
+        }
+
+        if (row.needsFr && tabPatterns.patternValidated.fr) {
+          if (frInventory) {
+            const match = matchAgainstInventory(row.sourceUrl, "fr", tabPatterns, frInventory);
+            if (match) {
+              result.frUrl = match.url;
+              result.confidenceFr = match.confidence;
+              result.matchMethodFr = match.method;
+            } else {
+              const constructed = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
+              if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: constructed });
+            }
           }
         }
-        log(`  Verified: ${verified}/${urlsToVerify.length} URLs exist`);
+
+        matchResults.set(row.rowIndex, result);
       }
+
+      if (unmatchedForHead.length > 0) {
+        log(`  Falling back to HEAD checks for ${unmatchedForHead.length} unmatched URLs...`);
+        const headUrls = unmatchedForHead.map((u) => u.constructedUrl);
+        const existence = await batchHeadCheck(headUrls);
+        let headMatched = 0;
+        for (const item of unmatchedForHead) {
+          if (existence.get(item.constructedUrl)) {
+            const result = matchResults.get(item.index);
+            if (result) {
+              if (item.lang === "en") {
+                result.enUrl = item.constructedUrl;
+                result.confidenceEn = 90;
+                result.matchMethodEn = "pattern+head";
+              } else {
+                result.frUrl = item.constructedUrl;
+                result.confidenceFr = 90;
+                result.matchMethodFr = "pattern+head";
+              }
+              headMatched++;
+            }
+          }
+        }
+        log(`  HEAD fallback: ${headMatched}/${unmatchedForHead.length} verified`);
+      }
+
+      const crawlMatched = Array.from(matchResults.values()).reduce((acc, m) => {
+        return acc + (m.enUrl ? 1 : 0) + (m.frUrl ? 1 : 0);
+      }, 0);
+      log(`  Total matches for tab: ${crawlMatched}`);
 
       const resultBatch: any[] = [];
 
