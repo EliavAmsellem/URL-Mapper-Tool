@@ -21,11 +21,13 @@ export interface TabPatterns {
 }
 
 const urlExistenceCache = new Map<string, boolean>();
+const translationCache = new Map<string, string>();
 const HEAD_CONCURRENCY = 50;
 const HEAD_TIMEOUT = 3000;
 
 export function clearCaches() {
   urlExistenceCache.clear();
+  translationCache.clear();
 }
 
 async function headCheck(url: string): Promise<boolean> {
@@ -392,6 +394,7 @@ export interface CrawlInventory {
   urls: Set<string>;
   normalizedIndex: Map<string, string>;
   tailIndex: Map<string, string[]>;
+  titleIndex: Map<string, string>;
 }
 
 function normalizeUrlPath(url: string): string {
@@ -474,6 +477,7 @@ export async function crawlDirectory(
     urls: new Set(),
     normalizedIndex: new Map(),
     tailIndex: new Map(),
+    titleIndex: new Map(),
   };
 
   const scopePrefix = "/" + rootPath.join("/");
@@ -509,6 +513,12 @@ export async function crawlDirectory(
       addToInventory(inventory, url);
 
       if (html) {
+        const $ = cheerio.load(html);
+        const pageTitle = $("title").first().text().trim();
+        if (pageTitle) {
+          inventory.titleIndex.set(url, pageTitle);
+        }
+
         const links = extractLinks(html, url, scopePrefix);
         for (const link of links) {
           addToInventory(inventory, link);
@@ -626,4 +636,187 @@ export function matchAgainstInventory(
   }
 
   return null;
+}
+
+function normalizeTitle(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[-–—_|:]/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\b(the|a|an|le|la|les|un|une|des|de|du|et|and|or|ou|in|en|à|au|aux)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function titleSimilarity(a: string, b: string): number {
+  const aNorm = normalizeTitle(a);
+  const bNorm = normalizeTitle(b);
+
+  if (aNorm === bNorm) return 1.0;
+  if (!aNorm || !bNorm) return 0;
+
+  const aWords = aNorm.split(" ").filter(w => w.length > 1);
+  const bWordsSet = new Set(bNorm.split(" ").filter(w => w.length > 1));
+
+  if (aWords.length === 0 || bWordsSet.size === 0) return 0;
+
+  let intersection = 0;
+  for (const w of aWords) {
+    if (bWordsSet.has(w)) intersection++;
+  }
+
+  const jaccard = intersection / (aWords.length + bWordsSet.size - intersection);
+
+  const containsBonus = (aNorm.includes(bNorm) || bNorm.includes(aNorm)) ? 0.15 : 0;
+
+  return Math.min(jaccard + containsBonus, 1.0);
+}
+
+async function translateText(text: string, targetLang: "en" | "fr"): Promise<string | null> {
+  const cacheKey = `${text}|${targetLang}`;
+  if (translationCache.has(cacheKey)) return translationCache.get(cacheKey)!;
+
+  try {
+    const { translate } = await import("@vitalets/google-translate-api");
+    const result = await translate(text, { to: targetLang === "en" ? "en" : "fr" });
+    translationCache.set(cacheKey, result.text);
+    return result.text;
+  } catch (e: any) {
+    return null;
+  }
+}
+
+const TRANSLATE_BATCH_SIZE = 10;
+const TRANSLATE_DELAY = 200;
+
+export async function batchTranslate(
+  texts: string[],
+  targetLang: "en" | "fr"
+): Promise<Map<string, string>> {
+  const results = new Map<string, string>();
+  const uniqueSet = new Set(texts);
+  const unique = Array.from(uniqueSet);
+
+  for (let i = 0; i < unique.length; i += TRANSLATE_BATCH_SIZE) {
+    const batch = unique.slice(i, i + TRANSLATE_BATCH_SIZE);
+    const translations = await Promise.all(
+      batch.map(async (text) => {
+        const translated = await translateText(text, targetLang);
+        return { text, translated };
+      })
+    );
+    for (const { text, translated } of translations) {
+      if (translated) results.set(text, translated);
+    }
+    if (i + TRANSLATE_BATCH_SIZE < unique.length) {
+      await new Promise((r) => setTimeout(r, TRANSLATE_DELAY));
+    }
+  }
+
+  return results;
+}
+
+export interface TitleMatchResult {
+  url: string;
+  confidence: number;
+  method: string;
+  similarity: number;
+}
+
+export function matchByTitle(
+  translatedTitle: string,
+  inventory: CrawlInventory,
+  minSimilarity: number = 0.45
+): TitleMatchResult | null {
+  let bestMatch: TitleMatchResult | null = null;
+  let bestSimilarity = minSimilarity;
+
+  inventory.titleIndex.forEach((pageTitle, url) => {
+    const sim = titleSimilarity(translatedTitle, pageTitle);
+    if (sim > bestSimilarity) {
+      bestSimilarity = sim;
+      bestMatch = {
+        url,
+        confidence: Math.round(70 + sim * 20),
+        method: "title-match",
+        similarity: sim,
+      };
+    }
+  });
+
+  return bestMatch;
+}
+
+export async function titleMatchUnmatched(
+  unmatchedRows: { rowIndex: number; title: string; sourceUrl: string; needsEn: boolean; needsFr: boolean }[],
+  enInventory: CrawlInventory | null,
+  frInventory: CrawlInventory | null,
+): Promise<Map<number, BatchMatchResult>> {
+  const results = new Map<number, BatchMatchResult>();
+
+  if (unmatchedRows.length === 0) return results;
+
+  const titles = unmatchedRows.map((r) => r.title).filter(Boolean);
+  if (titles.length === 0) return results;
+
+  const enTitlesNeeded = unmatchedRows.filter(r => r.needsEn && enInventory && enInventory.titleIndex.size > 0).map(r => r.title).filter(Boolean);
+  const frTitlesNeeded = unmatchedRows.filter(r => r.needsFr && frInventory && frInventory.titleIndex.size > 0).map(r => r.title).filter(Boolean);
+
+  let enTranslations = new Map<string, string>();
+  let frTranslations = new Map<string, string>();
+
+  if (enTitlesNeeded.length > 0) {
+    log(`  Translating ${enTitlesNeeded.length} titles to English for title matching...`);
+    enTranslations = await batchTranslate(enTitlesNeeded, "en");
+    log(`  Translated ${enTranslations.size} titles to English`);
+  }
+  if (frTitlesNeeded.length > 0) {
+    log(`  Translating ${frTitlesNeeded.length} titles to French for title matching...`);
+    frTranslations = await batchTranslate(frTitlesNeeded, "fr");
+    log(`  Translated ${frTranslations.size} titles to French`);
+  }
+
+  let titleMatches = 0;
+
+  for (const row of unmatchedRows) {
+    if (!row.title) continue;
+
+    const result: BatchMatchResult = {
+      enUrl: null, frUrl: null,
+      confidenceEn: null, confidenceFr: null,
+      matchMethodEn: null, matchMethodFr: null,
+    };
+
+    if (row.needsEn && enInventory && enInventory.titleIndex.size > 0) {
+      const enTitle = enTranslations.get(row.title);
+      if (enTitle) {
+        const match = matchByTitle(enTitle, enInventory);
+        if (match) {
+          result.enUrl = match.url;
+          result.confidenceEn = match.confidence;
+          result.matchMethodEn = match.method;
+        }
+      }
+    }
+
+    if (row.needsFr && frInventory && frInventory.titleIndex.size > 0) {
+      const frTitle = frTranslations.get(row.title);
+      if (frTitle) {
+        const match = matchByTitle(frTitle, frInventory);
+        if (match) {
+          result.frUrl = match.url;
+          result.confidenceFr = match.confidence;
+          result.matchMethodFr = match.method;
+        }
+      }
+    }
+
+    if (result.enUrl || result.frUrl) {
+      results.set(row.rowIndex, result);
+      titleMatches++;
+    }
+  }
+
+  log(`  Title matching found ${titleMatches} new matches`);
+  return results;
 }

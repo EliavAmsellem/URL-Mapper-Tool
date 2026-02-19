@@ -13,6 +13,7 @@ import {
   batchHeadCheck,
   crawlDirectory,
   matchAgainstInventory,
+  titleMatchUnmatched,
   clearCaches,
   type TabPatterns,
   type CrawlInventory,
@@ -386,8 +387,48 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
         log(`  HEAD fallback: ${headMatched}/${unmatchedForHead.length} verified`);
       }
 
+      const unmatchedForTitle = needsMatching.filter(row => {
+        const m = matchResults.get(row.rowIndex);
+        return row.title && (
+          (row.needsEn && (!m || !m.enUrl)) ||
+          (row.needsFr && (!m || !m.frUrl))
+        );
+      }).map(row => {
+        const m = matchResults.get(row.rowIndex);
+        return {
+          rowIndex: row.rowIndex,
+          title: row.title,
+          sourceUrl: row.sourceUrl,
+          needsEn: row.needsEn && (!m || !m.enUrl),
+          needsFr: row.needsFr && (!m || !m.frUrl),
+        };
+      });
+
+      if (unmatchedForTitle.length > 0 && (enInventory || frInventory)) {
+        log(`  Attempting title-based matching for ${unmatchedForTitle.length} unmatched URLs...`);
+        const titleMatches = await titleMatchUnmatched(unmatchedForTitle, enInventory, frInventory);
+
+        for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
+          let result = matchResults.get(rowIndex);
+          if (!result) {
+            result = { enUrl: null, frUrl: null, confidenceEn: null, confidenceFr: null, matchMethodEn: null, matchMethodFr: null };
+            matchResults.set(rowIndex, result);
+          }
+          if (titleResult.enUrl && !result.enUrl) {
+            result.enUrl = titleResult.enUrl;
+            result.confidenceEn = titleResult.confidenceEn;
+            result.matchMethodEn = titleResult.matchMethodEn;
+          }
+          if (titleResult.frUrl && !result.frUrl) {
+            result.frUrl = titleResult.frUrl;
+            result.confidenceFr = titleResult.confidenceFr;
+            result.matchMethodFr = titleResult.matchMethodFr;
+          }
+        }
+      }
+
       const crawlMatched = Array.from(matchResults.values()).reduce((acc, m) => {
-        return acc + (m.enUrl ? 1 : 0) + (m.frUrl ? 1 : 0);
+        return acc + ((m.enUrl || m.frUrl) ? 1 : 0);
       }, 0);
       log(`  Total matches for tab: ${crawlMatched}`);
 
