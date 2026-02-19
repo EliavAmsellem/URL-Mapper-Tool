@@ -1,10 +1,10 @@
 import {
   type MappingJob, type InsertMappingJob,
   type MappingResult, type InsertMappingResult,
-  mappingJobs, mappingResults,
+  mappingJobs, mappingResults, translationCache,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 
 export interface IStorage {
   createJob(job: InsertMappingJob): Promise<MappingJob>;
@@ -13,6 +13,9 @@ export interface IStorage {
   createResult(result: InsertMappingResult): Promise<MappingResult>;
   createResults(results: InsertMappingResult[]): Promise<void>;
   getResultsByJob(jobId: string): Promise<MappingResult[]>;
+  getCachedTranslation(sourceText: string, targetLang: string): Promise<string | null>;
+  getCachedTranslations(targetLang: string): Promise<Map<string, string>>;
+  saveCachedTranslations(entries: { sourceText: string; targetLang: string; translatedText: string }[]): Promise<void>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -46,6 +49,40 @@ export class DatabaseStorage implements IStorage {
 
   async getResultsByJob(jobId: string): Promise<MappingResult[]> {
     return db.select().from(mappingResults).where(eq(mappingResults.jobId, jobId));
+  }
+
+  async getCachedTranslation(sourceText: string, targetLang: string): Promise<string | null> {
+    const [row] = await db.select().from(translationCache)
+      .where(and(
+        eq(translationCache.sourceText, sourceText),
+        eq(translationCache.targetLang, targetLang)
+      ))
+      .limit(1);
+    return row?.translatedText || null;
+  }
+
+  async getCachedTranslations(targetLang: string): Promise<Map<string, string>> {
+    const rows = await db.select().from(translationCache)
+      .where(eq(translationCache.targetLang, targetLang));
+    const map = new Map<string, string>();
+    for (const row of rows) {
+      map.set(row.sourceText, row.translatedText);
+    }
+    return map;
+  }
+
+  async saveCachedTranslations(entries: { sourceText: string; targetLang: string; translatedText: string }[]): Promise<void> {
+    if (entries.length === 0) return;
+    const batchSize = 100;
+    for (let i = 0; i < entries.length; i += batchSize) {
+      const batch = entries.slice(i, i + batchSize).map(e => ({
+        sourceText: e.sourceText,
+        sourceLang: "he",
+        targetLang: e.targetLang,
+        translatedText: e.translatedText,
+      }));
+      await db.insert(translationCache).values(batch).onConflictDoNothing();
+    }
   }
 }
 

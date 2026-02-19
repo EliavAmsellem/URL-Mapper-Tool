@@ -17,6 +17,7 @@ import {
   clearCaches,
   type TabPatterns,
   type CrawlInventory,
+  type BatchMatchResult,
 } from "./scraper";
 import { log } from "./index";
 
@@ -199,7 +200,245 @@ export async function registerRoutes(
 }
 
 const DB_BATCH_SIZE = 200;
-const SAMPLE_SIZE = 5;
+const MAX_PASSES = 3;
+
+interface RowData {
+  rowIndex: number;
+  title: string;
+  sourceUrl: string;
+  existingEn: string;
+  existingFr: string;
+  originalEn: string;
+  originalFr: string;
+  needsEn: boolean;
+  needsFr: boolean;
+}
+
+interface TabData {
+  sheetName: string;
+  allRows: RowData[];
+  tabRefRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[];
+  data: any[][];
+}
+
+function parseSheet(
+  sheetName: string,
+  ws: XLSX.WorkSheet,
+  targetLangs: string[]
+): TabData | null {
+  const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
+  if (data.length < 2) return null;
+
+  const tabRefRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[] = [];
+  const allRows: RowData[] = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const title = (row[0] || "").toString().trim();
+    const rawSource = (row[1] || "").toString().trim();
+    const existingEn = (row[2] || "").toString().trim();
+    const existingFr = (row[3] || "").toString().trim();
+
+    let sourceUrl = rawSource;
+    if (!sourceUrl.startsWith("http") && sourceUrl.includes("|")) {
+      const afterPipe = sourceUrl.split("|").pop()?.trim() || "";
+      if (afterPipe.startsWith("http")) sourceUrl = afterPipe;
+    }
+
+    if (!sourceUrl || !sourceUrl.startsWith("http")) continue;
+
+    if (existingEn || existingFr) {
+      tabRefRows.push({
+        sourceUrl,
+        enUrl: existingEn || undefined,
+        frUrl: existingFr || undefined,
+      });
+    }
+
+    const needsEn = targetLangs.includes("en") && !existingEn;
+    const needsFr = targetLangs.includes("fr") && !existingFr;
+
+    allRows.push({ rowIndex: i, title, sourceUrl, existingEn, existingFr, originalEn: existingEn, originalFr: existingFr, needsEn, needsFr });
+  }
+
+  return { sheetName, allRows, tabRefRows, data };
+}
+
+async function matchTab(
+  tabData: TabData,
+  crawlCache: Map<string, CrawlInventory>,
+  control: { cancel: boolean },
+): Promise<{
+  matchResults: Map<number, BatchMatchResult>;
+  enInventory: CrawlInventory | null;
+  frInventory: CrawlInventory | null;
+  tabPatterns: TabPatterns;
+}> {
+  const { sheetName, allRows, tabRefRows } = tabData;
+
+  const tabPatterns = learnTabPatterns(tabRefRows);
+  log(`Tab "${sheetName}": ${tabRefRows.length} reference rows, ${allRows.length} total rows`);
+
+  const needsMatching = allRows.filter((r) => r.needsEn || r.needsFr);
+  const matchResults = new Map<number, BatchMatchResult>();
+  let enInventory: CrawlInventory | null = null;
+  let frInventory: CrawlInventory | null = null;
+
+  if (needsMatching.length === 0 || (tabPatterns.enRoot.length === 0 && tabPatterns.frRoot.length === 0)) {
+    return { matchResults, enInventory, frInventory, tabPatterns };
+  }
+
+  if (tabPatterns.enRoot.length > 0) tabPatterns.patternValidated.en = true;
+  if (tabPatterns.frRoot.length > 0) tabPatterns.patternValidated.fr = true;
+
+  const origin = (() => {
+    for (const ref of tabRefRows) {
+      try { return new URL(ref.sourceUrl).origin; } catch {}
+    }
+    for (const row of allRows) {
+      try { return new URL(row.sourceUrl).origin; } catch {}
+    }
+    return "";
+  })();
+
+  const crawlPromises: Promise<void>[] = [];
+  if (origin && tabPatterns.enRoot.length > 0) {
+    const enScope = tabPatterns.enCrawlScope.length > 0 ? tabPatterns.enCrawlScope : tabPatterns.enRoot;
+    const enCacheKey = `en:${enScope.join("/")}`;
+    if (crawlCache.has(enCacheKey)) {
+      enInventory = crawlCache.get(enCacheKey)!;
+      log(`  EN directory cached: ${enInventory.urls.size} URLs`);
+    } else {
+      log(`  Crawling EN directory: /${enScope.join("/")}/`);
+      crawlPromises.push(
+        crawlDirectory(origin, enScope, (c, q) => {
+          if (c % 50 === 0) log(`    EN crawl progress: ${c} pages fetched, ${q} queued`);
+        }).then(inv => { enInventory = inv; crawlCache.set(enCacheKey, inv); log(`  EN crawl complete: ${inv.urls.size} URLs discovered`); })
+      );
+    }
+  }
+
+  if (origin && tabPatterns.frRoot.length > 0) {
+    const frScope = tabPatterns.frCrawlScope.length > 0 ? tabPatterns.frCrawlScope : tabPatterns.frRoot;
+    const frCacheKey = `fr:${frScope.join("/")}`;
+    if (crawlCache.has(frCacheKey)) {
+      frInventory = crawlCache.get(frCacheKey)!;
+      log(`  FR directory cached: ${frInventory.urls.size} URLs`);
+    } else {
+      log(`  Crawling FR directory: /${frScope.join("/")}/`);
+      crawlPromises.push(
+        crawlDirectory(origin, frScope, (c, q) => {
+          if (c % 50 === 0) log(`    FR crawl progress: ${c} pages fetched, ${q} queued`);
+        }).then(inv => { frInventory = inv; crawlCache.set(frCacheKey, inv); log(`  FR crawl complete: ${inv.urls.size} URLs discovered`); })
+      );
+    }
+  }
+
+  if (crawlPromises.length > 0) await Promise.all(crawlPromises);
+
+  const unmatchedForHead: { index: number; lang: "en" | "fr"; constructedUrl: string }[] = [];
+  for (const row of needsMatching) {
+    if (control.cancel) break;
+    const result: BatchMatchResult = {
+      enUrl: null, frUrl: null,
+      confidenceEn: null, confidenceFr: null,
+      matchMethodEn: null, matchMethodFr: null,
+    };
+
+    if (row.needsEn && tabPatterns.patternValidated.en && enInventory) {
+      const match = matchAgainstInventory(row.sourceUrl, "en", tabPatterns, enInventory);
+      if (match) {
+        result.enUrl = match.url;
+        result.confidenceEn = match.confidence;
+        result.matchMethodEn = match.method;
+      } else {
+        const constructed = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
+        if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: constructed });
+      }
+    }
+
+    if (row.needsFr && tabPatterns.patternValidated.fr && frInventory) {
+      const match = matchAgainstInventory(row.sourceUrl, "fr", tabPatterns, frInventory);
+      if (match) {
+        result.frUrl = match.url;
+        result.confidenceFr = match.confidence;
+        result.matchMethodFr = match.method;
+      } else {
+        const constructed = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
+        if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: constructed });
+      }
+    }
+
+    matchResults.set(row.rowIndex, result);
+  }
+
+  if (unmatchedForHead.length > 0) {
+    log(`  Falling back to HEAD checks for ${unmatchedForHead.length} unmatched URLs...`);
+    const headUrls = unmatchedForHead.map((u) => u.constructedUrl);
+    const existence = await batchHeadCheck(headUrls);
+    let headMatched = 0;
+    for (const item of unmatchedForHead) {
+      if (existence.get(item.constructedUrl)) {
+        const result = matchResults.get(item.index);
+        if (result) {
+          if (item.lang === "en") {
+            result.enUrl = item.constructedUrl;
+            result.confidenceEn = 90;
+            result.matchMethodEn = "pattern+head";
+          } else {
+            result.frUrl = item.constructedUrl;
+            result.confidenceFr = 90;
+            result.matchMethodFr = "pattern+head";
+          }
+          headMatched++;
+        }
+      }
+    }
+    log(`  HEAD fallback: ${headMatched}/${unmatchedForHead.length} verified`);
+  }
+
+  const unmatchedForTitle = needsMatching.filter(row => {
+    const m = matchResults.get(row.rowIndex);
+    return row.title && (
+      (row.needsEn && (!m || !m.enUrl)) ||
+      (row.needsFr && (!m || !m.frUrl))
+    );
+  }).map(row => {
+    const m = matchResults.get(row.rowIndex);
+    return {
+      rowIndex: row.rowIndex,
+      title: row.title,
+      sourceUrl: row.sourceUrl,
+      needsEn: row.needsEn && (!m || !m.enUrl),
+      needsFr: row.needsFr && (!m || !m.frUrl),
+    };
+  });
+
+  if (unmatchedForTitle.length > 0 && (enInventory || frInventory)) {
+    log(`  Attempting title-based matching for ${unmatchedForTitle.length} unmatched URLs...`);
+    const titleMatches = await titleMatchUnmatched(unmatchedForTitle, enInventory, frInventory, storage);
+
+    for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
+      let result = matchResults.get(rowIndex);
+      if (!result) {
+        result = { enUrl: null, frUrl: null, confidenceEn: null, confidenceFr: null, matchMethodEn: null, matchMethodFr: null };
+        matchResults.set(rowIndex, result);
+      }
+      if (titleResult.enUrl && !result.enUrl) {
+        result.enUrl = titleResult.enUrl;
+        result.confidenceEn = titleResult.confidenceEn;
+        result.matchMethodEn = titleResult.matchMethodEn;
+      }
+      if (titleResult.frUrl && !result.frUrl) {
+        result.frUrl = titleResult.frUrl;
+        result.confidenceFr = titleResult.confidenceFr;
+        result.matchMethodFr = titleResult.matchMethodFr;
+      }
+    }
+  }
+
+  return { matchResults, enInventory, frInventory, tabPatterns };
+}
 
 async function processJob(jobId: string, _threshold: number, control: { cancel: boolean }) {
   const filePath = `/tmp/uploads/${jobId}.xlsx`;
@@ -213,333 +452,226 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
   const job = await storage.getJob(jobId);
   if (!job) throw new Error("Job not found");
 
-  const targetLangs = (job.targetLanguages || ["en", "fr"]) as ("en" | "fr" | "ru" | "ar")[];
+  const targetLangs = (job.targetLanguages || ["en", "fr"]) as string[];
   let processedCount = 0;
   let matchedCount = 0;
   const startTime = Date.now();
   const crawlCache = new Map<string, CrawlInventory>();
 
+  const allTabData: TabData[] = [];
   for (const sheetName of workbook.SheetNames) {
+    const ws = workbook.Sheets[sheetName];
+    const td = parseSheet(sheetName, ws, targetLangs);
+    if (td) allTabData.push(td);
+  }
+
+  const globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
+
+  for (let pass = 1; pass <= MAX_PASSES; pass++) {
     if (control.cancel) break;
 
-    const ws = workbook.Sheets[sheetName];
-    const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
-    if (data.length < 2) continue;
+    const passStartTime = Date.now();
+    let passNewMatches = 0;
 
-    const tabStartTime = Date.now();
-    log(`\n=== Processing tab: "${sheetName}" (${data.length - 1} rows) ===`);
-    await storage.updateJob(jobId, { currentStep: "learning" });
+    if (pass > 1) {
+      log(`\n========== PASS ${pass} ==========`);
+      log(`Re-learning patterns from ${pass === 1 ? "original" : "updated"} reference rows...`);
 
-    const tabRefRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[] = [];
-    const allRows: {
-      rowIndex: number;
-      title: string;
-      sourceUrl: string;
-      existingEn: string;
-      existingFr: string;
-      needsEn: boolean;
-      needsFr: boolean;
-    }[] = [];
+      for (const tabData of allTabData) {
+        const prevResults = globalMatchResults.get(tabData.sheetName);
+        if (!prevResults) continue;
 
-    for (let i = 1; i < data.length; i++) {
-      const row = data[i];
-      const title = (row[0] || "").toString().trim();
-      const rawSource = (row[1] || "").toString().trim();
-      const existingEn = (row[2] || "").toString().trim();
-      const existingFr = (row[3] || "").toString().trim();
+        for (const row of tabData.allRows) {
+          const m = prevResults.get(row.rowIndex);
+          if (!m) continue;
+          if (m.enUrl && row.needsEn) {
+            row.existingEn = m.enUrl;
+            row.needsEn = false;
+          }
+          if (m.frUrl && row.needsFr) {
+            row.existingFr = m.frUrl;
+            row.needsFr = false;
+          }
+        }
 
-      let sourceUrl = rawSource;
-      if (!sourceUrl.startsWith("http") && sourceUrl.includes("|")) {
-        const afterPipe = sourceUrl.split("|").pop()?.trim() || "";
-        if (afterPipe.startsWith("http")) sourceUrl = afterPipe;
+        tabData.tabRefRows = [];
+        for (const row of tabData.allRows) {
+          if (row.existingEn || row.existingFr) {
+            tabData.tabRefRows.push({
+              sourceUrl: row.sourceUrl,
+              enUrl: row.existingEn || undefined,
+              frUrl: row.existingFr || undefined,
+            });
+          }
+        }
       }
-
-      if (!sourceUrl || !sourceUrl.startsWith("http")) continue;
-
-      if (existingEn || existingFr) {
-        tabRefRows.push({
-          sourceUrl,
-          enUrl: existingEn || undefined,
-          frUrl: existingFr || undefined,
-        });
-      }
-
-      const needsEn = targetLangs.includes("en") && !existingEn;
-      const needsFr = targetLangs.includes("fr") && !existingFr;
-
-      allRows.push({ rowIndex: i, title, sourceUrl, existingEn, existingFr, needsEn, needsFr });
     }
 
-    const tabPatterns = learnTabPatterns(tabRefRows);
-    log(`Tab "${sheetName}": ${tabRefRows.length} reference rows, ${allRows.length} total rows`);
+    for (const tabData of allTabData) {
+      if (control.cancel) break;
 
-    const needsMatching = allRows.filter((r) => r.needsEn || r.needsFr);
-
-    if (needsMatching.length > 0 && (tabPatterns.enRoot.length > 0 || tabPatterns.frRoot.length > 0)) {
-      await storage.updateJob(jobId, { currentStep: "matching" });
-
-      if (tabPatterns.enRoot.length > 0) tabPatterns.patternValidated.en = true;
-      if (tabPatterns.frRoot.length > 0) tabPatterns.patternValidated.fr = true;
-
-      const origin = (() => {
-        for (const ref of tabRefRows) {
-          try { return new URL(ref.sourceUrl).origin; } catch {}
+      const needsMatching = tabData.allRows.filter((r) => r.needsEn || r.needsFr);
+      if (needsMatching.length === 0) {
+        if (pass === 1) {
+          log(`\n=== Processing tab: "${tabData.sheetName}" (${tabData.allRows.length} rows) ===`);
+          log(`Tab "${tabData.sheetName}": all rows already have matches, skipping`);
         }
-        for (const row of allRows) {
-          try { return new URL(row.sourceUrl).origin; } catch {}
-        }
-        return "";
-      })();
+        continue;
+      }
 
-      let enInventory: CrawlInventory | null = null;
-      let frInventory: CrawlInventory | null = null;
+      const tabStartTime = Date.now();
+      log(`\n=== ${pass > 1 ? `Pass ${pass} - ` : ""}Processing tab: "${tabData.sheetName}" (${needsMatching.length} unmatched) ===`);
 
-      const crawlPromises: Promise<void>[] = [];
-      if (origin && tabPatterns.enRoot.length > 0) {
-        const enScope = tabPatterns.enCrawlScope.length > 0 ? tabPatterns.enCrawlScope : tabPatterns.enRoot;
-        const enCacheKey = `en:${enScope.join("/")}`;
-        if (crawlCache.has(enCacheKey)) {
-          enInventory = crawlCache.get(enCacheKey)!;
-          log(`  EN directory cached: ${enInventory.urls.size} URLs (/${enScope.join("/")})`);
+      await storage.updateJob(jobId, { currentStep: pass > 1 ? `pass${pass}` : "matching" });
+
+      const { matchResults } = await matchTab(tabData, crawlCache, control);
+
+      if (!globalMatchResults.has(tabData.sheetName)) {
+        globalMatchResults.set(tabData.sheetName, new Map());
+      }
+      const sheetGlobal = globalMatchResults.get(tabData.sheetName)!;
+
+      let tabNewMatches = 0;
+      for (const [rowIndex, result] of Array.from(matchResults.entries())) {
+        const existing = sheetGlobal.get(rowIndex);
+        if (!existing) {
+          if (result.enUrl || result.frUrl) {
+            sheetGlobal.set(rowIndex, result);
+            tabNewMatches++;
+          }
         } else {
-          log(`  Crawling EN directory: /${enScope.join("/")}/`);
-          crawlPromises.push(
-            crawlDirectory(origin, enScope, (c, q) => {
-              if (c % 50 === 0) log(`    EN crawl progress: ${c} pages fetched, ${q} queued`);
-            }).then(inv => { enInventory = inv; crawlCache.set(enCacheKey, inv); log(`  EN crawl complete: ${inv.urls.size} URLs discovered`); })
-          );
-        }
-      }
-
-      if (origin && tabPatterns.frRoot.length > 0) {
-        const frScope = tabPatterns.frCrawlScope.length > 0 ? tabPatterns.frCrawlScope : tabPatterns.frRoot;
-        const frCacheKey = `fr:${frScope.join("/")}`;
-        if (crawlCache.has(frCacheKey)) {
-          frInventory = crawlCache.get(frCacheKey)!;
-          log(`  FR directory cached: ${frInventory.urls.size} URLs (/${frScope.join("/")})`);
-        } else {
-          log(`  Crawling FR directory: /${frScope.join("/")}/`);
-          crawlPromises.push(
-            crawlDirectory(origin, frScope, (c, q) => {
-              if (c % 50 === 0) log(`    FR crawl progress: ${c} pages fetched, ${q} queued`);
-            }).then(inv => { frInventory = inv; crawlCache.set(frCacheKey, inv); log(`  FR crawl complete: ${inv.urls.size} URLs discovered`); })
-          );
-        }
-      }
-
-      if (crawlPromises.length > 0) await Promise.all(crawlPromises);
-
-      const matchResults = new Map<number, { enUrl: string | null; frUrl: string | null; confidenceEn: number | null; confidenceFr: number | null; matchMethodEn: string | null; matchMethodFr: string | null }>();
-      const unmatchedForHead: { index: number; lang: "en" | "fr"; constructedUrl: string }[] = [];
-      for (const row of needsMatching) {
-        const result = {
-          enUrl: null as string | null,
-          frUrl: null as string | null,
-          confidenceEn: null as number | null,
-          confidenceFr: null as number | null,
-          matchMethodEn: null as string | null,
-          matchMethodFr: null as string | null,
-        };
-
-        if (row.needsEn && tabPatterns.patternValidated.en) {
-          if (enInventory) {
-            const match = matchAgainstInventory(row.sourceUrl, "en", tabPatterns, enInventory);
-            if (match) {
-              result.enUrl = match.url;
-              result.confidenceEn = match.confidence;
-              result.matchMethodEn = match.method;
-            } else {
-              const constructed = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
-              if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: constructed });
-            }
+          if (result.enUrl && !existing.enUrl) {
+            existing.enUrl = result.enUrl;
+            existing.confidenceEn = result.confidenceEn;
+            existing.matchMethodEn = result.matchMethodEn;
+            tabNewMatches++;
+          }
+          if (result.frUrl && !existing.frUrl) {
+            existing.frUrl = result.frUrl;
+            existing.confidenceFr = result.confidenceFr;
+            existing.matchMethodFr = result.matchMethodFr;
+            tabNewMatches++;
           }
         }
-
-        if (row.needsFr && tabPatterns.patternValidated.fr) {
-          if (frInventory) {
-            const match = matchAgainstInventory(row.sourceUrl, "fr", tabPatterns, frInventory);
-            if (match) {
-              result.frUrl = match.url;
-              result.confidenceFr = match.confidence;
-              result.matchMethodFr = match.method;
-            } else {
-              const constructed = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
-              if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: constructed });
-            }
-          }
-        }
-
-        matchResults.set(row.rowIndex, result);
       }
 
-      if (unmatchedForHead.length > 0) {
-        log(`  Falling back to HEAD checks for ${unmatchedForHead.length} unmatched URLs...`);
-        const headUrls = unmatchedForHead.map((u) => u.constructedUrl);
-        const existence = await batchHeadCheck(headUrls);
-        let headMatched = 0;
-        for (const item of unmatchedForHead) {
-          if (existence.get(item.constructedUrl)) {
-            const result = matchResults.get(item.index);
-            if (result) {
-              if (item.lang === "en") {
-                result.enUrl = item.constructedUrl;
-                result.confidenceEn = 90;
-                result.matchMethodEn = "pattern+head";
-              } else {
-                result.frUrl = item.constructedUrl;
-                result.confidenceFr = 90;
-                result.matchMethodFr = "pattern+head";
-              }
-              headMatched++;
-            }
+      passNewMatches += tabNewMatches;
+
+      const tabTime = ((Date.now() - tabStartTime) / 1000).toFixed(1);
+      log(`Tab "${tabData.sheetName}" done in ${tabTime}s: ${tabNewMatches} new matches this pass`);
+    }
+
+    const passTime = ((Date.now() - passStartTime) / 1000).toFixed(1);
+    log(`\nPass ${pass} completed in ${passTime}s: ${passNewMatches} new matches`);
+
+    if (pass > 1 && passNewMatches === 0) {
+      log(`No new matches in pass ${pass}, stopping multi-pass.`);
+      break;
+    }
+
+    if (pass < MAX_PASSES && passNewMatches > 0) {
+      for (const tabData of allTabData) {
+        const prevResults = globalMatchResults.get(tabData.sheetName);
+        if (!prevResults) continue;
+        for (const row of tabData.allRows) {
+          const m = prevResults.get(row.rowIndex);
+          if (!m) continue;
+          if (m.enUrl && row.needsEn) {
+            row.existingEn = m.enUrl;
+            row.needsEn = false;
+          }
+          if (m.frUrl && row.needsFr) {
+            row.existingFr = m.frUrl;
+            row.needsFr = false;
           }
         }
-        log(`  HEAD fallback: ${headMatched}/${unmatchedForHead.length} verified`);
+        tabData.tabRefRows = [];
+        for (const row of tabData.allRows) {
+          if (row.existingEn || row.existingFr) {
+            tabData.tabRefRows.push({
+              sourceUrl: row.sourceUrl,
+              enUrl: row.existingEn || undefined,
+              frUrl: row.existingFr || undefined,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  for (const tabData of allTabData) {
+    if (control.cancel) break;
+
+    const sheetGlobal = globalMatchResults.get(tabData.sheetName) || new Map();
+    const resultBatch: any[] = [];
+
+    for (const row of tabData.allRows) {
+      if (control.cancel) break;
+      processedCount++;
+
+      const match = sheetGlobal.get(row.rowIndex);
+      let enUrl: string | null = row.originalEn || null;
+      let frUrl: string | null = row.originalFr || null;
+      let confidenceEn: number | null = null;
+      let confidenceFr: number | null = null;
+      let matchMethodEn: string | null = row.originalEn ? "existing" : null;
+      let matchMethodFr: string | null = row.originalFr ? "existing" : null;
+
+      if (match) {
+        let rowHasMatch = false;
+        if (match.enUrl && !row.originalEn) {
+          enUrl = match.enUrl;
+          confidenceEn = match.confidenceEn;
+          matchMethodEn = match.matchMethodEn;
+          rowHasMatch = true;
+        }
+        if (match.frUrl && !row.originalFr) {
+          frUrl = match.frUrl;
+          confidenceFr = match.confidenceFr;
+          matchMethodFr = match.matchMethodFr;
+          rowHasMatch = true;
+        }
+        if (rowHasMatch) matchedCount++;
       }
 
-      const unmatchedForTitle = needsMatching.filter(row => {
-        const m = matchResults.get(row.rowIndex);
-        return row.title && (
-          (row.needsEn && (!m || !m.enUrl)) ||
-          (row.needsFr && (!m || !m.frUrl))
-        );
-      }).map(row => {
-        const m = matchResults.get(row.rowIndex);
-        return {
-          rowIndex: row.rowIndex,
-          title: row.title,
-          sourceUrl: row.sourceUrl,
-          needsEn: row.needsEn && (!m || !m.enUrl),
-          needsFr: row.needsFr && (!m || !m.frUrl),
-        };
+      resultBatch.push({
+        jobId,
+        sheetName: tabData.sheetName,
+        rowIndex: row.rowIndex,
+        title: row.title,
+        sourceUrl: row.sourceUrl,
+        englishUrl: enUrl,
+        frenchUrl: frUrl,
+        russianUrl: null,
+        arabicUrl: null,
+        confidenceEn,
+        confidenceFr,
+        matchMethodEn,
+        matchMethodFr,
+        details: {},
       });
 
-      if (unmatchedForTitle.length > 0 && (enInventory || frInventory)) {
-        log(`  Attempting title-based matching for ${unmatchedForTitle.length} unmatched URLs...`);
-        const titleMatches = await titleMatchUnmatched(unmatchedForTitle, enInventory, frInventory);
-
-        for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
-          let result = matchResults.get(rowIndex);
-          if (!result) {
-            result = { enUrl: null, frUrl: null, confidenceEn: null, confidenceFr: null, matchMethodEn: null, matchMethodFr: null };
-            matchResults.set(rowIndex, result);
-          }
-          if (titleResult.enUrl && !result.enUrl) {
-            result.enUrl = titleResult.enUrl;
-            result.confidenceEn = titleResult.confidenceEn;
-            result.matchMethodEn = titleResult.matchMethodEn;
-          }
-          if (titleResult.frUrl && !result.frUrl) {
-            result.frUrl = titleResult.frUrl;
-            result.confidenceFr = titleResult.confidenceFr;
-            result.matchMethodFr = titleResult.matchMethodFr;
-          }
-        }
-      }
-
-      const crawlMatched = Array.from(matchResults.values()).reduce((acc, m) => {
-        return acc + ((m.enUrl || m.frUrl) ? 1 : 0);
-      }, 0);
-      log(`  Total matches for tab: ${crawlMatched}`);
-
-      const resultBatch: any[] = [];
-
-      for (const row of allRows) {
-        if (control.cancel) break;
-        processedCount++;
-
-        if (!row.needsEn && !row.needsFr) {
-          resultBatch.push({
-            jobId,
-            sheetName,
-            rowIndex: row.rowIndex,
-            title: row.title,
-            sourceUrl: row.sourceUrl,
-            englishUrl: row.existingEn || null,
-            frenchUrl: row.existingFr || null,
-            russianUrl: null,
-            arabicUrl: null,
-            confidenceEn: null,
-            confidenceFr: null,
-            matchMethodEn: row.existingEn ? "existing" : null,
-            matchMethodFr: row.existingFr ? "existing" : null,
-            details: {},
-          });
-        } else {
-          const match = matchResults.get(row.rowIndex);
-
-          let enUrl: string | null = row.existingEn || null;
-          let frUrl: string | null = row.existingFr || null;
-          let confidenceEn: number | null = null;
-          let confidenceFr: number | null = null;
-          let matchMethodEn: string | null = null;
-          let matchMethodFr: string | null = null;
-
-          if (match) {
-            let rowHasMatch = false;
-            if (match.enUrl && row.needsEn) {
-              enUrl = match.enUrl;
-              confidenceEn = match.confidenceEn;
-              matchMethodEn = match.matchMethodEn;
-              rowHasMatch = true;
-            }
-            if (match.frUrl && row.needsFr) {
-              frUrl = match.frUrl;
-              confidenceFr = match.confidenceFr;
-              matchMethodFr = match.matchMethodFr;
-              rowHasMatch = true;
-            }
-            if (rowHasMatch) matchedCount++;
-          }
-
-          resultBatch.push({
-            jobId,
-            sheetName,
-            rowIndex: row.rowIndex,
-            title: row.title,
-            sourceUrl: row.sourceUrl,
-            englishUrl: enUrl,
-            frenchUrl: frUrl,
-            russianUrl: null,
-            arabicUrl: null,
-            confidenceEn,
-            confidenceFr,
-            matchMethodEn,
-            matchMethodFr,
-            details: {},
-          });
-        }
-
-        if (resultBatch.length >= DB_BATCH_SIZE) {
-          await storage.createResults(resultBatch);
-          resultBatch.length = 0;
-          await storage.updateJob(jobId, {
-            processedUrls: processedCount,
-            matchedUrls: matchedCount,
-            currentStep: "matching",
-          });
-        }
-      }
-
-      if (resultBatch.length > 0) {
+      if (resultBatch.length >= DB_BATCH_SIZE) {
         await storage.createResults(resultBatch);
         resultBatch.length = 0;
+        await storage.updateJob(jobId, {
+          processedUrls: processedCount,
+          matchedUrls: matchedCount,
+          currentStep: "saving",
+        });
       }
-    } else {
-      for (const row of allRows) {
-        if (control.cancel) break;
-        processedCount++;
-      }
+    }
+
+    if (resultBatch.length > 0) {
+      await storage.createResults(resultBatch);
+      resultBatch.length = 0;
     }
 
     await storage.updateJob(jobId, {
       processedUrls: processedCount,
       matchedUrls: matchedCount,
-      currentStep: "matching",
+      currentStep: "saving",
     });
-
-    const tabTime = ((Date.now() - tabStartTime) / 1000).toFixed(1);
-    log(`Tab "${sheetName}" done in ${tabTime}s: ${matchedCount} matches so far`);
   }
 
   await storage.updateJob(jobId, {

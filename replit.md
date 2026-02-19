@@ -42,6 +42,7 @@ Preferred communication style: Simple, everyday language.
 - **Schema** (`shared/schema.ts`):
   - `mapping_jobs` — Tracks upload jobs with status, progress counters, target languages, and processing step
   - `mapping_results` — Stores per-URL mapping results with source/target URLs for each language, confidence scores, and match methods
+  - `translation_cache` — Persistent cache for Hebrew→EN/FR translations (keyed by source_text + target_lang), avoids redundant API calls across runs
 - **Push migrations**: Use `npm run db:push` (drizzle-kit push) to sync schema to database
 
 ### Pattern-Based URL Construction Engine (`server/scraper.ts`)
@@ -68,10 +69,31 @@ For each source URL needing a target:
 3. Apply segment-level translations to remaining path parts
 4. Construct full target URL
 
-#### Step 3: Batch HEAD Verification
+#### Step 3: Crawl Inventory Matching
+- Directory crawling builds an inventory of all URLs in target language sections
+- Exact match against constructed URLs (confidence 95)
+- Normalized path matching (confidence 93)
+- Tail-segment matching from the end of URL paths (confidence 85-88)
+- Segment fuzzy matching using word-overlap Jaccard similarity (confidence 80-90)
+- Translated segment matching using learned segment translations (confidence 86)
+
+#### Step 4: Batch HEAD Verification
 - All constructed URLs are verified with HTTP HEAD requests (50 concurrent, 3s timeout)
 - URLs returning non-200 status are discarded
 - Verified URLs get confidence score of 90
+
+#### Step 5: Title-Based Matching
+- For URLs still unmatched after pattern/crawl matching, page titles are extracted and translated Hebrew→EN/FR using Google Translate GTX endpoint
+- Translated titles are fuzzy-matched against crawl inventory page titles using word-overlap similarity
+- 5 concurrent translation requests with rate limiting (200ms between batches)
+- Translation results are cached persistently in the database `translation_cache` table
+
+#### Multi-Pass Processing
+- Jobs automatically run up to 3 passes per processing run
+- After each pass, newly matched URLs are treated as additional reference rows for learning improved transformation patterns
+- Subsequent passes re-run pattern learning and matching on remaining unmatched URLs
+- Processing stops early if a pass produces no new matches
+- This eliminates the need for manual download→re-upload cycles to improve match rates
 
 #### Key Data Structures
 - `TabPatterns`: Contains `enRoot`, `frRoot`, `enSrcRoot`, `frSrcRoot`, `segmentMap`, `patternValidated`

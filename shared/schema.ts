@@ -33,8 +33,18 @@ export const mappingResults = pgTable("mapping_results", {
   details: jsonb("details"),
 });
 
+export const translationCache = pgTable("translation_cache", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  sourceText: text("source_text").notNull(),
+  sourceLang: text("source_lang").notNull().default("he"),
+  targetLang: text("target_lang").notNull(),
+  translatedText: text("translated_text").notNull(),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
 export const insertMappingJobSchema = createInsertSchema(mappingJobs).omit({ id: true, createdAt: true });
 export const insertMappingResultSchema = createInsertSchema(mappingResults).omit({ id: true });
+export const insertTranslationCacheSchema = createInsertSchema(translationCache).omit({ id: true, createdAt: true });
 
 export type InsertMappingJob = z.infer<typeof insertMappingJobSchema>;
 export type MappingJob = typeof mappingJobs.$inferSelect;

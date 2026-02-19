@@ -1,5 +1,6 @@
 import { log } from "./index";
 import * as cheerio from "cheerio";
+import type { IStorage } from "./storage";
 
 export interface MatchScore {
   total: number;
@@ -26,6 +27,10 @@ const HEAD_CONCURRENCY = 50;
 const HEAD_TIMEOUT = 3000;
 
 export function clearCaches() {
+  urlExistenceCache.clear();
+}
+
+export function clearAllCaches() {
   urlExistenceCache.clear();
   translationCache.clear();
 }
@@ -395,6 +400,7 @@ export interface CrawlInventory {
   normalizedIndex: Map<string, string>;
   tailIndex: Map<string, string[]>;
   titleIndex: Map<string, string>;
+  lastSegWordIndex: Map<string, Set<string>>;
 }
 
 function normalizeUrlPath(url: string): string {
@@ -478,6 +484,7 @@ export async function crawlDirectory(
     normalizedIndex: new Map(),
     tailIndex: new Map(),
     titleIndex: new Map(),
+    lastSegWordIndex: new Map(),
   };
 
   const scopePrefix = "/" + rootPath.join("/");
@@ -553,6 +560,100 @@ function addToInventory(inventory: CrawlInventory, url: string) {
       inventory.tailIndex.get(tail)!.push(url);
     }
   }
+
+  const normParts = normalized.split("/");
+  const lastSeg = normParts[normParts.length - 1];
+  if (lastSeg && lastSeg.length > 2) {
+    const words = lastSeg.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2);
+    for (const word of words) {
+      if (!inventory.lastSegWordIndex.has(word)) {
+        inventory.lastSegWordIndex.set(word, new Set());
+      }
+      inventory.lastSegWordIndex.get(word)!.add(normalized);
+    }
+  }
+}
+
+function fuzzySegmentMatch(
+  srcTailParts: string[],
+  lang: "en" | "fr",
+  tabPatterns: TabPatterns,
+  inventory: CrawlInventory
+): { url: string; confidence: number; method: string } | null {
+  const segments = tabPatterns.segmentMap.get(lang);
+  const lastSrc = normalizeSegment(srcTailParts[srcTailParts.length - 1]);
+  if (!lastSrc || lastSrc === "pages" || lastSrc.length <= 3) return null;
+
+  const srcWords = lastSrc.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2);
+  if (srcWords.length === 0) return null;
+
+  const candidateNorms = new Set<string>();
+  for (const word of srcWords) {
+    const urls = inventory.lastSegWordIndex.get(word);
+    if (urls) {
+      for (const u of urls) candidateNorms.add(u);
+    }
+  }
+
+  if (candidateNorms.size > 0) {
+    const result = bestJaccardMatch(srcWords, candidateNorms, inventory);
+    if (result) return { url: result.url, confidence: Math.round(80 + result.score * 10), method: "segment-fuzzy" };
+  }
+
+  if (segments) {
+    const translatedLast = segments.has(lastSrc) ? normalizeSegment(segments.get(lastSrc)!) : lastSrc;
+    if (translatedLast !== lastSrc) {
+      const transWords = translatedLast.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2);
+      if (transWords.length > 0) {
+        const transCandidates = new Set<string>();
+        for (const word of transWords) {
+          const urls = inventory.lastSegWordIndex.get(word);
+          if (urls) {
+            for (const u of urls) transCandidates.add(u);
+          }
+        }
+
+        if (transCandidates.size > 0) {
+          const result = bestJaccardMatch(transWords, transCandidates, inventory);
+          if (result) return { url: result.url, confidence: Math.round(80 + result.score * 10), method: "segment-fuzzy-translated" };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function bestJaccardMatch(
+  srcWords: string[],
+  candidateNorms: Set<string>,
+  inventory: CrawlInventory
+): { url: string; score: number } | null {
+  let best: { url: string; score: number } | null = null;
+  const srcSet = new Set(srcWords);
+
+  for (const normUrl of candidateNorms) {
+    const parts = normUrl.split("/");
+    const lastSeg = parts[parts.length - 1];
+    if (!lastSeg || lastSeg.length < 3) continue;
+
+    const invWords = new Set(lastSeg.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2));
+    if (invWords.size === 0) continue;
+
+    let overlap = 0;
+    for (const w of srcSet) {
+      if (invWords.has(w)) overlap++;
+    }
+    const total = srcSet.size + invWords.size - overlap;
+    const score = total > 0 ? overlap / total : 0;
+
+    if (score >= 0.5 && (!best || score > best.score)) {
+      const realUrl = inventory.normalizedIndex.get(normUrl);
+      if (realUrl) best = { url: realUrl, score };
+    }
+  }
+
+  return best;
 }
 
 export function matchAgainstInventory(
@@ -628,6 +729,11 @@ export function matchAgainstInventory(
           return { url: candidates[0], confidence: 86, method: "crawl-translated-tail" };
         }
       }
+    }
+
+    if (srcTailParts.length >= 1) {
+      const result = fuzzySegmentMatch(srcTailParts, lang, tabPatterns, inventory);
+      if (result) return result;
     }
   } catch {}
 
@@ -719,21 +825,54 @@ const TRANSLATE_CONCURRENCY = 5;
 
 export async function batchTranslate(
   texts: string[],
-  targetLang: "en" | "fr"
+  targetLang: "en" | "fr",
+  dbStorage?: IStorage
 ): Promise<Map<string, string>> {
   const results = new Map<string, string>();
   const uniqueSet = new Set(texts);
   const unique = Array.from(uniqueSet);
+
+  let dbCache: Map<string, string> | null = null;
+  if (dbStorage) {
+    try {
+      dbCache = await dbStorage.getCachedTranslations(targetLang);
+    } catch {}
+  }
+
+  const needsTranslation: string[] = [];
+  for (const text of unique) {
+    const cacheKey = `${text}|${targetLang}`;
+    if (translationCache.has(cacheKey)) {
+      results.set(text, translationCache.get(cacheKey)!);
+    } else if (dbCache && dbCache.has(text)) {
+      const cached = dbCache.get(text)!;
+      results.set(text, cached);
+      translationCache.set(cacheKey, cached);
+    } else {
+      needsTranslation.push(text);
+    }
+  }
+
+  if (results.size > 0 && needsTranslation.length > 0) {
+    log(`    [translate] ${results.size} from cache, ${needsTranslation.length} need translation`);
+  }
+
+  if (needsTranslation.length === 0) {
+    log(`    [translate] All ${results.size} titles found in cache`);
+    return results;
+  }
+
   let consecutiveFailures = 0;
   let totalProcessed = 0;
+  const newTranslations: { sourceText: string; targetLang: string; translatedText: string }[] = [];
 
-  for (let i = 0; i < unique.length; i += TRANSLATE_CONCURRENCY) {
+  for (let i = 0; i < needsTranslation.length; i += TRANSLATE_CONCURRENCY) {
     if (consecutiveFailures >= 8) {
       log(`    [translate] Too many consecutive failures, stopping. Translated ${results.size}/${unique.length}.`);
       break;
     }
 
-    const batch = unique.slice(i, i + TRANSLATE_CONCURRENCY);
+    const batch = needsTranslation.slice(i, i + TRANSLATE_CONCURRENCY);
     const batchResults = await Promise.all(
       batch.map((text) => translateText(text, targetLang).then((r) => ({ text, result: r })))
     );
@@ -741,6 +880,7 @@ export async function batchTranslate(
     for (const { text, result } of batchResults) {
       if (result) {
         results.set(text, result);
+        newTranslations.push({ sourceText: text, targetLang, translatedText: result });
         consecutiveFailures = 0;
       } else {
         consecutiveFailures++;
@@ -749,11 +889,20 @@ export async function batchTranslate(
 
     totalProcessed += batch.length;
 
-    if (totalProcessed % 50 === 0 || i + TRANSLATE_CONCURRENCY >= unique.length) {
-      log(`    [translate] Progress: ${results.size} translated, ${totalProcessed}/${unique.length} processed`);
+    if (totalProcessed % 50 === 0 || i + TRANSLATE_CONCURRENCY >= needsTranslation.length) {
+      log(`    [translate] Progress: ${results.size} translated, ${totalProcessed}/${needsTranslation.length} processed`);
     }
 
     await new Promise((r) => setTimeout(r, 200));
+  }
+
+  if (dbStorage && newTranslations.length > 0) {
+    try {
+      await dbStorage.saveCachedTranslations(newTranslations);
+      log(`    [translate] Saved ${newTranslations.length} new translations to persistent cache`);
+    } catch (e: any) {
+      log(`    [translate] Warning: Failed to save to DB cache: ${e?.message?.substring(0, 80)}`);
+    }
   }
 
   return results;
@@ -794,6 +943,7 @@ export async function titleMatchUnmatched(
   unmatchedRows: { rowIndex: number; title: string; sourceUrl: string; needsEn: boolean; needsFr: boolean }[],
   enInventory: CrawlInventory | null,
   frInventory: CrawlInventory | null,
+  dbStorage?: IStorage,
 ): Promise<Map<number, BatchMatchResult>> {
   const results = new Map<number, BatchMatchResult>();
 
@@ -810,12 +960,12 @@ export async function titleMatchUnmatched(
 
   if (enTitlesNeeded.length > 0) {
     log(`  Translating ${enTitlesNeeded.length} titles to English for title matching...`);
-    enTranslations = await batchTranslate(enTitlesNeeded, "en");
+    enTranslations = await batchTranslate(enTitlesNeeded, "en", dbStorage);
     log(`  Translated ${enTranslations.size} titles to English`);
   }
   if (frTitlesNeeded.length > 0) {
     log(`  Translating ${frTitlesNeeded.length} titles to French for title matching...`);
-    frTranslations = await batchTranslate(frTitlesNeeded, "fr");
+    frTranslations = await batchTranslate(frTitlesNeeded, "fr", dbStorage);
     log(`  Translated ${frTranslations.size} titles to French`);
   }
 
