@@ -992,14 +992,14 @@ export async function titleMatchUnmatched(
     let enMatch: TitleMatchResult | null = null;
     let frMatch: TitleMatchResult | null = null;
 
-    if (row.needsEn && enInventory && enInventory.titleIndex.size > 0) {
+    if (row.needsEn && enInventory && enInventory.titleIndex.size > 0 && enAllowedRoots && enAllowedRoots.length > 0) {
       const enTitle = enTranslations.get(row.title);
       if (enTitle) {
         enMatch = matchByTitle(enTitle, enInventory, 0.85, enAllowedRoots);
       }
     }
 
-    if (row.needsFr && frInventory && frInventory.titleIndex.size > 0) {
+    if (row.needsFr && frInventory && frInventory.titleIndex.size > 0 && frAllowedRoots && frAllowedRoots.length > 0) {
       const frTitle = frTranslations.get(row.title);
       if (frTitle) {
         frMatch = matchByTitle(frTitle, frInventory, 0.85, frAllowedRoots);

@@ -454,13 +454,15 @@ async function matchTab(
 
     const enRootsArr = Array.from(enAllowedRoots);
     const frRootsArr = Array.from(frAllowedRoots);
-    if (enRootsArr.length > 0) log(`  EN allowed roots: ${enRootsArr.join(", ")}`);
-    if (frRootsArr.length > 0) log(`  FR allowed roots: ${frRootsArr.join(", ")}`);
+    if (enRootsArr.length > 0) log(`  EN allowed roots for title matching: ${enRootsArr.join(", ")}`);
+    else log(`  EN title matching SKIPPED: no allowed roots could be determined`);
+    if (frRootsArr.length > 0) log(`  FR allowed roots for title matching: ${frRootsArr.join(", ")}`);
+    else log(`  FR title matching SKIPPED: no allowed roots could be determined`);
 
     const titleMatches = await titleMatchUnmatched(
       unmatchedForTitle, enInventory, frInventory, storage,
-      enRootsArr.length > 0 ? enRootsArr : undefined,
-      frRootsArr.length > 0 ? frRootsArr : undefined,
+      enRootsArr,
+      frRootsArr,
     );
 
     for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
