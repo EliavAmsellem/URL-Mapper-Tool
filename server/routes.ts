@@ -522,7 +522,8 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       const tabStartTime = Date.now();
       log(`\n=== ${pass > 1 ? `Pass ${pass} - ` : ""}Processing tab: "${tabData.sheetName}" (${needsMatching.length} unmatched) ===`);
 
-      await storage.updateJob(jobId, { currentStep: pass > 1 ? `pass${pass}` : "matching" });
+      const stepLabel = pass > 1 ? `pass${pass}:${tabData.sheetName}` : `matching:${tabData.sheetName}`;
+      await storage.updateJob(jobId, { currentStep: stepLabel });
 
       const { matchResults } = await matchTab(tabData, crawlCache, control);
 
@@ -556,6 +557,13 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       }
 
       passNewMatches += tabNewMatches;
+      processedCount += tabData.allRows.length;
+      matchedCount += tabNewMatches;
+
+      await storage.updateJob(jobId, {
+        processedUrls: processedCount,
+        matchedUrls: matchedCount,
+      });
 
       const tabTime = ((Date.now() - tabStartTime) / 1000).toFixed(1);
       log(`Tab "${tabData.sheetName}" done in ${tabTime}s: ${tabNewMatches} new matches this pass`);
@@ -599,6 +607,10 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
     }
   }
 
+  await storage.updateJob(jobId, { currentStep: "saving" });
+
+  let finalMatchedCount = 0;
+
   for (const tabData of allTabData) {
     if (control.cancel) break;
 
@@ -607,7 +619,6 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
     for (const row of tabData.allRows) {
       if (control.cancel) break;
-      processedCount++;
 
       const match = sheetGlobal.get(row.rowIndex);
       let enUrl: string | null = row.originalEn || null;
@@ -631,7 +642,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
           matchMethodFr = match.matchMethodFr;
           rowHasMatch = true;
         }
-        if (rowHasMatch) matchedCount++;
+        if (rowHasMatch) finalMatchedCount++;
       }
 
       resultBatch.push({
@@ -654,11 +665,6 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       if (resultBatch.length >= DB_BATCH_SIZE) {
         await storage.createResults(resultBatch);
         resultBatch.length = 0;
-        await storage.updateJob(jobId, {
-          processedUrls: processedCount,
-          matchedUrls: matchedCount,
-          currentStep: "saving",
-        });
       }
     }
 
@@ -666,18 +672,14 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       await storage.createResults(resultBatch);
       resultBatch.length = 0;
     }
-
-    await storage.updateJob(jobId, {
-      processedUrls: processedCount,
-      matchedUrls: matchedCount,
-      currentStep: "saving",
-    });
   }
+
+  const totalUrls = allTabData.reduce((sum, t) => sum + t.allRows.length, 0);
 
   await storage.updateJob(jobId, {
     status: control.cancel ? "cancelled" : "completed",
-    processedUrls: processedCount,
-    matchedUrls: matchedCount,
+    processedUrls: totalUrls,
+    matchedUrls: finalMatchedCount,
     currentStep: "done",
   });
 
@@ -685,5 +687,5 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
   clearCaches();
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-  log(`\nJob ${jobId} completed in ${totalTime}s: ${matchedCount} matches found out of ${processedCount} URLs`);
+  log(`\nJob ${jobId} completed in ${totalTime}s: ${finalMatchedCount} matches found out of ${totalUrls} URLs`);
 }
