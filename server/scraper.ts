@@ -591,7 +591,7 @@ function fuzzySegmentMatch(
   for (const word of srcWords) {
     const urls = inventory.lastSegWordIndex.get(word);
     if (urls) {
-      for (const u of urls) candidateNorms.add(u);
+      Array.from(urls).forEach(u => candidateNorms.add(u));
     }
   }
 
@@ -609,7 +609,7 @@ function fuzzySegmentMatch(
         for (const word of transWords) {
           const urls = inventory.lastSegWordIndex.get(word);
           if (urls) {
-            for (const u of urls) transCandidates.add(u);
+            Array.from(urls).forEach(u => transCandidates.add(u));
           }
         }
 
@@ -632,18 +632,18 @@ function bestJaccardMatch(
   let best: { url: string; score: number } | null = null;
   const srcSet = new Set(srcWords);
 
-  for (const normUrl of candidateNorms) {
+  for (const normUrl of Array.from(candidateNorms)) {
     const parts = normUrl.split("/");
     const lastSeg = parts[parts.length - 1];
     if (!lastSeg || lastSeg.length < 3) continue;
 
-    const invWords = new Set(lastSeg.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2));
+    const invWords = new Set(lastSeg.replace(/[_\-%20]+/g, " ").split(" ").filter((w: string) => w.length > 2));
     if (invWords.size === 0) continue;
 
     let overlap = 0;
-    for (const w of srcSet) {
+    Array.from(srcSet).forEach(w => {
       if (invWords.has(w)) overlap++;
-    }
+    });
     const total = srcSet.size + invWords.size - overlap;
     const score = total > 0 ? overlap / total : 0;
 
@@ -918,12 +918,21 @@ export interface TitleMatchResult {
 export function matchByTitle(
   translatedTitle: string,
   inventory: CrawlInventory,
-  minSimilarity: number = 0.45
+  minSimilarity: number = 0.85,
+  allowedRoots?: string[]
 ): TitleMatchResult | null {
   let bestMatch: TitleMatchResult | null = null;
   let bestSimilarity = minSimilarity;
 
   inventory.titleIndex.forEach((pageTitle, url) => {
+    if (allowedRoots && allowedRoots.length > 0) {
+      try {
+        const urlPath = new URL(url).pathname.toLowerCase();
+        const matchesRoot = allowedRoots.some(root => urlPath.startsWith(root.toLowerCase()));
+        if (!matchesRoot) return;
+      } catch { return; }
+    }
+
     const sim = titleSimilarity(translatedTitle, pageTitle);
     if (sim > bestSimilarity) {
       bestSimilarity = sim;
@@ -944,6 +953,8 @@ export async function titleMatchUnmatched(
   enInventory: CrawlInventory | null,
   frInventory: CrawlInventory | null,
   dbStorage?: IStorage,
+  enAllowedRoots?: string[],
+  frAllowedRoots?: string[],
 ): Promise<Map<number, BatchMatchResult>> {
   const results = new Map<number, BatchMatchResult>();
 
@@ -970,46 +981,69 @@ export async function titleMatchUnmatched(
   }
 
   let titleMatches = 0;
+  const usedEnUrls = new Set<string>();
+  const usedFrUrls = new Set<string>();
+
+  const candidates: { rowIndex: number; enMatch: TitleMatchResult | null; frMatch: TitleMatchResult | null }[] = [];
 
   for (const row of unmatchedRows) {
     if (!row.title) continue;
 
-    const result: BatchMatchResult = {
-      enUrl: null, frUrl: null,
-      confidenceEn: null, confidenceFr: null,
-      matchMethodEn: null, matchMethodFr: null,
-    };
+    let enMatch: TitleMatchResult | null = null;
+    let frMatch: TitleMatchResult | null = null;
 
     if (row.needsEn && enInventory && enInventory.titleIndex.size > 0) {
       const enTitle = enTranslations.get(row.title);
       if (enTitle) {
-        const match = matchByTitle(enTitle, enInventory);
-        if (match) {
-          result.enUrl = match.url;
-          result.confidenceEn = match.confidence;
-          result.matchMethodEn = match.method;
-        }
+        enMatch = matchByTitle(enTitle, enInventory, 0.85, enAllowedRoots);
       }
     }
 
     if (row.needsFr && frInventory && frInventory.titleIndex.size > 0) {
       const frTitle = frTranslations.get(row.title);
       if (frTitle) {
-        const match = matchByTitle(frTitle, frInventory);
-        if (match) {
-          result.frUrl = match.url;
-          result.confidenceFr = match.confidence;
-          result.matchMethodFr = match.method;
-        }
+        frMatch = matchByTitle(frTitle, frInventory, 0.85, frAllowedRoots);
       }
     }
 
+    if (enMatch || frMatch) {
+      candidates.push({ rowIndex: row.rowIndex, enMatch, frMatch });
+    }
+  }
+
+  candidates.sort((a, b) => {
+    const aConf = Math.max(a.enMatch?.similarity || 0, a.frMatch?.similarity || 0);
+    const bConf = Math.max(b.enMatch?.similarity || 0, b.frMatch?.similarity || 0);
+    return bConf - aConf;
+  });
+
+  for (const candidate of candidates) {
+    const result: BatchMatchResult = {
+      enUrl: null, frUrl: null,
+      confidenceEn: null, confidenceFr: null,
+      matchMethodEn: null, matchMethodFr: null,
+    };
+
+    if (candidate.enMatch && !usedEnUrls.has(candidate.enMatch.url)) {
+      result.enUrl = candidate.enMatch.url;
+      result.confidenceEn = candidate.enMatch.confidence;
+      result.matchMethodEn = candidate.enMatch.method;
+      usedEnUrls.add(candidate.enMatch.url);
+    }
+
+    if (candidate.frMatch && !usedFrUrls.has(candidate.frMatch.url)) {
+      result.frUrl = candidate.frMatch.url;
+      result.confidenceFr = candidate.frMatch.confidence;
+      result.matchMethodFr = candidate.frMatch.method;
+      usedFrUrls.add(candidate.frMatch.url);
+    }
+
     if (result.enUrl || result.frUrl) {
-      results.set(row.rowIndex, result);
+      results.set(candidate.rowIndex, result);
       titleMatches++;
     }
   }
 
-  log(`  Title matching found ${titleMatches} new matches`);
+  log(`  Title matching found ${titleMatches} new matches (${usedEnUrls.size} EN, ${usedFrUrls.size} FR unique URLs)`);
   return results;
 }

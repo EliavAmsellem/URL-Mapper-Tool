@@ -416,7 +416,52 @@ async function matchTab(
 
   if (unmatchedForTitle.length > 0 && (enInventory || frInventory)) {
     log(`  Attempting title-based matching for ${unmatchedForTitle.length} unmatched URLs...`);
-    const titleMatches = await titleMatchUnmatched(unmatchedForTitle, enInventory, frInventory, storage);
+
+    const enAllowedRoots = new Set<string>();
+    const frAllowedRoots = new Set<string>();
+
+    if (tabPatterns.enRoot.length > 0) {
+      enAllowedRoots.add("/" + tabPatterns.enRoot.join("/") + "/");
+    }
+    if (tabPatterns.frRoot.length > 0) {
+      frAllowedRoots.add("/" + tabPatterns.frRoot.join("/") + "/");
+    }
+
+    for (const ref of tabRefRows) {
+      if (ref.enUrl) {
+        try {
+          const enPath = new URL(ref.enUrl).pathname;
+          const enParts = enPath.split("/").filter(Boolean);
+          if (enParts.length >= 2) {
+            enAllowedRoots.add("/" + enParts.slice(0, 2).join("/") + "/");
+          } else if (enParts.length >= 1) {
+            enAllowedRoots.add("/" + enParts[0] + "/");
+          }
+        } catch {}
+      }
+      if (ref.frUrl) {
+        try {
+          const frPath = new URL(ref.frUrl).pathname;
+          const frParts = frPath.split("/").filter(Boolean);
+          if (frParts.length >= 2) {
+            frAllowedRoots.add("/" + frParts.slice(0, 2).join("/") + "/");
+          } else if (frParts.length >= 1) {
+            frAllowedRoots.add("/" + frParts[0] + "/");
+          }
+        } catch {}
+      }
+    }
+
+    const enRootsArr = Array.from(enAllowedRoots);
+    const frRootsArr = Array.from(frAllowedRoots);
+    if (enRootsArr.length > 0) log(`  EN allowed roots: ${enRootsArr.join(", ")}`);
+    if (frRootsArr.length > 0) log(`  FR allowed roots: ${frRootsArr.join(", ")}`);
+
+    const titleMatches = await titleMatchUnmatched(
+      unmatchedForTitle, enInventory, frInventory, storage,
+      enRootsArr.length > 0 ? enRootsArr : undefined,
+      frRootsArr.length > 0 ? frRootsArr : undefined,
+    );
 
     for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
       let result = matchResults.get(rowIndex);
