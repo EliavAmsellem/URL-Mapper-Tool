@@ -44,6 +44,7 @@
     "@tanstack/react-query": "^5.60.5",
     "@types/multer": "^2.0.0",
     "@types/papaparse": "^5.5.2",
+    "@vitalets/google-translate-api": "^9.2.1",
     "cheerio": "^1.2.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
