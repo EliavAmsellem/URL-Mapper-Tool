@@ -88,6 +88,16 @@ export async function registerRoutes(
       if (!job) return res.status(404).json({ message: "Job not found" });
 
       const threshold = parseInt(req.body?.threshold as string) || 85;
+
+      for (const [existingJobId, existingControl] of Array.from(activeJobs.entries())) {
+        if (existingJobId !== jobId) {
+          log(`Cancelling previous job ${existingJobId} before starting new job ${jobId}`);
+          existingControl.cancel = true;
+          await storage.updateJob(existingJobId, { status: "cancelled", currentStep: "done" });
+          activeJobs.delete(existingJobId);
+        }
+      }
+
       const control = { cancel: false };
       activeJobs.set(jobId, control);
 

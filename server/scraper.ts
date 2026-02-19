@@ -672,22 +672,50 @@ function titleSimilarity(a: string, b: string): number {
   return Math.min(jaccard + containsBonus, 1.0);
 }
 
+async function translateWithGTX(text: string, source: string, target: string): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    const encoded = encodeURIComponent(text);
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${source}&tl=${target}&dt=t&q=${encoded}`;
+    const resp = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      },
+    });
+    clearTimeout(timeout);
+    if (!resp.ok) return null;
+    const data = await resp.json() as any;
+    if (Array.isArray(data) && Array.isArray(data[0])) {
+      const translated = data[0].map((s: any) => s[0]).join("");
+      return translated || null;
+    }
+  } catch {}
+  return null;
+}
+
 async function translateText(text: string, targetLang: "en" | "fr"): Promise<string | null> {
   const cacheKey = `${text}|${targetLang}`;
   if (translationCache.has(cacheKey)) return translationCache.get(cacheKey)!;
 
-  try {
-    const { translate } = await import("@vitalets/google-translate-api");
-    const result = await translate(text, { to: targetLang === "en" ? "en" : "fr" });
-    translationCache.set(cacheKey, result.text);
-    return result.text;
-  } catch (e: any) {
-    return null;
+  const result = await translateWithGTX(text, "he", targetLang);
+  if (result) {
+    translationCache.set(cacheKey, result);
+    return result;
   }
+
+  await new Promise((r) => setTimeout(r, 500));
+  const retry = await translateWithGTX(text, "he", targetLang);
+  if (retry) {
+    translationCache.set(cacheKey, retry);
+    return retry;
+  }
+
+  return null;
 }
 
-const TRANSLATE_BATCH_SIZE = 10;
-const TRANSLATE_DELAY = 200;
+const TRANSLATE_CONCURRENCY = 5;
 
 export async function batchTranslate(
   texts: string[],
@@ -696,21 +724,36 @@ export async function batchTranslate(
   const results = new Map<string, string>();
   const uniqueSet = new Set(texts);
   const unique = Array.from(uniqueSet);
+  let consecutiveFailures = 0;
+  let totalProcessed = 0;
 
-  for (let i = 0; i < unique.length; i += TRANSLATE_BATCH_SIZE) {
-    const batch = unique.slice(i, i + TRANSLATE_BATCH_SIZE);
-    const translations = await Promise.all(
-      batch.map(async (text) => {
-        const translated = await translateText(text, targetLang);
-        return { text, translated };
-      })
+  for (let i = 0; i < unique.length; i += TRANSLATE_CONCURRENCY) {
+    if (consecutiveFailures >= 8) {
+      log(`    [translate] Too many consecutive failures, stopping. Translated ${results.size}/${unique.length}.`);
+      break;
+    }
+
+    const batch = unique.slice(i, i + TRANSLATE_CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map((text) => translateText(text, targetLang).then((r) => ({ text, result: r })))
     );
-    for (const { text, translated } of translations) {
-      if (translated) results.set(text, translated);
+
+    for (const { text, result } of batchResults) {
+      if (result) {
+        results.set(text, result);
+        consecutiveFailures = 0;
+      } else {
+        consecutiveFailures++;
+      }
     }
-    if (i + TRANSLATE_BATCH_SIZE < unique.length) {
-      await new Promise((r) => setTimeout(r, TRANSLATE_DELAY));
+
+    totalProcessed += batch.length;
+
+    if (totalProcessed % 50 === 0 || i + TRANSLATE_CONCURRENCY >= unique.length) {
+      log(`    [translate] Progress: ${results.size} translated, ${totalProcessed}/${unique.length} processed`);
     }
+
+    await new Promise((r) => setTimeout(r, 200));
   }
 
   return results;
