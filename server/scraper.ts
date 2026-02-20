@@ -919,10 +919,16 @@ export function matchByTitle(
   translatedTitle: string,
   inventory: CrawlInventory,
   minSimilarity: number = 0.85,
-  allowedRoots?: string[]
+  allowedRoots?: string[],
+  refDepths?: number[],
+  sourceSegments?: Set<string>,
 ): TitleMatchResult | null {
   let bestMatch: TitleMatchResult | null = null;
   let bestSimilarity = minSimilarity;
+  let secondBestSimilarity = 0;
+
+  const minDepth = refDepths && refDepths.length > 0 ? Math.min(...refDepths) - 2 : 0;
+  const maxDepth = refDepths && refDepths.length > 0 ? Math.max(...refDepths) + 2 : Infinity;
 
   inventory.titleIndex.forEach((pageTitle, url) => {
     if (allowedRoots && allowedRoots.length > 0) {
@@ -933,8 +939,16 @@ export function matchByTitle(
       } catch { return; }
     }
 
+    if (refDepths && refDepths.length > 0) {
+      try {
+        const urlParts = new URL(url).pathname.split("/").filter(Boolean);
+        if (urlParts.length < minDepth || urlParts.length > maxDepth) return;
+      } catch { return; }
+    }
+
     const sim = titleSimilarity(translatedTitle, pageTitle);
     if (sim > bestSimilarity) {
+      secondBestSimilarity = bestSimilarity;
       bestSimilarity = sim;
       bestMatch = {
         url,
@@ -942,10 +956,42 @@ export function matchByTitle(
         method: "title-match",
         similarity: sim,
       };
+    } else if (sim > secondBestSimilarity) {
+      secondBestSimilarity = sim;
     }
   });
 
-  return bestMatch;
+  const finalMatch = bestMatch as TitleMatchResult | null;
+  if (finalMatch) {
+    const gap = bestSimilarity - secondBestSimilarity;
+    if (gap < 0.05 && bestSimilarity < 0.95) {
+      log(`    Title match REJECTED (ambiguous): "${translatedTitle}" best=${bestSimilarity.toFixed(3)} second=${secondBestSimilarity.toFixed(3)} gap=${gap.toFixed(3)}`);
+      return null;
+    }
+
+    if (!sourceSegments || sourceSegments.size === 0) {
+      log(`    Title match REJECTED (no source segments to validate): "${translatedTitle}" -> ${finalMatch.url}`);
+      return null;
+    }
+
+    try {
+      const matchParts = new URL(finalMatch.url).pathname.split("/").filter(Boolean);
+      const matchNorms = matchParts.map(p => normalizeSegment(p));
+      let sharedSegments = 0;
+      for (const seg of matchNorms) {
+        if (sourceSegments.has(seg)) sharedSegments++;
+      }
+      if (sharedSegments === 0 && matchNorms.length > 2) {
+        log(`    Title match REJECTED (no shared segments): "${translatedTitle}" -> ${finalMatch.url}`);
+        return null;
+      }
+    } catch {
+      log(`    Title match REJECTED (URL parse error): "${translatedTitle}" -> ${finalMatch.url}`);
+      return null;
+    }
+  }
+
+  return finalMatch;
 }
 
 export async function titleMatchUnmatched(
@@ -955,6 +1001,10 @@ export async function titleMatchUnmatched(
   dbStorage?: IStorage,
   enAllowedRoots?: string[],
   frAllowedRoots?: string[],
+  enRefDepths?: number[],
+  frRefDepths?: number[],
+  knownEnUrls?: Set<string>,
+  knownFrUrls?: Set<string>,
 ): Promise<Map<number, BatchMatchResult>> {
   const results = new Map<number, BatchMatchResult>();
 
@@ -963,8 +1013,8 @@ export async function titleMatchUnmatched(
   const titles = unmatchedRows.map((r) => r.title).filter(Boolean);
   if (titles.length === 0) return results;
 
-  const enTitlesNeeded = unmatchedRows.filter(r => r.needsEn && enInventory && enInventory.titleIndex.size > 0).map(r => r.title).filter(Boolean);
-  const frTitlesNeeded = unmatchedRows.filter(r => r.needsFr && frInventory && frInventory.titleIndex.size > 0).map(r => r.title).filter(Boolean);
+  const enTitlesNeeded = unmatchedRows.filter(r => r.needsEn && enInventory && enInventory.titleIndex.size > 0 && enAllowedRoots && enAllowedRoots.length > 0).map(r => r.title).filter(Boolean);
+  const frTitlesNeeded = unmatchedRows.filter(r => r.needsFr && frInventory && frInventory.titleIndex.size > 0 && frAllowedRoots && frAllowedRoots.length > 0).map(r => r.title).filter(Boolean);
 
   let enTranslations = new Map<string, string>();
   let frTranslations = new Map<string, string>();
@@ -981,13 +1031,25 @@ export async function titleMatchUnmatched(
   }
 
   let titleMatches = 0;
+  let rejected = { ambiguous: 0, noSegments: 0, depth: 0, crossValidation: 0, knownUrl: 0 };
   const usedEnUrls = new Set<string>();
   const usedFrUrls = new Set<string>();
 
-  const candidates: { rowIndex: number; enMatch: TitleMatchResult | null; frMatch: TitleMatchResult | null }[] = [];
+  const candidates: { rowIndex: number; sourceUrl: string; enMatch: TitleMatchResult | null; frMatch: TitleMatchResult | null }[] = [];
 
   for (const row of unmatchedRows) {
     if (!row.title) continue;
+
+    const sourceSegments = new Set<string>();
+    try {
+      const srcParts = new URL(row.sourceUrl).pathname.split("/").filter(Boolean);
+      for (const p of srcParts) {
+        const norm = normalizeSegment(p);
+        if (norm && norm !== "pages" && norm !== "default.aspx" && norm.length > 3) {
+          sourceSegments.add(norm);
+        }
+      }
+    } catch {}
 
     let enMatch: TitleMatchResult | null = null;
     let frMatch: TitleMatchResult | null = null;
@@ -995,19 +1057,19 @@ export async function titleMatchUnmatched(
     if (row.needsEn && enInventory && enInventory.titleIndex.size > 0 && enAllowedRoots && enAllowedRoots.length > 0) {
       const enTitle = enTranslations.get(row.title);
       if (enTitle) {
-        enMatch = matchByTitle(enTitle, enInventory, 0.85, enAllowedRoots);
+        enMatch = matchByTitle(enTitle, enInventory, 0.85, enAllowedRoots, enRefDepths, sourceSegments);
       }
     }
 
     if (row.needsFr && frInventory && frInventory.titleIndex.size > 0 && frAllowedRoots && frAllowedRoots.length > 0) {
       const frTitle = frTranslations.get(row.title);
       if (frTitle) {
-        frMatch = matchByTitle(frTitle, frInventory, 0.85, frAllowedRoots);
+        frMatch = matchByTitle(frTitle, frInventory, 0.85, frAllowedRoots, frRefDepths, sourceSegments);
       }
     }
 
     if (enMatch || frMatch) {
-      candidates.push({ rowIndex: row.rowIndex, enMatch, frMatch });
+      candidates.push({ rowIndex: row.rowIndex, sourceUrl: row.sourceUrl, enMatch, frMatch });
     }
   }
 
@@ -1018,24 +1080,79 @@ export async function titleMatchUnmatched(
   });
 
   for (const candidate of candidates) {
+    let enMatch = candidate.enMatch;
+    let frMatch = candidate.frMatch;
+
+    if (enMatch && frMatch) {
+      try {
+        const enTail = new URL(enMatch.url).pathname.split("/").filter(Boolean).slice(-2).map(p => normalizeSegment(p));
+        const frTail = new URL(frMatch.url).pathname.split("/").filter(Boolean).slice(-2).map(p => normalizeSegment(p));
+        let tailOverlap = 0;
+        for (const seg of enTail) {
+          if (frTail.some(f => f === seg || (seg.length > 4 && f.includes(seg)) || (f.length > 4 && seg.includes(f)))) {
+            tailOverlap++;
+          }
+        }
+        if (tailOverlap === 0 && enTail.length > 0 && frTail.length > 0) {
+          log(`    Cross-validation REJECTED BOTH: EN "${enMatch.url}" vs FR "${frMatch.url}" (no tail overlap, disagreement)`);
+          enMatch = null;
+          frMatch = null;
+          rejected.crossValidation += 2;
+        }
+      } catch {}
+
+      if (enMatch && enMatch.similarity < 0.90) {
+        log(`    Paired EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.90): "${enMatch.url}"`);
+        enMatch = null;
+        rejected.crossValidation++;
+      }
+      if (frMatch && frMatch.similarity < 0.90) {
+        log(`    Paired FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.90): "${frMatch.url}"`);
+        frMatch = null;
+        rejected.crossValidation++;
+      }
+    } else if (enMatch && !frMatch) {
+      if (enMatch.similarity < 0.92) {
+        log(`    Single-lang EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.92): "${enMatch.url}"`);
+        enMatch = null;
+        rejected.crossValidation++;
+      }
+    } else if (frMatch && !enMatch) {
+      if (frMatch.similarity < 0.92) {
+        log(`    Single-lang FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.92): "${frMatch.url}"`);
+        frMatch = null;
+        rejected.crossValidation++;
+      }
+    }
+
     const result: BatchMatchResult = {
       enUrl: null, frUrl: null,
       confidenceEn: null, confidenceFr: null,
       matchMethodEn: null, matchMethodFr: null,
     };
 
-    if (candidate.enMatch && !usedEnUrls.has(candidate.enMatch.url)) {
-      result.enUrl = candidate.enMatch.url;
-      result.confidenceEn = candidate.enMatch.confidence;
-      result.matchMethodEn = candidate.enMatch.method;
-      usedEnUrls.add(candidate.enMatch.url);
+    if (enMatch && !usedEnUrls.has(enMatch.url)) {
+      if (knownEnUrls && knownEnUrls.has(enMatch.url)) {
+        log(`    Title match REJECTED (already known EN ref): ${enMatch.url}`);
+        rejected.knownUrl++;
+      } else {
+        result.enUrl = enMatch.url;
+        result.confidenceEn = enMatch.confidence;
+        result.matchMethodEn = enMatch.method;
+        usedEnUrls.add(enMatch.url);
+      }
     }
 
-    if (candidate.frMatch && !usedFrUrls.has(candidate.frMatch.url)) {
-      result.frUrl = candidate.frMatch.url;
-      result.confidenceFr = candidate.frMatch.confidence;
-      result.matchMethodFr = candidate.frMatch.method;
-      usedFrUrls.add(candidate.frMatch.url);
+    if (frMatch && !usedFrUrls.has(frMatch.url)) {
+      if (knownFrUrls && knownFrUrls.has(frMatch.url)) {
+        log(`    Title match REJECTED (already known FR ref): ${frMatch.url}`);
+        rejected.knownUrl++;
+      } else {
+        result.frUrl = frMatch.url;
+        result.confidenceFr = frMatch.confidence;
+        result.matchMethodFr = frMatch.method;
+        usedFrUrls.add(frMatch.url);
+      }
     }
 
     if (result.enUrl || result.frUrl) {
@@ -1045,5 +1162,6 @@ export async function titleMatchUnmatched(
   }
 
   log(`  Title matching found ${titleMatches} new matches (${usedEnUrls.size} EN, ${usedFrUrls.size} FR unique URLs)`);
+  log(`  Title rejections: ambiguous=${rejected.ambiguous}, noSharedSegments=${rejected.noSegments}, crossValidation=${rejected.crossValidation}, knownUrl=${rejected.knownUrl}`);
   return results;
 }

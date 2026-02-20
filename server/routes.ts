@@ -459,10 +459,43 @@ async function matchTab(
     if (frRootsArr.length > 0) log(`  FR allowed roots for title matching: ${frRootsArr.join(", ")}`);
     else log(`  FR title matching SKIPPED: no allowed roots could be determined`);
 
+    const enRefDepths: number[] = [];
+    const frRefDepths: number[] = [];
+    const knownEnUrls = new Set<string>();
+    const knownFrUrls = new Set<string>();
+
+    for (const ref of tabRefRows) {
+      if (ref.enUrl) {
+        try {
+          enRefDepths.push(new URL(ref.enUrl).pathname.split("/").filter(Boolean).length);
+          knownEnUrls.add(ref.enUrl);
+        } catch {}
+      }
+      if (ref.frUrl) {
+        try {
+          frRefDepths.push(new URL(ref.frUrl).pathname.split("/").filter(Boolean).length);
+          knownFrUrls.add(ref.frUrl);
+        } catch {}
+      }
+    }
+
+    for (const [, mr] of Array.from(matchResults.entries())) {
+      if (mr.enUrl) knownEnUrls.add(mr.enUrl);
+      if (mr.frUrl) knownFrUrls.add(mr.frUrl);
+    }
+
+    if (enRefDepths.length > 0) log(`  EN ref depths: min=${Math.min(...enRefDepths)} max=${Math.max(...enRefDepths)} (${enRefDepths.length} refs)`);
+    if (frRefDepths.length > 0) log(`  FR ref depths: min=${Math.min(...frRefDepths)} max=${Math.max(...frRefDepths)} (${frRefDepths.length} refs)`);
+    log(`  Known URLs to exclude: ${knownEnUrls.size} EN, ${knownFrUrls.size} FR`);
+
     const titleMatches = await titleMatchUnmatched(
       unmatchedForTitle, enInventory, frInventory, storage,
       enRootsArr,
       frRootsArr,
+      enRefDepths.length > 0 ? enRefDepths : undefined,
+      frRefDepths.length > 0 ? frRefDepths : undefined,
+      knownEnUrls,
+      knownFrUrls,
     );
 
     for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
