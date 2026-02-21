@@ -517,18 +517,26 @@ export async function crawlDirectory(
     for (const { url, html } of results) {
       crawled++;
 
-      addToInventory(inventory, url);
-
       if (html) {
+        addToInventory(inventory, url);
+
         const $ = cheerio.load(html);
         const pageTitle = $("title").first().text().trim();
         if (pageTitle) {
-          inventory.titleIndex.set(url, pageTitle);
+          const lowerTitle = pageTitle.toLowerCase();
+          const isErrorPage = lowerTitle.includes("page not found") ||
+            lowerTitle.includes("404 -") ||
+            lowerTitle.includes("שגיאה") ||
+            lowerTitle.includes("הדף לא נמצא");
+          if (isErrorPage) {
+            removeFromInventory(inventory, url);
+          } else {
+            inventory.titleIndex.set(url, pageTitle);
+          }
         }
 
         const links = extractLinks(html, url, scopePrefix);
         for (const link of links) {
-          addToInventory(inventory, link);
           if (!visited.has(link)) {
             queue.push(link);
           }
@@ -542,6 +550,36 @@ export async function crawlDirectory(
   }
 
   return inventory;
+}
+
+function removeFromInventory(inventory: CrawlInventory, url: string) {
+  inventory.urls.delete(url);
+  const normalized = normalizeUrlPath(url);
+  inventory.normalizedIndex.delete(normalized);
+  inventory.titleIndex.delete(url);
+
+  for (let tailLen = 1; tailLen <= 3; tailLen++) {
+    const tail = getUrlTail(url, tailLen);
+    if (tail && inventory.tailIndex.has(tail)) {
+      const arr = inventory.tailIndex.get(tail)!;
+      const idx = arr.indexOf(url);
+      if (idx >= 0) arr.splice(idx, 1);
+      if (arr.length === 0) inventory.tailIndex.delete(tail);
+    }
+  }
+
+  const normParts = normalized.split("/");
+  const lastSeg = normParts[normParts.length - 1];
+  if (lastSeg && lastSeg.length > 2) {
+    const words = lastSeg.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2);
+    for (const word of words) {
+      const set = inventory.lastSegWordIndex.get(word);
+      if (set) {
+        set.delete(normalized);
+        if (set.size === 0) inventory.lastSegWordIndex.delete(word);
+      }
+    }
+  }
 }
 
 function addToInventory(inventory: CrawlInventory, url: string) {
@@ -656,6 +694,96 @@ function bestJaccardMatch(
   return best;
 }
 
+function getSourceSectionSegment(sourceUrl: string, sourceRoot: string[]): string | null {
+  try {
+    const parsed = new URL(sourceUrl);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const cleanParts = stripSuffix(parts);
+    const afterRoot = sourceRoot.length > 0 ? cleanParts.slice(sourceRoot.length) : cleanParts;
+    if (afterRoot.length > 0) {
+      const seg = normalizeSegment(afterRoot[0]);
+      if (seg && seg !== "pages" && seg !== "default.aspx" && seg.length > 2) {
+        return seg;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function validateSectionContext(
+  candidateUrl: string,
+  sourceUrl: string,
+  lang: "en" | "fr",
+  tabPatterns: TabPatterns
+): boolean {
+  const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
+  const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
+  const segments = tabPatterns.segmentMap.get(lang);
+
+  const srcSection = getSourceSectionSegment(sourceUrl, sourceRoot);
+  if (!srcSection) return true;
+
+  try {
+    const candidateParts = new URL(candidateUrl).pathname.split("/").filter(Boolean);
+    const afterRoot = candidateParts.slice(targetRoot.length);
+    if (afterRoot.length === 0) return true;
+
+    const candidateSection = normalizeSegment(afterRoot[0]);
+
+    if (candidateSection === srcSection) return true;
+
+    if (segments) {
+      const translatedSection = segments.has(srcSection) ? normalizeSegment(segments.get(srcSection)!) : null;
+      if (translatedSection && candidateSection === translatedSection) return true;
+    }
+
+    const srcWords = srcSection.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2);
+    const candWords = candidateSection.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2);
+    if (srcWords.length > 0 && candWords.length > 0) {
+      let overlap = 0;
+      for (const w of srcWords) {
+        if (candWords.some(cw => cw === w || (w.length > 4 && cw.includes(w)) || (cw.length > 4 && w.includes(cw)))) {
+          overlap++;
+        }
+      }
+      if (overlap > 0) return true;
+    }
+
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function validateDepthMatch(
+  sourceUrl: string,
+  candidateUrl: string,
+  sourceRoot: string[],
+  targetRoot: string[]
+): boolean {
+  try {
+    const srcParts = new URL(sourceUrl).pathname.split("/").filter(Boolean);
+    const srcClean = stripSuffix(srcParts);
+    const srcDepthAfterRoot = srcClean.length - sourceRoot.length;
+
+    const tgtParts = new URL(candidateUrl).pathname.split("/").filter(Boolean);
+    const tgtClean = stripSuffix(tgtParts);
+    const tgtDepthAfterRoot = tgtClean.length - targetRoot.length;
+
+    if (srcDepthAfterRoot >= 2 && tgtDepthAfterRoot <= 0) {
+      return false;
+    }
+
+    if (srcDepthAfterRoot >= 3 && tgtDepthAfterRoot <= 1) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 export function matchAgainstInventory(
   sourceUrl: string,
   lang: "en" | "fr",
@@ -663,15 +791,20 @@ export function matchAgainstInventory(
   inventory: CrawlInventory
 ): { url: string; confidence: number; method: string } | null {
   const constructedUrl = constructTargetUrl(sourceUrl, lang, tabPatterns);
-  if (constructedUrl && inventory.urls.has(constructedUrl)) {
-    return { url: constructedUrl, confidence: 95, method: "pattern+crawl" };
-  }
+  const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
+  const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
 
   if (constructedUrl) {
-    const constructedNorm = normalizeUrlPath(constructedUrl);
-    const inventoryUrl = inventory.normalizedIndex.get(constructedNorm);
-    if (inventoryUrl) {
-      return { url: inventoryUrl, confidence: 93, method: "pattern+crawl-norm" };
+    if (!validateDepthMatch(sourceUrl, constructedUrl, sourceRoot, targetRoot)) {
+      log(`    REJECTED (parent-only, depth mismatch): ${sourceUrl} -> ${constructedUrl}`);
+    } else if (inventory.urls.has(constructedUrl)) {
+      return { url: constructedUrl, confidence: 95, method: "pattern+crawl" };
+    } else {
+      const constructedNorm = normalizeUrlPath(constructedUrl);
+      const inventoryUrl = inventory.normalizedIndex.get(constructedNorm);
+      if (inventoryUrl) {
+        return { url: inventoryUrl, confidence: 93, method: "pattern+crawl-norm" };
+      }
     }
   }
 
@@ -679,8 +812,6 @@ export function matchAgainstInventory(
     const parsed = new URL(sourceUrl);
     const srcParts = parsed.pathname.split("/").filter(Boolean);
     const cleanSrc = stripSuffix(srcParts);
-
-    const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
 
     let srcTailParts: string[];
     if (sourceRoot.length > 0) {
@@ -700,15 +831,23 @@ export function matchAgainstInventory(
       if (lastSeg && lastSeg !== "pages") {
         const tail1 = lastSeg;
         const candidates = inventory.tailIndex.get(tail1) || [];
-        if (candidates.length === 1) {
-          return { url: candidates[0], confidence: 85, method: "crawl-tail" };
+
+        const sectionFiltered = candidates.filter(c => validateSectionContext(c, sourceUrl, lang, tabPatterns));
+
+        if (sectionFiltered.length === 1) {
+          if (validateDepthMatch(sourceUrl, sectionFiltered[0], sourceRoot, targetRoot)) {
+            return { url: sectionFiltered[0], confidence: 85, method: "crawl-tail" };
+          }
         }
 
-        if (srcTailParts.length >= 2 && candidates.length > 1) {
+        if (srcTailParts.length >= 2 && (sectionFiltered.length > 1 || sectionFiltered.length === 0)) {
           const tail2 = srcTailParts.slice(-2).map((p) => normalizeSegment(p)).join("/");
           const candidates2 = inventory.tailIndex.get(tail2) || [];
-          if (candidates2.length === 1) {
-            return { url: candidates2[0], confidence: 88, method: "crawl-tail2" };
+          const sectionFiltered2 = candidates2.filter(c => validateSectionContext(c, sourceUrl, lang, tabPatterns));
+          if (sectionFiltered2.length === 1) {
+            if (validateDepthMatch(sourceUrl, sectionFiltered2[0], sourceRoot, targetRoot)) {
+              return { url: sectionFiltered2[0], confidence: 88, method: "crawl-tail2" };
+            }
           }
         }
       }
@@ -725,15 +864,20 @@ export function matchAgainstInventory(
       for (let tailLen = Math.min(translatedTail.length, 3); tailLen >= 1; tailLen--) {
         const tailKey = translatedTail.slice(-tailLen).join("/");
         const candidates = inventory.tailIndex.get(tailKey) || [];
-        if (candidates.length === 1) {
-          return { url: candidates[0], confidence: 86, method: "crawl-translated-tail" };
+        const sectionFiltered = candidates.filter(c => validateSectionContext(c, sourceUrl, lang, tabPatterns));
+        if (sectionFiltered.length === 1) {
+          if (validateDepthMatch(sourceUrl, sectionFiltered[0], sourceRoot, targetRoot)) {
+            return { url: sectionFiltered[0], confidence: 86, method: "crawl-translated-tail" };
+          }
         }
       }
     }
 
     if (srcTailParts.length >= 1) {
       const result = fuzzySegmentMatch(srcTailParts, lang, tabPatterns, inventory);
-      if (result) return result;
+      if (result && validateSectionContext(result.url, sourceUrl, lang, tabPatterns) && validateDepthMatch(sourceUrl, result.url, sourceRoot, targetRoot)) {
+        return result;
+      }
     }
   } catch {}
 

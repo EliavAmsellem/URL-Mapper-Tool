@@ -336,7 +336,7 @@ async function matchTab(
 
   if (crawlPromises.length > 0) await Promise.all(crawlPromises);
 
-  const unmatchedForHead: { index: number; lang: "en" | "fr"; constructedUrl: string }[] = [];
+  const unmatchedForHead: { index: number; lang: "en" | "fr"; constructedUrl: string; sourceUrl: string }[] = [];
   for (const row of needsMatching) {
     if (control.cancel) break;
     const result: BatchMatchResult = {
@@ -353,7 +353,7 @@ async function matchTab(
         result.matchMethodEn = match.method;
       } else {
         const constructed = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
-        if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: constructed });
+        if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: constructed, sourceUrl: row.sourceUrl });
       }
     }
 
@@ -365,7 +365,7 @@ async function matchTab(
         result.matchMethodFr = match.method;
       } else {
         const constructed = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
-        if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: constructed });
+        if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: constructed, sourceUrl: row.sourceUrl });
       }
     }
 
@@ -377,8 +377,34 @@ async function matchTab(
     const headUrls = unmatchedForHead.map((u) => u.constructedUrl);
     const existence = await batchHeadCheck(headUrls);
     let headMatched = 0;
+    let headDepthRejected = 0;
+    const enSrcRoot = tabPatterns.enSrcRoot;
+    const frSrcRoot = tabPatterns.frSrcRoot;
+    const enTgtRoot = tabPatterns.enRoot;
+    const frTgtRoot = tabPatterns.frRoot;
+
     for (const item of unmatchedForHead) {
       if (existence.get(item.constructedUrl)) {
+        const srcRoot = item.lang === "en" ? enSrcRoot : frSrcRoot;
+        const tgtRoot = item.lang === "en" ? enTgtRoot : frTgtRoot;
+
+        try {
+          const srcParts = new URL(item.sourceUrl).pathname.split("/").filter(Boolean);
+          const srcDepth = srcParts.length - srcRoot.length;
+          const tgtParts = new URL(item.constructedUrl).pathname.split("/").filter(Boolean);
+          const tgtDepth = tgtParts.length - tgtRoot.length;
+          if (srcDepth >= 2 && tgtDepth <= 0) {
+            log(`    HEAD match REJECTED (parent-only): ${item.sourceUrl} -> ${item.constructedUrl}`);
+            headDepthRejected++;
+            continue;
+          }
+          if (srcDepth >= 3 && tgtDepth <= 1) {
+            log(`    HEAD match REJECTED (too shallow): ${item.sourceUrl} -> ${item.constructedUrl}`);
+            headDepthRejected++;
+            continue;
+          }
+        } catch {}
+
         const result = matchResults.get(item.index);
         if (result) {
           if (item.lang === "en") {
@@ -394,7 +420,7 @@ async function matchTab(
         }
       }
     }
-    log(`  HEAD fallback: ${headMatched}/${unmatchedForHead.length} verified`);
+    log(`  HEAD fallback: ${headMatched}/${unmatchedForHead.length} verified${headDepthRejected > 0 ? `, ${headDepthRejected} depth-rejected` : ''}`);
   }
 
   const unmatchedForTitle = needsMatching.filter(row => {
@@ -515,6 +541,73 @@ async function matchTab(
         result.matchMethodFr = titleResult.matchMethodFr;
       }
     }
+  }
+
+  let dedupEn = 0;
+  let dedupFr = 0;
+
+  const sourceUrlByRow = new Map<number, string>();
+  for (const row of needsMatching) {
+    sourceUrlByRow.set(row.rowIndex, row.sourceUrl);
+  }
+
+  function normalizeSourceForDedup(url: string): string {
+    try {
+      const parsed = new URL(url);
+      let path = decodeURIComponent(parsed.pathname).toLowerCase().replace(/\/+$/, "");
+      if (path.endsWith("/default.aspx")) path = path.slice(0, -"/default.aspx".length);
+      if (path.endsWith("/pages")) path = path.slice(0, -"/pages".length);
+      return parsed.origin + path;
+    } catch { return url.toLowerCase(); }
+  }
+
+  function dedupLang(lang: "en" | "fr") {
+    const urlToRows = new Map<string, { rowIndex: number; confidence: number; normSource: string }[]>();
+    for (const [rowIndex, result] of Array.from(matchResults.entries())) {
+      const targetUrl = lang === "en" ? result.enUrl : result.frUrl;
+      const conf = lang === "en" ? result.confidenceEn : result.confidenceFr;
+      if (!targetUrl) continue;
+      if (!urlToRows.has(targetUrl)) urlToRows.set(targetUrl, []);
+      const srcUrl = sourceUrlByRow.get(rowIndex) || "";
+      urlToRows.get(targetUrl)!.push({ rowIndex, confidence: conf || 0, normSource: normalizeSourceForDedup(srcUrl) });
+    }
+
+    let count = 0;
+    for (const [url, rows] of Array.from(urlToRows.entries())) {
+      if (rows.length <= 1) continue;
+
+      const uniqueSources = new Set(rows.map(r => r.normSource));
+      if (uniqueSources.size <= 1) continue;
+
+      rows.sort((a, b) => b.confidence - a.confidence);
+      for (let i = 1; i < rows.length; i++) {
+        if (rows[i].normSource === rows[0].normSource) continue;
+        const result = matchResults.get(rows[i].rowIndex);
+        if (result) {
+          if (lang === "en" && result.enUrl === url) {
+            log(`    Dedup EN REJECTED: ${url} for row ${rows[i].rowIndex} (kept for row ${rows[0].rowIndex})`);
+            result.enUrl = null;
+            result.confidenceEn = null;
+            result.matchMethodEn = null;
+            count++;
+          } else if (lang === "fr" && result.frUrl === url) {
+            log(`    Dedup FR REJECTED: ${url} for row ${rows[i].rowIndex} (kept for row ${rows[0].rowIndex})`);
+            result.frUrl = null;
+            result.confidenceFr = null;
+            result.matchMethodFr = null;
+            count++;
+          }
+        }
+      }
+    }
+    return count;
+  }
+
+  dedupEn = dedupLang("en");
+  dedupFr = dedupLang("fr");
+
+  if (dedupEn > 0 || dedupFr > 0) {
+    log(`  Deduplication removed ${dedupEn} EN and ${dedupFr} FR duplicate target assignments`);
   }
 
   return { matchResults, enInventory, frInventory, tabPatterns };
