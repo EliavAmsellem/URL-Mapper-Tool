@@ -82,9 +82,11 @@ For each source URL needing a target:
 - URLs returning non-200 status are discarded
 - Verified URLs get confidence score of 90
 
-#### Step 5: Title-Based Matching
+#### Step 5: Title-Based Matching with Section Awareness
 - For URLs still unmatched after pattern/crawl matching, page titles are extracted and translated Hebrew→EN/FR using Google Translate GTX endpoint
 - Translated titles are fuzzy-matched against crawl inventory page titles using word-overlap similarity
+- **Section-aware scoring**: Titles like "Unemployment - Conditions of entitlement" are split into section prefix ("Unemployment") and page name ("Conditions of entitlement"). When both source and target titles have section prefixes, matching sections provide a similarity boost (up to +0.15), helping disambiguate pages with similar names across different website sections
+- Section matching is purely additive (boost-only) — it never excludes or penalizes candidates, preserving recall
 - 5 concurrent translation requests with rate limiting (200ms between batches)
 - Translation results are cached persistently in the database `translation_cache` table
 

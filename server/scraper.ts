@@ -898,6 +898,55 @@ function normalizeTitle(title: string): string {
     .trim();
 }
 
+interface TitleParts {
+  section: string;
+  pageName: string;
+  full: string;
+}
+
+function splitTitleParts(title: string): TitleParts {
+  const separators = [" - ", " – ", " — ", " | "];
+  let bestIdx = -1;
+  let bestSepLen = 0;
+
+  for (const sep of separators) {
+    const idx = title.indexOf(sep);
+    if (idx > 0 && idx < title.length - sep.length) {
+      if (bestIdx === -1) {
+        bestIdx = idx;
+        bestSepLen = sep.length;
+      }
+      break;
+    }
+  }
+
+  if (bestIdx > 0) {
+    const section = title.substring(0, bestIdx).trim();
+    const rest = title.substring(bestIdx + bestSepLen).trim();
+    if (section.split(/\s+/).length <= 5) {
+      return { section, pageName: rest, full: title };
+    }
+  }
+  return { section: "", pageName: title.trim(), full: title };
+}
+
+function wordSetSimilarity(a: string, b: string): number {
+  const aNorm = normalizeTitle(a);
+  const bNorm = normalizeTitle(b);
+  if (aNorm === bNorm) return 1.0;
+  if (!aNorm || !bNorm) return 0;
+
+  const aWords = aNorm.split(" ").filter(w => w.length > 1);
+  const bWordsSet = new Set(bNorm.split(" ").filter(w => w.length > 1));
+  if (aWords.length === 0 || bWordsSet.size === 0) return 0;
+
+  let intersection = 0;
+  for (const w of aWords) {
+    if (bWordsSet.has(w)) intersection++;
+  }
+  return intersection / (aWords.length + bWordsSet.size - intersection);
+}
+
 function titleSimilarity(a: string, b: string): number {
   const aNorm = normalizeTitle(a);
   const bNorm = normalizeTitle(b);
@@ -921,6 +970,7 @@ function titleSimilarity(a: string, b: string): number {
 
   return Math.min(jaccard + containsBonus, 1.0);
 }
+
 
 async function translateWithGTX(text: string, source: string, target: string): Promise<string | null> {
   try {
@@ -1074,6 +1124,10 @@ export function matchByTitle(
   const minDepth = refDepths && refDepths.length > 0 ? Math.min(...refDepths) - 2 : 0;
   const maxDepth = refDepths && refDepths.length > 0 ? Math.max(...refDepths) + 2 : Infinity;
 
+  const translatedParts = splitTitleParts(translatedTitle);
+  const translatedSection = translatedParts.section ? normalizeTitle(translatedParts.section) : "";
+  const hasSection = translatedSection.length > 0;
+
   inventory.titleIndex.forEach((pageTitle, url) => {
     if (allowedRoots && allowedRoots.length > 0) {
       try {
@@ -1090,14 +1144,32 @@ export function matchByTitle(
       } catch { return; }
     }
 
-    const sim = titleSimilarity(translatedTitle, pageTitle);
+    const baseSim = titleSimilarity(translatedTitle, pageTitle);
+
+    let sectionBonus = 0;
+    let usedSection = false;
+
+    if (hasSection) {
+      const targetParts = splitTitleParts(pageTitle);
+      if (targetParts.section) {
+        const sectionSim = wordSetSimilarity(translatedParts.section, targetParts.section);
+        if (sectionSim >= 0.4) {
+          const pageSim = wordSetSimilarity(translatedParts.pageName, targetParts.pageName);
+          sectionBonus = pageSim * 0.1 + sectionSim * 0.05;
+          usedSection = true;
+        }
+      }
+    }
+
+    const sim = Math.min(baseSim + sectionBonus, 1.0);
+
     if (sim > bestSimilarity) {
       secondBestSimilarity = bestSimilarity;
       bestSimilarity = sim;
       bestMatch = {
         url,
         confidence: Math.round(70 + sim * 20),
-        method: "title-match",
+        method: usedSection ? "title-section-match" : "title-match",
         similarity: sim,
       };
     } else if (sim > secondBestSimilarity) {
