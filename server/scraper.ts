@@ -1,6 +1,7 @@
 import { log } from "./index";
 import * as cheerio from "cheerio";
 import type { IStorage } from "./storage";
+import OpenAI from "openai";
 
 export interface MatchScore {
   total: number;
@@ -755,7 +756,7 @@ function validateSectionContext(
   }
 }
 
-function validateDepthMatch(
+export function validateDepthMatch(
   sourceUrl: string,
   candidateUrl: string,
   sourceRoot: string[],
@@ -1379,5 +1380,235 @@ export async function titleMatchUnmatched(
 
   log(`  Title matching found ${titleMatches} new matches (${usedEnUrls.size} EN, ${usedFrUrls.size} FR unique URLs)`);
   log(`  Title rejections: ambiguous=${rejected.ambiguous}, noSharedSegments=${rejected.noSegments}, crossValidation=${rejected.crossValidation}, knownUrl=${rejected.knownUrl}`);
+  return results;
+}
+
+const AI_BATCH_SIZE = 15;
+const AI_CONCURRENCY = 2;
+
+interface AiMatchInput {
+  rowIndex: number;
+  title: string;
+  sourceUrl: string;
+  needsEn: boolean;
+  needsFr: boolean;
+}
+
+interface AiSuggestion {
+  sourceUrl: string;
+  englishUrl: string | null;
+  frenchUrl: string | null;
+  reasoning: string;
+}
+
+export async function aiMatchUnmatched(
+  unmatchedRows: AiMatchInput[],
+  enInventory: CrawlInventory | null,
+  frInventory: CrawlInventory | null,
+  tabPatterns: TabPatterns,
+  matchedExamples: { sourceUrl: string; enUrl?: string; frUrl?: string }[],
+  enTranslations: Map<string, string>,
+  frTranslations: Map<string, string>,
+  knownEnUrls: Set<string>,
+  knownFrUrls: Set<string>,
+): Promise<Map<number, BatchMatchResult>> {
+  const results = new Map<number, BatchMatchResult>();
+
+  if (unmatchedRows.length === 0) return results;
+
+  const openai = new OpenAI({
+    apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
+    baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
+  });
+
+  const enInventoryUrls = enInventory ? Array.from(enInventory.urls) : [];
+  const frInventoryUrls = frInventory ? Array.from(frInventory.urls) : [];
+
+  const exampleLines = matchedExamples.slice(0, 8).map(ex => {
+    const parts = [`  Source: ${ex.sourceUrl}`];
+    if (ex.enUrl) parts.push(`  English: ${ex.enUrl}`);
+    if (ex.frUrl) parts.push(`  French: ${ex.frUrl}`);
+    return parts.join("\n");
+  }).join("\n---\n");
+
+  const patternContext: string[] = [];
+  if (tabPatterns.enRoot.length > 0) {
+    patternContext.push(`English section root path: /${tabPatterns.enRoot.join("/")}/`);
+    patternContext.push(`Hebrew source root path for English: /${tabPatterns.enSrcRoot.join("/")}/`);
+  }
+  if (tabPatterns.frRoot.length > 0) {
+    patternContext.push(`French section root path: /${tabPatterns.frRoot.join("/")}/`);
+    patternContext.push(`Hebrew source root path for French: /${tabPatterns.frSrcRoot.join("/")}/`);
+  }
+  if (tabPatterns.segmentMap.get("en")?.size) {
+    const segs = Array.from(tabPatterns.segmentMap.get("en")!.entries()).slice(0, 15);
+    patternContext.push(`Known Hebrew→English segment translations: ${segs.map(([k,v]) => `${k}→${v}`).join(", ")}`);
+  }
+  if (tabPatterns.segmentMap.get("fr")?.size) {
+    const segs = Array.from(tabPatterns.segmentMap.get("fr")!.entries()).slice(0, 15);
+    patternContext.push(`Known Hebrew→French segment translations: ${segs.map(([k,v]) => `${k}→${v}`).join(", ")}`);
+  }
+
+  const batches: AiMatchInput[][] = [];
+  for (let i = 0; i < unmatchedRows.length; i += AI_BATCH_SIZE) {
+    batches.push(unmatchedRows.slice(i, i + AI_BATCH_SIZE));
+  }
+
+  log(`  AI matching: ${unmatchedRows.length} unmatched URLs in ${batches.length} batches (inventory: ${enInventoryUrls.length} EN, ${frInventoryUrls.length} FR)`);
+
+  const usedEnUrls = new Set<string>(knownEnUrls);
+  const usedFrUrls = new Set<string>(knownFrUrls);
+  let aiMatches = 0;
+
+  for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
+    const batch = batches[batchIdx];
+
+    const urlsBlock = batch.map(row => {
+      const parts = [`- Source URL: ${row.sourceUrl}`];
+      parts.push(`  Title (Hebrew): ${row.title || "N/A"}`);
+      const enTitle = enTranslations.get(row.title);
+      const frTitle = frTranslations.get(row.title);
+      if (enTitle) parts.push(`  Title (English translation): ${enTitle}`);
+      if (frTitle) parts.push(`  Title (French translation): ${frTitle}`);
+      if (row.needsEn) parts.push(`  Needs: English URL`);
+      if (row.needsFr) parts.push(`  Needs: French URL`);
+      return parts.join("\n");
+    }).join("\n\n");
+
+    const enListForBatch = enInventoryUrls.length <= 500
+      ? enInventoryUrls.join("\n")
+      : enInventoryUrls.slice(0, 500).join("\n") + `\n... (${enInventoryUrls.length - 500} more)`;
+
+    const frListForBatch = frInventoryUrls.length <= 500
+      ? frInventoryUrls.join("\n")
+      : frInventoryUrls.slice(0, 500).join("\n") + `\n... (${frInventoryUrls.length - 500} more)`;
+
+    const systemPrompt = `You are a URL matching expert for a multilingual government website. Your task is to find the correct English and/or French equivalent pages for Hebrew source URLs.
+
+CRITICAL RULES:
+1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs.
+2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
+3. Each target URL should only be used ONCE across all matches. Do not assign the same target URL to multiple source URLs.
+4. URLs that are already matched should not appear again. Check the "already used" lists.
+5. Focus on matching the page PURPOSE and CONTENT, not just superficial URL similarity.
+6. Pay attention to the URL path structure - pages in the same section should map to the corresponding section in the target language.
+
+WEBSITE STRUCTURE:
+${patternContext.join("\n")}
+
+EXAMPLES OF CORRECTLY MATCHED PAIRS:
+${exampleLines}
+
+ALREADY USED ENGLISH URLs (do NOT reuse these):
+${Array.from(usedEnUrls).slice(-50).join("\n") || "(none)"}
+
+ALREADY USED FRENCH URLs (do NOT reuse these):
+${Array.from(usedFrUrls).slice(-50).join("\n") || "(none)"}`;
+
+    const userPrompt = `Find the matching English and/or French URLs for each of these Hebrew source URLs.
+
+UNMATCHED SOURCE URLs:
+${urlsBlock}
+
+AVAILABLE ENGLISH URLs (pick ONLY from this list):
+${enListForBatch || "(no English inventory available)"}
+
+AVAILABLE FRENCH URLs (pick ONLY from this list):
+${frListForBatch || "(no French inventory available)"}
+
+For each source URL, respond with a JSON array of objects. Each object must have:
+- "sourceUrl": the original Hebrew source URL
+- "englishUrl": the matching English URL from the inventory, or null if no confident match
+- "frenchUrl": the matching French URL from the inventory, or null if no confident match  
+- "reasoning": a brief explanation of why you matched these URLs (or why no match was found)
+
+Return ONLY the JSON array, no other text.`;
+
+    try {
+      const response = await openai.chat.completions.create({
+        model: "gpt-5-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        response_format: { type: "json_object" },
+        max_completion_tokens: 8192,
+      });
+
+      const content = response.choices[0]?.message?.content;
+      if (!content) {
+        log(`    AI batch ${batchIdx + 1}/${batches.length}: empty response`);
+        continue;
+      }
+
+      let suggestions: AiSuggestion[] = [];
+      try {
+        const parsed = JSON.parse(content);
+        suggestions = Array.isArray(parsed) ? parsed : (parsed.matches || parsed.results || parsed.urls || []);
+      } catch {
+        log(`    AI batch ${batchIdx + 1}/${batches.length}: failed to parse response`);
+        continue;
+      }
+
+      let batchMatches = 0;
+      for (const suggestion of suggestions) {
+        if (!suggestion.sourceUrl) continue;
+
+        const row = batch.find(r => r.sourceUrl === suggestion.sourceUrl);
+        if (!row) continue;
+
+        const result: BatchMatchResult = {
+          enUrl: null, frUrl: null,
+          confidenceEn: null, confidenceFr: null,
+          matchMethodEn: null, matchMethodFr: null,
+        };
+
+        if (suggestion.englishUrl && row.needsEn) {
+          if (!enInventory?.urls.has(suggestion.englishUrl)) {
+            log(`    AI REJECTED (not in inventory): EN ${suggestion.englishUrl}`);
+          } else if (usedEnUrls.has(suggestion.englishUrl)) {
+            log(`    AI REJECTED (already used): EN ${suggestion.englishUrl}`);
+          } else {
+            result.enUrl = suggestion.englishUrl;
+            result.confidenceEn = 82;
+            result.matchMethodEn = "ai-match";
+            usedEnUrls.add(suggestion.englishUrl);
+          }
+        }
+
+        if (suggestion.frenchUrl && row.needsFr) {
+          if (!frInventory?.urls.has(suggestion.frenchUrl)) {
+            log(`    AI REJECTED (not in inventory): FR ${suggestion.frenchUrl}`);
+          } else if (usedFrUrls.has(suggestion.frenchUrl)) {
+            log(`    AI REJECTED (already used): FR ${suggestion.frenchUrl}`);
+          } else {
+            result.frUrl = suggestion.frenchUrl;
+            result.confidenceFr = 82;
+            result.matchMethodFr = "ai-match";
+            usedFrUrls.add(suggestion.frenchUrl);
+          }
+        }
+
+        if (result.enUrl || result.frUrl) {
+          results.set(row.rowIndex, result);
+          batchMatches++;
+          if (suggestion.reasoning) {
+            log(`    AI match: ${row.sourceUrl} -> EN:${result.enUrl || "null"} FR:${result.frUrl || "null"} (${suggestion.reasoning})`);
+          }
+        }
+      }
+
+      aiMatches += batchMatches;
+      log(`  AI batch ${batchIdx + 1}/${batches.length}: ${batchMatches} matches from ${batch.length} URLs`);
+    } catch (error: any) {
+      log(`  AI batch ${batchIdx + 1}/${batches.length} error: ${error?.message?.substring(0, 200)}`);
+    }
+
+    if (batchIdx < batches.length - 1) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+
+  log(`  AI matching complete: ${aiMatches} total matches from ${unmatchedRows.length} unmatched URLs`);
   return results;
 }

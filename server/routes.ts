@@ -14,8 +14,11 @@ import {
   crawlDirectory,
   matchAgainstInventory,
   titleMatchUnmatched,
+  aiMatchUnmatched,
+  batchTranslate,
   clearCaches,
   clearAllCaches,
+  validateDepthMatch,
   type TabPatterns,
   type CrawlInventory,
   type BatchMatchResult,
@@ -643,6 +646,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
   }
 
   const globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
+  const tabInventories = new Map<string, { enInventory: CrawlInventory | null; frInventory: CrawlInventory | null; tabPatterns: TabPatterns }>();
 
   for (let pass = 1; pass <= MAX_PASSES; pass++) {
     if (control.cancel) break;
@@ -702,7 +706,8 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       const stepLabel = pass > 1 ? `pass${pass}:${tabData.sheetName}` : `matching:${tabData.sheetName}`;
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
-      const { matchResults } = await matchTab(tabData, crawlCache, control);
+      const { matchResults, enInventory, frInventory, tabPatterns } = await matchTab(tabData, crawlCache, control);
+      tabInventories.set(tabData.sheetName, { enInventory, frInventory, tabPatterns });
 
       if (!globalMatchResults.has(tabData.sheetName)) {
         globalMatchResults.set(tabData.sheetName, new Map());
@@ -780,6 +785,160 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
             });
           }
         }
+      }
+    }
+  }
+
+  if (!control.cancel) {
+    await storage.updateJob(jobId, { currentStep: "ai-matching" });
+
+    for (const tabData of allTabData) {
+      if (control.cancel) break;
+
+      const sheetGlobal = globalMatchResults.get(tabData.sheetName);
+      const inv = tabInventories.get(tabData.sheetName);
+      if (!sheetGlobal || !inv) continue;
+
+      const unmatchedForAi = tabData.allRows.filter(row => {
+        if (!row.title) return false;
+        const m = sheetGlobal.get(row.rowIndex);
+        const stillNeedsEn = row.needsEn && (!m || !m.enUrl);
+        const stillNeedsFr = row.needsFr && (!m || !m.frUrl);
+        return stillNeedsEn || stillNeedsFr;
+      }).map(row => {
+        const m = sheetGlobal.get(row.rowIndex);
+        return {
+          rowIndex: row.rowIndex,
+          title: row.title,
+          sourceUrl: row.sourceUrl,
+          needsEn: row.needsEn && (!m || !m.enUrl),
+          needsFr: row.needsFr && (!m || !m.frUrl),
+        };
+      });
+
+      if (unmatchedForAi.length === 0) continue;
+
+      log(`\n=== AI Matching for tab: "${tabData.sheetName}" (${unmatchedForAi.length} unmatched) ===`);
+      await storage.updateJob(jobId, { currentStep: `ai:${tabData.sheetName}` });
+
+      const knownEnUrls = new Set<string>();
+      const knownFrUrls = new Set<string>();
+      for (const ref of tabData.tabRefRows) {
+        if (ref.enUrl) knownEnUrls.add(ref.enUrl);
+        if (ref.frUrl) knownFrUrls.add(ref.frUrl);
+      }
+      for (const [, mr] of Array.from(sheetGlobal.entries())) {
+        if (mr.enUrl) knownEnUrls.add(mr.enUrl);
+        if (mr.frUrl) knownFrUrls.add(mr.frUrl);
+      }
+
+      const matchedExamples = tabData.tabRefRows.slice(0, 10);
+
+      const titlesForEn = unmatchedForAi.filter(r => r.needsEn).map(r => r.title).filter(Boolean);
+      const titlesForFr = unmatchedForAi.filter(r => r.needsFr).map(r => r.title).filter(Boolean);
+
+      let enTranslations = new Map<string, string>();
+      let frTranslations = new Map<string, string>();
+
+      if (titlesForEn.length > 0) {
+        enTranslations = await batchTranslate(titlesForEn, "en", storage);
+      }
+      if (titlesForFr.length > 0) {
+        frTranslations = await batchTranslate(titlesForFr, "fr", storage);
+      }
+
+      const aiMatches = await aiMatchUnmatched(
+        unmatchedForAi,
+        inv.enInventory,
+        inv.frInventory,
+        inv.tabPatterns,
+        matchedExamples,
+        enTranslations,
+        frTranslations,
+        knownEnUrls,
+        knownFrUrls,
+      );
+
+      if (aiMatches.size > 0) {
+        const aiUrls: string[] = [];
+        for (const [, aiResult] of Array.from(aiMatches.entries())) {
+          if (aiResult.enUrl) aiUrls.push(aiResult.enUrl);
+          if (aiResult.frUrl) aiUrls.push(aiResult.frUrl);
+        }
+
+        log(`  HEAD-verifying ${aiUrls.length} AI-suggested URLs...`);
+        const existence = await batchHeadCheck(aiUrls);
+
+        const rowSourceMap = new Map<number, string>();
+        for (const r of unmatchedForAi) {
+          rowSourceMap.set(r.rowIndex, r.sourceUrl);
+        }
+
+        let aiAccepted = 0;
+        let aiHeadRejected = 0;
+        let aiDepthRejected = 0;
+
+        for (const [rowIndex, aiResult] of Array.from(aiMatches.entries())) {
+          const srcUrl = rowSourceMap.get(rowIndex) || "";
+
+          if (aiResult.enUrl && !existence.get(aiResult.enUrl)) {
+            log(`    AI HEAD REJECTED: EN ${aiResult.enUrl}`);
+            aiResult.enUrl = null;
+            aiResult.confidenceEn = null;
+            aiResult.matchMethodEn = null;
+            aiHeadRejected++;
+          }
+          if (aiResult.frUrl && !existence.get(aiResult.frUrl)) {
+            log(`    AI HEAD REJECTED: FR ${aiResult.frUrl}`);
+            aiResult.frUrl = null;
+            aiResult.confidenceFr = null;
+            aiResult.matchMethodFr = null;
+            aiHeadRejected++;
+          }
+
+          if (aiResult.enUrl && srcUrl && inv.tabPatterns.enSrcRoot.length > 0) {
+            if (!validateDepthMatch(srcUrl, aiResult.enUrl, inv.tabPatterns.enSrcRoot, inv.tabPatterns.enRoot)) {
+              log(`    AI DEPTH REJECTED: EN ${aiResult.enUrl}`);
+              aiResult.enUrl = null;
+              aiResult.confidenceEn = null;
+              aiResult.matchMethodEn = null;
+              aiDepthRejected++;
+            }
+          }
+          if (aiResult.frUrl && srcUrl && inv.tabPatterns.frSrcRoot.length > 0) {
+            if (!validateDepthMatch(srcUrl, aiResult.frUrl, inv.tabPatterns.frSrcRoot, inv.tabPatterns.frRoot)) {
+              log(`    AI DEPTH REJECTED: FR ${aiResult.frUrl}`);
+              aiResult.frUrl = null;
+              aiResult.confidenceFr = null;
+              aiResult.matchMethodFr = null;
+              aiDepthRejected++;
+            }
+          }
+
+          if (aiResult.enUrl || aiResult.frUrl) {
+            let existing = sheetGlobal.get(rowIndex);
+            if (!existing) {
+              existing = { enUrl: null, frUrl: null, confidenceEn: null, confidenceFr: null, matchMethodEn: null, matchMethodFr: null };
+              sheetGlobal.set(rowIndex, existing);
+            }
+            if (aiResult.enUrl && !existing.enUrl) {
+              existing.enUrl = aiResult.enUrl;
+              existing.confidenceEn = aiResult.confidenceEn;
+              existing.matchMethodEn = aiResult.matchMethodEn;
+              aiAccepted++;
+            }
+            if (aiResult.frUrl && !existing.frUrl) {
+              existing.frUrl = aiResult.frUrl;
+              existing.confidenceFr = aiResult.confidenceFr;
+              existing.matchMethodFr = aiResult.matchMethodFr;
+              aiAccepted++;
+            }
+          }
+        }
+
+        matchedCount += aiAccepted;
+        log(`  AI results: ${aiAccepted} accepted, ${aiHeadRejected} HEAD-rejected, ${aiDepthRejected} depth-rejected`);
+        await storage.updateJob(jobId, { matchedUrls: matchedCount });
       }
     }
   }

@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { Check, Loader2, Search, GitMerge, Save } from "lucide-react";
+import { Check, Loader2, Search, GitMerge, Save, Brain } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useEffect, useState, useRef } from "react";
 import { getJobStatus, type JobStatus } from "@/lib/api";
@@ -21,6 +21,11 @@ function parseStep(currentStep: string): { phase: string; tabName: string | null
     const tabName = parts.length > 1 ? parts.slice(1).join(":") : null;
     return { phase: "matching", tabName, passNum: 1 };
   }
+  if (currentStep === "ai-matching" || currentStep.startsWith("ai:")) {
+    const parts = currentStep.split(":");
+    const tabName = parts.length > 1 ? parts.slice(1).join(":") : null;
+    return { phase: "ai-matching", tabName, passNum: null };
+  }
   if (currentStep === "saving") {
     return { phase: "saving", tabName: null, passNum: null };
   }
@@ -37,6 +42,7 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
   const steps = [
     { id: "learning", title: "Learning Patterns", icon: Search, desc: "Extracting URL patterns from reference rows..." },
     { id: "matching", title: "URL Matching", icon: GitMerge, desc: "Constructing & verifying target URLs..." },
+    { id: "ai-matching", title: "AI Matching", icon: Brain, desc: "Using AI to match remaining URLs..." },
     { id: "saving", title: "Saving Results", icon: Save, desc: "Writing results to database..." },
   ];
 
@@ -55,6 +61,9 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
           if (phase === "matching" && tabName) {
             const passLabel = passNum && passNum > 1 ? ` (Pass ${passNum})` : "";
             setLogs(prev => [`Processing tab: "${tabName}"${passLabel}`, ...prev].slice(0, 10));
+          } else if (phase === "ai-matching") {
+            const aiMsg = tabName ? `AI matching: "${tabName}"` : "Starting AI matching for unmatched URLs...";
+            setLogs(prev => [aiMsg, ...prev].slice(0, 10));
           } else if (phase === "saving") {
             setLogs(prev => ["Saving results to database...", ...prev].slice(0, 10));
           }
@@ -89,7 +98,7 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
   const progress = job ? (job.totalUrls > 0 ? Math.round((job.processedUrls / job.totalUrls) * 100) : 0) : 0;
 
   const currentPhase = job ? parseStep(job.currentStep).phase : "learning";
-  const stepOrder = ["learning", "matching", "saving", "done"];
+  const stepOrder = ["learning", "matching", "ai-matching", "saving", "done"];
   const currentStepIndex = stepOrder.indexOf(currentPhase);
 
   const currentTabName = job ? parseStep(job.currentStep).tabName : null;
@@ -111,7 +120,7 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
           <motion.div
             className="h-full bg-primary"
             initial={{ width: "0%" }}
-            animate={{ width: `${Math.max(progress, currentPhase === "matching" && progress === 0 ? 2 : 0)}%` }}
+            animate={{ width: `${Math.max(progress, (currentPhase === "matching" || currentPhase === "ai-matching") && progress === 0 ? 2 : 0)}%` }}
             transition={{ ease: "easeOut", duration: 0.5 }}
           />
         </div>
@@ -124,7 +133,7 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
       </div>
 
       <div className="p-6 grid gap-6">
-        <div className="grid grid-cols-3 gap-3">
+        <div className="grid grid-cols-4 gap-3">
           {steps.map((step, idx) => {
             const isActive = step.id === currentPhase;
             const isCompleted = currentStepIndex > idx || job?.status === "completed";

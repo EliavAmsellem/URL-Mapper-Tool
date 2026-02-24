@@ -90,6 +90,16 @@ For each source URL needing a target:
 - 5 concurrent translation requests with rate limiting (200ms between batches)
 - Translation results are cached persistently in the database `translation_cache` table
 
+#### Step 6: AI-Powered Matching (Final Fallback)
+- For URLs still unmatched after all deterministic steps, an AI agent (GPT-5-mini via Replit AI Integrations) attempts matching
+- The AI receives: unmatched source URLs with translated titles, the full crawl inventory of available target URLs, learned URL patterns and segment translations, and examples of already-matched pairs
+- AI is constrained to ONLY select from the crawl inventory — never invents URLs
+- Batches of ~15 unmatched URLs are processed per API call
+- All AI-suggested URLs are HEAD-verified before acceptance (same as pattern matches)
+- AI matches are labeled with method "ai-match" and confidence score 82
+- Duplicate prevention: AI cannot reuse URLs already assigned by earlier matching steps
+- The system prompt emphasizes accuracy over completeness — better to return null than a wrong match
+
 #### Multi-Pass Processing
 - Jobs automatically run up to 3 passes per processing run
 - After each pass, newly matched URLs are treated as additional reference rows for learning improved transformation patterns
@@ -125,6 +135,7 @@ Source URL cells may contain Hebrew text prepended with a pipe character (e.g., 
 - `framer-motion` — Client-side animations
 - `papaparse` — CSV parsing (client-side)
 - `zod` + `drizzle-zod` — Schema validation
+- `openai` — OpenAI SDK for AI-powered URL matching (via Replit AI Integrations)
 
 ### External Web Requests
 - The engine makes HTTP HEAD requests to verify constructed target URLs exist. Uses 50 concurrent connections with a 3s timeout per request and an in-memory existence cache to avoid redundant checks.
