@@ -192,6 +192,7 @@ export async function registerRoutes(
       const outputName = job.fileName.replace(/\.xlsx?$/i, "_mapped.xlsx");
       res.download(outputPath, outputName, () => {
         try { fs.unlinkSync(outputPath); } catch {}
+        try { fs.unlinkSync(filePath); } catch {}
       });
     } catch (error: any) {
       log(`Download error: ${error.message}`);
