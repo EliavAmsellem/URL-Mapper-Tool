@@ -12,6 +12,7 @@ export interface IStorage {
   updateJob(id: string, updates: Partial<InsertMappingJob>): Promise<MappingJob | undefined>;
   createResult(result: InsertMappingResult): Promise<MappingResult>;
   createResults(results: InsertMappingResult[]): Promise<void>;
+  deleteResultsByJob(jobId: string): Promise<void>;
   getResultsByJob(jobId: string): Promise<MappingResult[]>;
   getCachedTranslation(sourceText: string, targetLang: string): Promise<string | null>;
   getCachedTranslations(targetLang: string): Promise<Map<string, string>>;
@@ -45,6 +46,10 @@ export class DatabaseStorage implements IStorage {
     for (let i = 0; i < results.length; i += batchSize) {
       await db.insert(mappingResults).values(results.slice(i, i + batchSize));
     }
+  }
+
+  async deleteResultsByJob(jobId: string): Promise<void> {
+    await db.delete(mappingResults).where(eq(mappingResults.jobId, jobId));
   }
 
   async getResultsByJob(jobId: string): Promise<MappingResult[]> {

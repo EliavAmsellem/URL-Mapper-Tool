@@ -15,6 +15,7 @@ import {
   matchAgainstInventory,
   titleMatchUnmatched,
   clearCaches,
+  clearAllCaches,
   type TabPatterns,
   type CrawlInventory,
   type BatchMatchResult,
@@ -189,7 +190,9 @@ export async function registerRoutes(
       XLSX.writeFile(workbook, outputPath);
 
       const outputName = job.fileName.replace(/\.xlsx?$/i, "_mapped.xlsx");
-      res.download(outputPath, outputName);
+      res.download(outputPath, outputName, () => {
+        try { fs.unlinkSync(outputPath); } catch {}
+      });
     } catch (error: any) {
       log(`Download error: ${error.message}`);
       res.status(500).json({ message: error.message });
@@ -619,7 +622,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
     throw new Error("Source file not found");
   }
 
-  clearCaches();
+  clearAllCaches();
 
   const workbook = XLSX.readFile(filePath);
   const job = await storage.getJob(jobId);
@@ -782,6 +785,8 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
   await storage.updateJob(jobId, { currentStep: "saving" });
 
+  await storage.deleteResultsByJob(jobId);
+
   let finalMatchedCount = 0;
 
   for (const tabData of allTabData) {
@@ -857,7 +862,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
   });
 
   activeJobs.delete(jobId);
-  clearCaches();
+  clearAllCaches();
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
   log(`\nJob ${jobId} completed in ${totalTime}s: ${finalMatchedCount} matches found out of ${totalUrls} URLs`);
