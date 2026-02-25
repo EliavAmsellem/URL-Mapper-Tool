@@ -65,6 +65,22 @@ export async function getJobResults(jobId: string): Promise<MappingResultRow[]> 
   return res.json();
 }
 
+export interface ReferenceConflict {
+  sourceUrl: string;
+  targetUrl: string;
+  lang: "en" | "fr";
+  reason: string;
+  expectedTargetDir: string;
+  actualTargetDir: string;
+  sheetName: string;
+}
+
+export async function getJobConflicts(jobId: string): Promise<ReferenceConflict[]> {
+  const res = await fetch(`/api/jobs/${jobId}/conflicts`);
+  if (!res.ok) return [];
+  return res.json();
+}
+
 export function getDownloadUrl(jobId: string): string {
   return `/api/jobs/${jobId}/download`;
 }

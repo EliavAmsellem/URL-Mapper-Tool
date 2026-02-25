@@ -9,6 +9,20 @@ export interface DirectoryMapping {
   lang: "en" | "fr";
 }
 
+export interface ReferenceConflict {
+  sourceUrl: string;
+  targetUrl: string;
+  lang: "en" | "fr";
+  reason: string;
+  expectedTargetDir: string;
+  actualTargetDir: string;
+}
+
+export interface ValidatedReferences {
+  cleanedRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[];
+  conflicts: ReferenceConflict[];
+}
+
 export interface TabPatterns {
   directoryMappings: DirectoryMapping[];
   segmentMap: Map<string, Map<string, string>>;
@@ -147,6 +161,206 @@ function computeRootMapping(
   const commonTgtRoot = findCommonPrefix(tgtRoots);
   if (commonTgtRoot.length === 0 && commonSrcRoot.length === 0) return null;
   return { sourceRoot: commonSrcRoot, targetRoot: commonTgtRoot };
+}
+
+export function validateReferenceRows(
+  rows: { sourceUrl: string; enUrl?: string; frUrl?: string }[]
+): ValidatedReferences {
+  const conflicts: ReferenceConflict[] = [];
+
+  type RefPair = { sourceUrl: string; targetUrl: string; sourceDir: string; targetDir: string; lang: "en" | "fr" };
+  const allPairs: RefPair[] = [];
+
+  for (const row of rows) {
+    try {
+      const sourceParsed = new URL(row.sourceUrl);
+      if (row.enUrl) {
+        try {
+          const enParsed = new URL(row.enUrl);
+          if (enParsed.origin === sourceParsed.origin) {
+            allPairs.push({
+              sourceUrl: row.sourceUrl,
+              targetUrl: row.enUrl,
+              sourceDir: getDirectoryPath(row.sourceUrl),
+              targetDir: getDirectoryPath(row.enUrl),
+              lang: "en",
+            });
+          }
+        } catch {}
+      }
+      if (row.frUrl) {
+        try {
+          const frParsed = new URL(row.frUrl);
+          if (frParsed.origin === sourceParsed.origin) {
+            allPairs.push({
+              sourceUrl: row.sourceUrl,
+              targetUrl: row.frUrl,
+              sourceDir: getDirectoryPath(row.sourceUrl),
+              targetDir: getDirectoryPath(row.frUrl),
+              lang: "fr",
+            });
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  if (allPairs.length <= 1) {
+    return { cleanedRows: rows.slice(), conflicts };
+  }
+
+  const consensusMap = new Map<string, Map<string, number>>();
+
+  for (const pair of allPairs) {
+    const key = `${pair.lang}:${pair.sourceDir}`;
+    if (!consensusMap.has(key)) consensusMap.set(key, new Map());
+    const votes = consensusMap.get(key)!;
+    votes.set(pair.targetDir, (votes.get(pair.targetDir) || 0) + 1);
+  }
+
+  function getConsensusTargetDir(lang: "en" | "fr", sourceDir: string): string | null {
+    const key = `${lang}:${sourceDir}`;
+    const votes = consensusMap.get(key);
+    if (!votes || votes.size === 0) return null;
+    if (votes.size === 1) {
+      const [dir] = votes.keys();
+      return dir;
+    }
+    let best = "";
+    let bestCount = 0;
+    let tieCount = 0;
+    for (const [dir, count] of votes) {
+      if (count > bestCount) {
+        bestCount = count;
+        best = dir;
+        tieCount = 1;
+      } else if (count === bestCount) {
+        tieCount++;
+      }
+    }
+    if (tieCount === 1 && bestCount >= 2) return best;
+    return null;
+  }
+
+  function getParentDir(dir: string): string | null {
+    const parts = dir.split("/").filter(Boolean);
+    if (parts.length <= 1) return null;
+    return "/" + parts.slice(0, -1).join("/");
+  }
+
+  function findAncestorConsensus(lang: "en" | "fr", sourceDir: string): { parentSourceDir: string; parentTargetDir: string } | null {
+    let current = getParentDir(sourceDir);
+    while (current && current !== "/") {
+      const consensus = getConsensusTargetDir(lang, current);
+      if (consensus) {
+        return { parentSourceDir: current, parentTargetDir: consensus };
+      }
+      current = getParentDir(current);
+    }
+    return null;
+  }
+
+  const flaggedPairs = new Set<string>();
+
+  for (const pair of allPairs) {
+    const pairKey = `${pair.lang}:${pair.sourceUrl}:${pair.targetUrl}`;
+
+    const directConsensus = getConsensusTargetDir(pair.lang, pair.sourceDir);
+    if (directConsensus && directConsensus !== pair.targetDir) {
+      const key = `${pair.lang}:${pair.sourceDir}`;
+      const votes = consensusMap.get(key)!;
+      const consensusVotes = votes.get(directConsensus) || 0;
+      const pairVotes = votes.get(pair.targetDir) || 0;
+
+      if (consensusVotes > pairVotes) {
+        conflicts.push({
+          sourceUrl: pair.sourceUrl,
+          targetUrl: pair.targetUrl,
+          lang: pair.lang,
+          reason: `Directory mapping conflicts with majority: ${pair.sourceDir} → ${pair.targetDir} (${pairVotes} vote${pairVotes !== 1 ? "s" : ""}) vs consensus ${pair.sourceDir} → ${directConsensus} (${consensusVotes} vote${consensusVotes !== 1 ? "s" : ""})`,
+          expectedTargetDir: directConsensus,
+          actualTargetDir: pair.targetDir,
+        });
+        flaggedPairs.add(pairKey);
+        continue;
+      }
+    }
+
+    const ancestor = findAncestorConsensus(pair.lang, pair.sourceDir);
+    if (ancestor) {
+      const targetSegments = pair.targetDir.split("/").filter(Boolean);
+      const parentTargetSegments = ancestor.parentTargetDir.split("/").filter(Boolean);
+
+      const isUnderParent = parentTargetSegments.length <= targetSegments.length &&
+        parentTargetSegments.every((seg, i) => seg.toLowerCase() === targetSegments[i]?.toLowerCase());
+
+      if (!isUnderParent) {
+        const sourceDirParts = pair.sourceDir.split("/").filter(Boolean);
+        const parentSourceParts = ancestor.parentSourceDir.split("/").filter(Boolean);
+        const childSegments = sourceDirParts.slice(parentSourceParts.length);
+
+        const parentTargetNorm = ancestor.parentTargetDir.replace(/\/+$/, "");
+        const expectedChildTarget = childSegments.length > 0
+          ? parentTargetNorm + "/" + childSegments.join("/")
+          : parentTargetNorm;
+
+        conflicts.push({
+          sourceUrl: pair.sourceUrl,
+          targetUrl: pair.targetUrl,
+          lang: pair.lang,
+          reason: `Target directory "${pair.targetDir}" is not under parent mapping "${ancestor.parentSourceDir}" → "${ancestor.parentTargetDir}". Expected target under "${ancestor.parentTargetDir}/"`,
+          expectedTargetDir: expectedChildTarget,
+          actualTargetDir: pair.targetDir,
+        });
+        flaggedPairs.add(pairKey);
+      }
+    }
+  }
+
+  if (conflicts.length === 0) {
+    return { cleanedRows: rows.slice(), conflicts };
+  }
+
+  log(`  Reference validation: ${conflicts.length} conflict(s) detected`);
+  for (const c of conflicts) {
+    log(`    CONFLICT [${c.lang.toUpperCase()}]: ${c.sourceUrl} → ${c.targetUrl}`);
+    log(`      ${c.reason}`);
+  }
+
+  const flaggedSourceTargetPairs = new Map<string, Set<string>>();
+  for (const c of conflicts) {
+    const key = c.sourceUrl;
+    if (!flaggedSourceTargetPairs.has(key)) flaggedSourceTargetPairs.set(key, new Set());
+    if (c.lang === "en") {
+      flaggedSourceTargetPairs.get(key)!.add(`en:${c.targetUrl}`);
+    } else {
+      flaggedSourceTargetPairs.get(key)!.add(`fr:${c.targetUrl}`);
+    }
+  }
+
+  const cleanedRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[] = [];
+  for (const row of rows) {
+    const flagged = flaggedSourceTargetPairs.get(row.sourceUrl);
+    if (!flagged) {
+      cleanedRows.push({ ...row });
+      continue;
+    }
+
+    const cleaned: { sourceUrl: string; enUrl?: string; frUrl?: string } = { sourceUrl: row.sourceUrl };
+    if (row.enUrl && !flagged.has(`en:${row.enUrl}`)) {
+      cleaned.enUrl = row.enUrl;
+    }
+    if (row.frUrl && !flagged.has(`fr:${row.frUrl}`)) {
+      cleaned.frUrl = row.frUrl;
+    }
+    if (cleaned.enUrl || cleaned.frUrl) {
+      cleanedRows.push(cleaned);
+    }
+  }
+
+  log(`  Reference validation: ${rows.length} input rows → ${cleanedRows.length} clean rows (${rows.length - cleanedRows.length} fully removed, ${conflicts.length} individual mappings flagged)`);
+
+  return { cleanedRows, conflicts };
 }
 
 export function learnTabPatterns(

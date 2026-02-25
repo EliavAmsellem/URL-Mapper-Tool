@@ -7,6 +7,7 @@ import fs from "fs";
 import { storage } from "./storage";
 import {
   learnTabPatterns,
+  validateReferenceRows,
   crawlDirectory,
   matchInDirectory,
   findTargetDirectory,
@@ -19,6 +20,7 @@ import {
   type TabPatterns,
   type CrawlInventory,
   type BatchMatchResult,
+  type ReferenceConflict,
 } from "./scraper";
 import { log } from "./index";
 
@@ -134,6 +136,24 @@ export async function registerRoutes(
     try {
       const results = await storage.getResultsByJob(req.params.id as string);
       res.json(results);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get("/api/jobs/:id/conflicts", async (req: Request, res: Response) => {
+    try {
+      const jobId = req.params.id as string;
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+
+      const conflictsPath = `/tmp/uploads/${jobId}_conflicts.json`;
+      if (!fs.existsSync(conflictsPath)) {
+        return res.json([]);
+      }
+
+      const data = JSON.parse(fs.readFileSync(conflictsPath, "utf-8"));
+      res.json(data);
     } catch (error: any) {
       res.status(500).json({ message: error.message });
     }
@@ -281,11 +301,13 @@ async function matchTab(
   enInventory: CrawlInventory | null;
   frInventory: CrawlInventory | null;
   tabPatterns: TabPatterns;
+  conflicts: ReferenceConflict[];
 }> {
   const { sheetName, allRows, tabRefRows } = tabData;
 
-  const tabPatterns = learnTabPatterns(tabRefRows);
-  log(`Tab "${sheetName}": ${tabRefRows.length} reference rows, ${allRows.length} total rows`);
+  const { cleanedRows, conflicts } = validateReferenceRows(tabRefRows);
+  const tabPatterns = learnTabPatterns(cleanedRows);
+  log(`Tab "${sheetName}": ${tabRefRows.length} reference rows (${conflicts.length} conflicts flagged, ${cleanedRows.length} clean), ${allRows.length} total rows`);
 
   const needsMatching = allRows.filter((r) => r.needsEn || r.needsFr);
   const matchResults = new Map<number, BatchMatchResult>();
@@ -296,7 +318,7 @@ async function matchTab(
   const hasFrMappings = tabPatterns.frRoot.length > 0 || tabPatterns.directoryMappings.some(m => m.lang === "fr");
 
   if (needsMatching.length === 0 || (!hasEnMappings && !hasFrMappings)) {
-    return { matchResults, enInventory, frInventory, tabPatterns };
+    return { matchResults, enInventory, frInventory, tabPatterns, conflicts };
   }
 
   const origin = (() => {
@@ -585,7 +607,7 @@ async function matchTab(
     log(`  Deduplication removed ${dedupEn} EN and ${dedupFr} FR duplicate target assignments`);
   }
 
-  return { matchResults, enInventory, frInventory, tabPatterns };
+  return { matchResults, enInventory, frInventory, tabPatterns, conflicts };
 }
 
 async function processJob(jobId: string, _threshold: number, control: { cancel: boolean }) {
@@ -615,6 +637,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
   const globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
   const tabInventories = new Map<string, { enInventory: CrawlInventory | null; frInventory: CrawlInventory | null; tabPatterns: TabPatterns }>();
+  const allConflicts = new Map<string, ReferenceConflict[]>();
 
   for (let pass = 1; pass <= MAX_PASSES; pass++) {
     if (control.cancel) break;
@@ -674,8 +697,12 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       const stepLabel = pass > 1 ? `pass${pass}:${tabData.sheetName}` : `matching:${tabData.sheetName}`;
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
-      const { matchResults, enInventory, frInventory, tabPatterns } = await matchTab(tabData, crawlCache, control);
+      const { matchResults, enInventory, frInventory, tabPatterns, conflicts } = await matchTab(tabData, crawlCache, control);
       tabInventories.set(tabData.sheetName, { enInventory, frInventory, tabPatterns });
+      if (conflicts.length > 0) {
+        if (!allConflicts.has(tabData.sheetName)) allConflicts.set(tabData.sheetName, []);
+        allConflicts.get(tabData.sheetName)!.push(...conflicts);
+      }
 
       if (!globalMatchResults.has(tabData.sheetName)) {
         globalMatchResults.set(tabData.sheetName, new Map());
@@ -940,6 +967,19 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
   const totalUrls = allTabData.reduce((sum, t) => sum + t.allRows.length, 0);
 
+  const conflictsList: (ReferenceConflict & { sheetName: string })[] = [];
+  for (const [sheetName, sheetConflicts] of Array.from(allConflicts.entries())) {
+    for (const c of sheetConflicts) {
+      conflictsList.push({ ...c, sheetName });
+    }
+  }
+
+  if (conflictsList.length > 0) {
+    const conflictsPath = `/tmp/uploads/${jobId}_conflicts.json`;
+    fs.writeFileSync(conflictsPath, JSON.stringify(conflictsList, null, 2));
+    log(`Saved ${conflictsList.length} reference conflicts to ${conflictsPath}`);
+  }
+
   await storage.updateJob(jobId, {
     status: control.cancel ? "cancelled" : "completed",
     processedUrls: totalUrls,
@@ -951,5 +991,5 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
   clearAllCaches();
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-  log(`\nJob ${jobId} completed in ${totalTime}s: ${finalMatchedCount} matches found out of ${totalUrls} URLs`);
+  log(`\nJob ${jobId} completed in ${totalTime}s: ${finalMatchedCount} matches found out of ${totalUrls} URLs${conflictsList.length > 0 ? `, ${conflictsList.length} reference conflicts detected` : ""}`);
 }
