@@ -43,6 +43,8 @@ Preferred communication style: Simple, everyday language.
   - `mapping_jobs` — Tracks upload jobs with status, progress counters, target languages, and processing step
   - `mapping_results` — Stores per-URL mapping results with source/target URLs for each language, confidence scores, and match methods
   - `translation_cache` — Persistent cache for Hebrew→EN/FR translations (keyed by source_text + target_lang), avoids redundant API calls across runs
+  - `crawl_sessions` — Tracks crawl session metadata: origin, rootPath, status (pending/crawling/completed/failed), totalUrls, maxPages, maxDepth, timestamps, optional label
+  - `crawl_inventory_urls` — Stores discovered URLs per crawl session: url, title, linked to session via sessionId
 - **Push migrations**: Use `npm run db:push` (drizzle-kit push) to sync schema to database
 
 ### Context-Focused Directory Matching Engine (`server/scraper.ts`)
@@ -65,9 +67,14 @@ Each Excel tab contains pre-filled reference rows (after conflict removal) where
 4. Builds segment-level translations for path components that differ
 5. Stores directory mappings hierarchically — sub-directories inherit parent mappings
 
-#### Step 3: Directory-Scoped Crawling
-- Crawls target language sections to build an inventory of existing URLs
-- The crawl scope is derived from learned directory mappings or common root paths
+#### Step 3: Static Crawl Inventory (DB-backed)
+- **Pre-crawled inventories** stored in PostgreSQL (`crawl_sessions` + `crawl_inventory_urls` tables) are the primary source of truth
+- Jobs check DB for completed crawl sessions matching the target directory's origin+rootPath before falling back to live crawl
+- **Prefix matching**: If the derived crawl root (e.g., `/English%20Homepage/`) doesn't match exactly, the system searches for DB sessions whose rootPath starts with the derived root (e.g., finds `/English%20Homepage/Benefits`) and combines their inventories
+- **Crawl Manager UI** (`/crawl-manager`): Dedicated page for managing crawl sessions — start new crawls, view status, delete, or refresh existing sessions
+- **Crawl parameters**: maxPages=2000, maxDepth=6 (BFS with per-URL depth tracking)
+- **API endpoints**: `POST /api/crawl` (start), `GET /api/crawl/sessions` (list), `DELETE /api/crawl/sessions/:id`, `POST /api/crawl/sessions/:id/refresh`
+- In-memory `crawlCache` Map provides fast caching after first DB load; cleared on server restart but repopulated from DB
 - Each crawled page is indexed by: normalized path, tail segments (last 1-3 segments), page title, and word index
 
 #### Step 4: Context-Focused Matching
@@ -138,5 +145,6 @@ Source URL cells may contain Hebrew text prepended with a pipe character (e.g., 
 - `GET /api/ai-config` — Returns the AI agent's full configuration (model, system prompt, user prompt template, validation pipeline, matching rules)
 
 ### External Web Requests
-- The engine crawls target language directories via HTTP GET requests to build page inventories (30 concurrent, 8s timeout per page, max 500 pages per scope)
+- The engine crawls target language directories via HTTP GET requests to build page inventories (30 concurrent, 8s timeout per page, max 2000 pages per crawl, max depth 6)
+- Crawl inventories are persisted in the database and reused across jobs — live crawling is only a fallback when no DB inventory exists
 - Title translations use the Google Translate GTX endpoint with rate limiting

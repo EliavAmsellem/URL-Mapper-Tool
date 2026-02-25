@@ -7,7 +7,7 @@ import {
   crawlSessions, crawlInventoryUrls,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, like } from "drizzle-orm";
 
 export interface IStorage {
   createJob(job: InsertMappingJob): Promise<MappingJob>;
@@ -27,6 +27,7 @@ export interface IStorage {
   updateCrawlSession(id: string, updates: Partial<InsertCrawlSession>): Promise<CrawlSession | undefined>;
   deleteCrawlSession(id: string): Promise<void>;
   findCompletedCrawlSession(origin: string, rootPath: string): Promise<CrawlSession | undefined>;
+  findCompletedCrawlSessionsByPrefix(origin: string, rootPathPrefix: string): Promise<CrawlSession[]>;
   saveCrawlInventory(sessionId: string, urls: { url: string; title?: string }[]): Promise<void>;
   loadCrawlInventory(sessionId: string): Promise<{ url: string; title: string | null }[]>;
   deleteCrawlInventory(sessionId: string): Promise<void>;
@@ -141,6 +142,17 @@ export class DatabaseStorage implements IStorage {
       .orderBy(desc(crawlSessions.completedAt))
       .limit(1);
     return session;
+  }
+
+  async findCompletedCrawlSessionsByPrefix(origin: string, rootPathPrefix: string): Promise<CrawlSession[]> {
+    const normalizedPrefix = rootPathPrefix.endsWith("/") ? rootPathPrefix : rootPathPrefix + "/";
+    return db.select().from(crawlSessions)
+      .where(and(
+        eq(crawlSessions.origin, origin),
+        like(crawlSessions.rootPath, normalizedPrefix + "%"),
+        eq(crawlSessions.status, "completed")
+      ))
+      .orderBy(desc(crawlSessions.completedAt));
   }
 
   async saveCrawlInventory(sessionId: string, urls: { url: string; title?: string }[]): Promise<void> {

@@ -509,11 +509,22 @@ async function matchTab(
         log(`  EN directory cached: ${enInventory.urls.size} URLs`);
       } else {
         const rootPathStr = "/" + enCrawlRoot.join("/");
-        const dbSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
-        if (dbSession) {
-          log(`  EN loading from DB inventory (session ${dbSession.id}): ${dbSession.totalUrls} URLs`);
-          const rows = await storage.loadCrawlInventory(dbSession.id);
-          enInventory = buildInventoryFromDbRows(rows);
+        let dbSessions: { id: string; totalUrls: number }[] = [];
+        const exactSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
+        if (exactSession) {
+          dbSessions = [exactSession];
+        } else {
+          const prefixSessions = await storage.findCompletedCrawlSessionsByPrefix(origin, rootPathStr);
+          if (prefixSessions.length > 0) dbSessions = prefixSessions;
+        }
+        if (dbSessions.length > 0) {
+          const allRows: { url: string; title: string | null }[] = [];
+          for (const s of dbSessions) {
+            const rows = await storage.loadCrawlInventory(s.id);
+            allRows.push(...rows);
+          }
+          log(`  EN loading from DB inventory (${dbSessions.length} session(s)): ${allRows.length} URLs`);
+          enInventory = buildInventoryFromDbRows(allRows);
           crawlCache.set(enCacheKey, enInventory);
           log(`  EN inventory loaded: ${enInventory.urls.size} URLs`);
         } else {
@@ -537,11 +548,22 @@ async function matchTab(
         log(`  FR directory cached: ${frInventory.urls.size} URLs`);
       } else {
         const rootPathStr = "/" + frCrawlRoot.join("/");
-        const dbSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
-        if (dbSession) {
-          log(`  FR loading from DB inventory (session ${dbSession.id}): ${dbSession.totalUrls} URLs`);
-          const rows = await storage.loadCrawlInventory(dbSession.id);
-          frInventory = buildInventoryFromDbRows(rows);
+        let dbSessions: { id: string; totalUrls: number }[] = [];
+        const exactSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
+        if (exactSession) {
+          dbSessions = [exactSession];
+        } else {
+          const prefixSessions = await storage.findCompletedCrawlSessionsByPrefix(origin, rootPathStr);
+          if (prefixSessions.length > 0) dbSessions = prefixSessions;
+        }
+        if (dbSessions.length > 0) {
+          const allRows: { url: string; title: string | null }[] = [];
+          for (const s of dbSessions) {
+            const rows = await storage.loadCrawlInventory(s.id);
+            allRows.push(...rows);
+          }
+          log(`  FR loading from DB inventory (${dbSessions.length} session(s)): ${allRows.length} URLs`);
+          frInventory = buildInventoryFromDbRows(allRows);
           crawlCache.set(frCacheKey, frInventory);
           log(`  FR inventory loaded: ${frInventory.urls.size} URLs`);
         } else {
