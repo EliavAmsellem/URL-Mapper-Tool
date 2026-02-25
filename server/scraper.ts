@@ -209,6 +209,25 @@ export function validateReferenceRows(
     return { cleanedRows: rows.slice(), conflicts };
   }
 
+  function normalizeDirForComparison(dir: string): string[] {
+    const segs = dir.split("/").filter(Boolean);
+    if (segs.length > 0 && segs[segs.length - 1].toLowerCase() === "pages") {
+      segs.pop();
+    }
+    return segs;
+  }
+
+  function isAncestorOrEqual(parentSegs: string[], childSegs: string[]): boolean {
+    if (parentSegs.length > childSegs.length) return false;
+    return parentSegs.every((seg, i) => seg.toLowerCase() === childSegs[i]?.toLowerCase());
+  }
+
+  function dirsAreRelated(dirA: string, dirB: string): boolean {
+    const segsA = normalizeDirForComparison(dirA);
+    const segsB = normalizeDirForComparison(dirB);
+    return isAncestorOrEqual(segsA, segsB) || isAncestorOrEqual(segsB, segsA);
+  }
+
   const consensusMap = new Map<string, Map<string, number>>();
 
   for (const pair of allPairs) {
@@ -267,6 +286,10 @@ export function validateReferenceRows(
 
     const directConsensus = getConsensusTargetDir(pair.lang, pair.sourceDir);
     if (directConsensus && directConsensus !== pair.targetDir) {
+      if (dirsAreRelated(directConsensus, pair.targetDir)) {
+        continue;
+      }
+
       const key = `${pair.lang}:${pair.sourceDir}`;
       const votes = consensusMap.get(key)!;
       const consensusVotes = votes.get(directConsensus) || 0;
@@ -288,13 +311,10 @@ export function validateReferenceRows(
 
     const ancestor = findAncestorConsensus(pair.lang, pair.sourceDir);
     if (ancestor) {
-      const targetSegments = pair.targetDir.split("/").filter(Boolean);
-      const parentTargetSegments = ancestor.parentTargetDir.split("/").filter(Boolean);
+      const targetSegments = normalizeDirForComparison(pair.targetDir);
+      const parentTargetSegments = normalizeDirForComparison(ancestor.parentTargetDir);
 
-      const isUnderParent = parentTargetSegments.length <= targetSegments.length &&
-        parentTargetSegments.every((seg, i) => seg.toLowerCase() === targetSegments[i]?.toLowerCase());
-
-      if (!isUnderParent) {
+      if (!isAncestorOrEqual(parentTargetSegments, targetSegments)) {
         const sourceDirParts = pair.sourceDir.split("/").filter(Boolean);
         const parentSourceParts = ancestor.parentSourceDir.split("/").filter(Boolean);
         const childSegments = sourceDirParts.slice(parentSourceParts.length);
