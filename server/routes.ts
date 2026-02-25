@@ -17,6 +17,7 @@ import {
   batchTranslate,
   clearAllCaches,
   getAiConfig,
+  crossLanguageDerive,
   type TabPatterns,
   type CrawlInventory,
   type BatchMatchResult,
@@ -223,6 +224,28 @@ export async function registerRoutes(
       res.status(500).json({ message: error.message });
     }
   });
+
+  setTimeout(async () => {
+    try {
+      const jobs = await storage.getAllJobs();
+      for (const job of jobs) {
+        if (job.status === "processing") {
+          const cpPath = `/tmp/uploads/${job.id}_checkpoint.json`;
+          if (fs.existsSync(cpPath) && fs.existsSync(`/tmp/uploads/${job.id}.xlsx`)) {
+            log(`Auto-resuming interrupted job ${job.id} from checkpoint...`);
+            const control = { cancel: false };
+            activeJobs.set(job.id, control);
+            processJob(job.id, 85, control).catch((err) => {
+              log(`Auto-resume job error: ${err.message}`);
+              storage.updateJob(job.id, { status: "error", currentStep: err.message });
+            });
+          }
+        }
+      }
+    } catch (err: any) {
+      log(`Auto-resume check error: ${err.message}`);
+    }
+  }, 3000);
 
   return httpServer;
 }
@@ -610,6 +633,61 @@ async function matchTab(
   return { matchResults, enInventory, frInventory, tabPatterns, conflicts };
 }
 
+interface CheckpointData {
+  globalMatchResults: Record<string, Record<string, BatchMatchResult>>;
+  completedPhase: string;
+  aiRound: number;
+  matchedCount: number;
+}
+
+function saveCheckpoint(jobId: string, globalMatchResults: Map<string, Map<number, BatchMatchResult>>, phase: string, aiRound: number, matchedCount: number) {
+  const data: CheckpointData = {
+    globalMatchResults: {},
+    completedPhase: phase,
+    aiRound,
+    matchedCount,
+  };
+  for (const [sheet, results] of Array.from(globalMatchResults.entries())) {
+    const sheetResults: Record<string, BatchMatchResult> = {};
+    for (const [rowIdx, result] of Array.from(results.entries())) {
+      sheetResults[String(rowIdx)] = result;
+    }
+    data.globalMatchResults[sheet] = sheetResults;
+  }
+  const cpPath = `/tmp/uploads/${jobId}_checkpoint.json`;
+  fs.writeFileSync(cpPath, JSON.stringify(data));
+  log(`Checkpoint saved: phase=${phase} round=${aiRound} matches=${matchedCount}`);
+}
+
+function loadCheckpoint(jobId: string): CheckpointData | null {
+  const cpPath = `/tmp/uploads/${jobId}_checkpoint.json`;
+  if (!fs.existsSync(cpPath)) return null;
+  try {
+    const data: CheckpointData = JSON.parse(fs.readFileSync(cpPath, "utf-8"));
+    log(`Checkpoint loaded: phase=${data.completedPhase} round=${data.aiRound} matches=${data.matchedCount}`);
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function restoreGlobalResults(checkpoint: CheckpointData): Map<string, Map<number, BatchMatchResult>> {
+  const results = new Map<string, Map<number, BatchMatchResult>>();
+  for (const [sheet, sheetResults] of Object.entries(checkpoint.globalMatchResults)) {
+    const sheetMap = new Map<number, BatchMatchResult>();
+    for (const [rowIdx, result] of Object.entries(sheetResults)) {
+      sheetMap.set(Number(rowIdx), result);
+    }
+    results.set(sheet, sheetMap);
+  }
+  return results;
+}
+
+function clearCheckpoint(jobId: string) {
+  const cpPath = `/tmp/uploads/${jobId}_checkpoint.json`;
+  if (fs.existsSync(cpPath)) fs.unlinkSync(cpPath);
+}
+
 async function processJob(jobId: string, _threshold: number, control: { cancel: boolean }) {
   const filePath = `/tmp/uploads/${jobId}.xlsx`;
   if (!fs.existsSync(filePath)) {
@@ -635,7 +713,44 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
     if (td) allTabData.push(td);
   }
 
-  const globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
+  const checkpoint = loadCheckpoint(jobId);
+  let globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
+  let resumeAiRound = 1;
+  let skipToPostAi = false;
+
+  if (checkpoint) {
+    globalMatchResults = restoreGlobalResults(checkpoint);
+    matchedCount = checkpoint.matchedCount;
+
+    if (checkpoint.completedPhase === "structural") {
+      resumeAiRound = 1;
+      log(`Resuming from checkpoint after structural: ${matchedCount} matches, starting AI round 1`);
+    } else if (checkpoint.completedPhase.startsWith("ai-round-")) {
+      resumeAiRound = checkpoint.aiRound + 1;
+      log(`Resuming from checkpoint after AI round ${checkpoint.aiRound}: ${matchedCount} matches, starting AI round ${resumeAiRound}`);
+    } else if (checkpoint.completedPhase === "all-ai") {
+      skipToPostAi = true;
+      log(`Resuming from checkpoint: all AI done with ${matchedCount} matches, going to cross-language derivation`);
+    }
+
+    for (const tabData of allTabData) {
+      const sheetResults = globalMatchResults.get(tabData.sheetName);
+      if (!sheetResults) continue;
+      for (const row of tabData.allRows) {
+        const m = sheetResults.get(row.rowIndex);
+        if (!m) continue;
+        if (m.enUrl && row.needsEn) {
+          row.existingEn = m.enUrl;
+          row.needsEn = false;
+        }
+        if (m.frUrl && row.needsFr) {
+          row.existingFr = m.frUrl;
+          row.needsFr = false;
+        }
+      }
+    }
+  }
+
   const tabInventories = new Map<string, { enInventory: CrawlInventory | null; frInventory: CrawlInventory | null; tabPatterns: TabPatterns }>();
   const allConflicts = new Map<string, ReferenceConflict[]>();
 
@@ -784,8 +899,97 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
     }
   }
 
-  if (!control.cancel) {
-    await storage.updateJob(jobId, { currentStep: "ai-matching" });
+  saveCheckpoint(jobId, globalMatchResults, "structural", 1, matchedCount);
+
+  const MAX_AI_ROUNDS = 3;
+
+  for (let aiRound = skipToPostAi ? MAX_AI_ROUNDS + 1 : resumeAiRound; aiRound <= MAX_AI_ROUNDS && !control.cancel; aiRound++) {
+    const roundLabel = aiRound > 1 ? ` (round ${aiRound})` : "";
+    await storage.updateJob(jobId, { currentStep: `ai-matching${roundLabel}` });
+
+    if (aiRound > 1) {
+      log(`\n========== AI RE-LEARNING ROUND ${aiRound} ==========`);
+      log(`Feeding AI matches back as references and re-learning patterns...`);
+
+      for (const tabData of allTabData) {
+        const sheetGlobal = globalMatchResults.get(tabData.sheetName);
+        if (!sheetGlobal) continue;
+
+        for (const row of tabData.allRows) {
+          const m = sheetGlobal.get(row.rowIndex);
+          if (!m) continue;
+          if (m.enUrl && row.needsEn) {
+            row.existingEn = m.enUrl;
+            row.needsEn = false;
+          }
+          if (m.frUrl && row.needsFr) {
+            row.existingFr = m.frUrl;
+            row.needsFr = false;
+          }
+        }
+
+        tabData.tabRefRows = [];
+        for (const row of tabData.allRows) {
+          if (row.existingEn || row.existingFr) {
+            tabData.tabRefRows.push({
+              sourceUrl: row.sourceUrl,
+              enUrl: row.existingEn || undefined,
+              frUrl: row.existingFr || undefined,
+            });
+          }
+        }
+      }
+
+      let reLearnNewMatches = 0;
+      for (const tabData of allTabData) {
+        if (control.cancel) break;
+        const needsMatching = tabData.allRows.filter((r) => r.needsEn || r.needsFr);
+        if (needsMatching.length === 0) continue;
+
+        const inv = tabInventories.get(tabData.sheetName);
+        if (!inv) continue;
+
+        const { matchResults, tabPatterns } = await matchTab(tabData, crawlCache, control);
+        tabInventories.set(tabData.sheetName, { ...inv, tabPatterns });
+
+        const sheetGlobal = globalMatchResults.get(tabData.sheetName)!;
+        let tabNew = 0;
+        for (const [rowIndex, result] of Array.from(matchResults.entries())) {
+          const existing = sheetGlobal.get(rowIndex);
+          if (!existing) {
+            if (result.enUrl || result.frUrl) {
+              sheetGlobal.set(rowIndex, result);
+              tabNew++;
+            }
+          } else {
+            if (result.enUrl && !existing.enUrl) {
+              existing.enUrl = result.enUrl;
+              existing.confidenceEn = result.confidenceEn;
+              existing.matchMethodEn = result.matchMethodEn;
+              tabNew++;
+            }
+            if (result.frUrl && !existing.frUrl) {
+              existing.frUrl = result.frUrl;
+              existing.confidenceFr = result.confidenceFr;
+              existing.matchMethodFr = result.matchMethodFr;
+              tabNew++;
+            }
+          }
+        }
+        reLearnNewMatches += tabNew;
+        matchedCount += tabNew;
+        if (tabNew > 0) {
+          log(`  Re-learn structural pass: ${tabNew} new matches for "${tabData.sheetName}"`);
+        }
+      }
+
+      if (reLearnNewMatches > 0) {
+        log(`Re-learn structural pass: ${reLearnNewMatches} total new matches`);
+        await storage.updateJob(jobId, { matchedUrls: matchedCount });
+      }
+    }
+
+    let roundAiTotal = 0;
 
     for (const tabData of allTabData) {
       if (control.cancel) break;
@@ -815,8 +1019,8 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
       if (unmatchedForAi.length === 0) continue;
 
-      log(`\n=== AI Matching for tab: "${tabData.sheetName}" (${unmatchedForAi.length} unmatched) ===`);
-      await storage.updateJob(jobId, { currentStep: `ai:${tabData.sheetName}` });
+      log(`\n=== AI Matching${roundLabel} for tab: "${tabData.sheetName}" (${unmatchedForAi.length} unmatched) ===`);
+      await storage.updateJob(jobId, { currentStep: `ai:${tabData.sheetName}${roundLabel}` });
 
       const knownEnUrls = new Set<string>();
       const knownFrUrls = new Set<string>();
@@ -889,10 +1093,82 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
           }
         }
 
+        roundAiTotal += aiAccepted;
         matchedCount += aiAccepted;
-        log(`  AI results: ${aiAccepted} accepted`);
+        log(`  AI results${roundLabel}: ${aiAccepted} accepted`);
         await storage.updateJob(jobId, { matchedUrls: matchedCount });
       }
+    }
+
+    log(`\nAI round ${aiRound}: ${roundAiTotal} total new matches`);
+
+    saveCheckpoint(jobId, globalMatchResults, `ai-round-${aiRound}`, aiRound, matchedCount);
+
+    if (roundAiTotal === 0) {
+      log(`No new AI matches in round ${aiRound}, stopping AI re-learning loop.`);
+      break;
+    }
+  }
+
+  saveCheckpoint(jobId, globalMatchResults, "all-ai", MAX_AI_ROUNDS, matchedCount);
+
+  if (!control.cancel) {
+    log(`\n=== Cross-Language Derivation ===`);
+    await storage.updateJob(jobId, { currentStep: "cross-lang" });
+
+    let crossLangMatches = 0;
+    for (const tabData of allTabData) {
+      if (control.cancel) break;
+
+      const sheetGlobal = globalMatchResults.get(tabData.sheetName);
+      const inv = tabInventories.get(tabData.sheetName);
+      if (!sheetGlobal || !inv) continue;
+
+      const knownEnUrls = new Set<string>();
+      const knownFrUrls = new Set<string>();
+      for (const ref of tabData.tabRefRows) {
+        if (ref.enUrl) knownEnUrls.add(ref.enUrl);
+        if (ref.frUrl) knownFrUrls.add(ref.frUrl);
+      }
+      for (const [, mr] of Array.from(sheetGlobal.entries())) {
+        if (mr.enUrl) knownEnUrls.add(mr.enUrl);
+        if (mr.frUrl) knownFrUrls.add(mr.frUrl);
+      }
+
+      for (const row of tabData.allRows) {
+        const m = sheetGlobal.get(row.rowIndex);
+        if (!m) continue;
+
+        if (m.frUrl && !m.enUrl && row.needsEn && inv.enInventory) {
+          const derived = crossLanguageDerive(m.frUrl, "fr", "en", inv.tabPatterns, inv.enInventory, knownEnUrls);
+          if (derived) {
+            m.enUrl = derived.url;
+            m.confidenceEn = derived.confidence;
+            m.matchMethodEn = derived.method;
+            knownEnUrls.add(derived.url);
+            crossLangMatches++;
+          }
+        }
+
+        if (m.enUrl && !m.frUrl && row.needsFr && inv.frInventory) {
+          const derived = crossLanguageDerive(m.enUrl, "en", "fr", inv.tabPatterns, inv.frInventory, knownFrUrls);
+          if (derived) {
+            m.frUrl = derived.url;
+            m.confidenceFr = derived.confidence;
+            m.matchMethodFr = derived.method;
+            knownFrUrls.add(derived.url);
+            crossLangMatches++;
+          }
+        }
+      }
+    }
+
+    if (crossLangMatches > 0) {
+      matchedCount += crossLangMatches;
+      log(`Cross-language derivation: ${crossLangMatches} new matches`);
+      await storage.updateJob(jobId, { matchedUrls: matchedCount });
+    } else {
+      log(`Cross-language derivation: no new matches`);
     }
   }
 
@@ -989,6 +1265,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
   activeJobs.delete(jobId);
   clearAllCaches();
+  clearCheckpoint(jobId);
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
   log(`\nJob ${jobId} completed in ${totalTime}s: ${finalMatchedCount} matches found out of ${totalUrls} URLs${conflictsList.length > 0 ? `, ${conflictsList.length} reference conflicts detected` : ""}`);

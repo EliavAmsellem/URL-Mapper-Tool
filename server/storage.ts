@@ -9,6 +9,7 @@ import { eq, and } from "drizzle-orm";
 export interface IStorage {
   createJob(job: InsertMappingJob): Promise<MappingJob>;
   getJob(id: string): Promise<MappingJob | undefined>;
+  getAllJobs(): Promise<MappingJob[]>;
   updateJob(id: string, updates: Partial<InsertMappingJob>): Promise<MappingJob | undefined>;
   createResult(result: InsertMappingResult): Promise<MappingResult>;
   createResults(results: InsertMappingResult[]): Promise<void>;
@@ -28,6 +29,10 @@ export class DatabaseStorage implements IStorage {
   async getJob(id: string): Promise<MappingJob | undefined> {
     const [job] = await db.select().from(mappingJobs).where(eq(mappingJobs.id, id));
     return job;
+  }
+
+  async getAllJobs(): Promise<MappingJob[]> {
+    return db.select().from(mappingJobs);
   }
 
   async updateJob(id: string, updates: Partial<InsertMappingJob>): Promise<MappingJob | undefined> {

@@ -1522,6 +1522,88 @@ export function getAiConfig() {
   };
 }
 
+function rankInventoryByTitleSimilarity(
+  inventory: CrawlInventory,
+  translatedTitles: string[],
+  usedUrls: Set<string>,
+  maxResults: number = 200,
+): string[] {
+  const scored: { url: string; score: number }[] = [];
+
+  for (const [url, pageTitle] of inventory.titleIndex.entries()) {
+    if (usedUrls.has(url)) continue;
+    let bestSim = 0;
+    for (const title of translatedTitles) {
+      const sim = titleSimilarity(title, pageTitle);
+      if (sim > bestSim) bestSim = sim;
+    }
+    if (bestSim > 0.15) {
+      scored.push({ url, score: bestSim });
+    }
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, maxResults).map(s => s.url);
+}
+
+export function crossLanguageDerive(
+  matchedUrl: string,
+  fromLang: "en" | "fr",
+  toLang: "en" | "fr",
+  tabPatterns: TabPatterns,
+  targetInventory: CrawlInventory,
+  usedUrls: Set<string>,
+): { url: string; confidence: number; method: string } | null {
+  const fromRoot = fromLang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
+  const toRoot = toLang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
+
+  if (fromRoot.length === 0 || toRoot.length === 0) return null;
+
+  try {
+    const parsed = new URL(matchedUrl);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+
+    let rootMatchLen = 0;
+    for (let i = 0; i < fromRoot.length && i < parts.length; i++) {
+      if (normalizeSegment(parts[i]) === normalizeSegment(fromRoot[i])) {
+        rootMatchLen++;
+      } else {
+        break;
+      }
+    }
+
+    if (rootMatchLen === 0) return null;
+
+    const remainder = parts.slice(rootMatchLen);
+    const candidatePath = "/" + [...toRoot, ...remainder].join("/");
+    const candidateNorm = candidatePath.toLowerCase();
+
+    for (const url of targetInventory.urls) {
+      if (usedUrls.has(url)) continue;
+      const p = new URL(url);
+      if (p.pathname.toLowerCase() === candidateNorm ||
+          p.pathname.toLowerCase() === candidateNorm + "/pages/default.aspx" ||
+          p.pathname.toLowerCase().replace(/\/pages\/[^/]+$/i, "") === candidateNorm) {
+        return { url, confidence: 85, method: "dir-cross-lang" };
+      }
+    }
+
+    const matchedTail = getUrlTail(matchedUrl, 2);
+    if (matchedTail) {
+      const tailMatches = targetInventory.tailIndex.get(matchedTail);
+      if (tailMatches) {
+        for (const url of tailMatches) {
+          if (!usedUrls.has(url)) {
+            return { url, confidence: 80, method: "dir-cross-lang-tail" };
+          }
+        }
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
 export async function aiMatchUnmatched(
   unmatchedRows: AiMatchInput[],
   enInventory: CrawlInventory | null,
@@ -1603,13 +1685,37 @@ export async function aiMatchUnmatched(
       }
     }
 
-    if (batchEnUrls.size === 0 && batchFrUrls.size === 0) {
-      if (enInventory) {
+    const needsEnFallback = batch.some(r => r.needsEn) && batchEnUrls.size === 0;
+    const needsFrFallback = batch.some(r => r.needsFr) && batchFrUrls.size === 0;
+
+    if (needsEnFallback || needsFrFallback) {
+      const batchTitles = batch
+        .map(r => enTranslations.get(r.title) || frTranslations.get(r.title))
+        .filter(Boolean) as string[];
+
+      if (batchTitles.length > 0) {
+        if (needsEnFallback && enInventory) {
+          const ranked = rankInventoryByTitleSimilarity(enInventory, batchTitles, usedEnUrls);
+          for (const url of ranked) batchEnUrls.add(url);
+          if (ranked.length > 0) {
+            log(`    Fallback scoping (EN): title-ranked ${ranked.length} candidates (from ${enInventory.urls.size} total)`);
+          }
+        }
+        if (needsFrFallback && frInventory) {
+          const ranked = rankInventoryByTitleSimilarity(frInventory, batchTitles, usedFrUrls);
+          for (const url of ranked) batchFrUrls.add(url);
+          if (ranked.length > 0) {
+            log(`    Fallback scoping (FR): title-ranked ${ranked.length} candidates (from ${frInventory.urls.size} total)`);
+          }
+        }
+      }
+
+      if (batchEnUrls.size === 0 && needsEnFallback && enInventory) {
         for (const url of enInventory.urls) {
           if (!usedEnUrls.has(url)) batchEnUrls.add(url);
         }
       }
-      if (frInventory) {
+      if (batchFrUrls.size === 0 && needsFrFallback && frInventory) {
         for (const url of frInventory.urls) {
           if (!usedFrUrls.has(url)) batchFrUrls.add(url);
         }
