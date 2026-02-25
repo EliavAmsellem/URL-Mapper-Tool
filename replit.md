@@ -91,7 +91,7 @@ For each source URL needing a target:
 - Translation results are cached persistently in the database `translation_cache` table
 
 #### Step 6: AI-Powered Matching (Final Fallback)
-- For URLs still unmatched after all deterministic steps, an AI agent (GPT-5-mini via Replit AI Integrations) attempts matching
+- For URLs still unmatched after all deterministic steps, an AI agent (Claude Opus 4.6 via Replit Anthropic AI Integrations) attempts matching
 - The AI receives: unmatched source URLs with translated titles, the full crawl inventory of available target URLs, learned URL patterns and segment translations, and examples of already-matched pairs
 - AI is constrained to ONLY select from the crawl inventory — never invents URLs
 - Batches of ~15 unmatched URLs are processed per API call
@@ -135,7 +135,8 @@ Source URL cells may contain Hebrew text prepended with a pipe character (e.g., 
 - `framer-motion` — Client-side animations
 - `papaparse` — CSV parsing (client-side)
 - `zod` + `drizzle-zod` — Schema validation
-- `openai` — OpenAI SDK for AI-powered URL matching (via Replit AI Integrations)
+- `@anthropic-ai/sdk` — Anthropic SDK for AI-powered URL matching (Claude Opus 4.6 via Replit AI Integrations)
+- `GET /api/ai-config` — Returns the AI agent's full configuration (model, system prompt, user prompt template, validation pipeline, matching rules)
 
 ### External Web Requests
 - The engine makes HTTP HEAD requests to verify constructed target URLs exist. Uses 50 concurrent connections with a 3s timeout per request and an in-memory existence cache to avoid redundant checks.

@@ -1,7 +1,7 @@
 import { log } from "./index";
 import * as cheerio from "cheerio";
 import type { IStorage } from "./storage";
-import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 
 export interface MatchScore {
   total: number;
@@ -1401,6 +1401,79 @@ interface AiSuggestion {
   reasoning: string;
 }
 
+export const AI_MODEL = "claude-opus-4-6";
+export const AI_CONFIDENCE_SCORE = 82;
+export const AI_METHOD_LABEL = "ai-match";
+
+export const AI_SYSTEM_PROMPT_TEMPLATE = `You are a URL matching expert for a multilingual government website. Your task is to find the correct English and/or French equivalent pages for Hebrew source URLs.
+
+CRITICAL RULES:
+1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs.
+2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
+3. Each target URL should only be used ONCE across all matches. Do not assign the same target URL to multiple source URLs.
+4. URLs that are already matched should not appear again. Check the "already used" lists.
+5. Focus on matching the page PURPOSE and CONTENT, not just superficial URL similarity.
+6. Pay attention to the URL path structure - pages in the same section should map to the corresponding section in the target language.
+
+WEBSITE STRUCTURE:
+{{patternContext}}
+
+EXAMPLES OF CORRECTLY MATCHED PAIRS:
+{{exampleLines}}
+
+ALREADY USED ENGLISH URLs (do NOT reuse these):
+{{usedEnUrls}}
+
+ALREADY USED FRENCH URLs (do NOT reuse these):
+{{usedFrUrls}}`;
+
+export const AI_USER_PROMPT_TEMPLATE = `Find the matching English and/or French URLs for each of these Hebrew source URLs.
+
+UNMATCHED SOURCE URLs:
+{{urlsBlock}}
+
+AVAILABLE ENGLISH URLs (pick ONLY from this list):
+{{enInventoryList}}
+
+AVAILABLE FRENCH URLs (pick ONLY from this list):
+{{frInventoryList}}
+
+For each source URL, respond with a JSON array of objects. Each object must have:
+- "sourceUrl": the original Hebrew source URL
+- "englishUrl": the matching English URL from the inventory, or null if no confident match
+- "frenchUrl": the matching French URL from the inventory, or null if no confident match
+- "reasoning": a brief explanation of why you matched these URLs (or why no match was found)
+
+Return ONLY the JSON array, no markdown formatting, no code fences, no other text.`;
+
+export const AI_VALIDATION_PIPELINE = [
+  { step: 1, name: "Inventory membership check", description: "Every URL suggested by the AI must exist in the crawl inventory (the full set of URLs discovered during directory crawling). URLs not in inventory are rejected." },
+  { step: 2, name: "Duplicate check", description: "Each target URL can only be assigned to one source URL. If the AI suggests a URL already assigned by an earlier match (from any step), it is rejected." },
+  { step: 3, name: "HEAD request verification", description: "All AI-suggested URLs are verified with HTTP HEAD requests (50 concurrent, 3s timeout). URLs returning non-200 status are discarded." },
+  { step: 4, name: "Depth validation", description: "The URL path depth of the suggested target must be within ±1 of the source URL depth. This prevents matching top-level section pages to deep sub-pages." },
+];
+
+export function getAiConfig() {
+  return {
+    model: AI_MODEL,
+    provider: "Anthropic (via Replit AI Integrations)",
+    confidenceScore: AI_CONFIDENCE_SCORE,
+    methodLabel: AI_METHOD_LABEL,
+    batchSize: AI_BATCH_SIZE,
+    systemPromptTemplate: AI_SYSTEM_PROMPT_TEMPLATE,
+    userPromptTemplate: AI_USER_PROMPT_TEMPLATE,
+    validationPipeline: AI_VALIDATION_PIPELINE,
+    matchingRules: [
+      "AI matching is the FINAL fallback — only runs on URLs unmatched after pattern construction, crawl inventory matching, fuzzy matching, and title-based matching",
+      "AI is constrained to ONLY select from the crawl inventory — it can never invent URLs",
+      "Batches of ~15 unmatched URLs are processed per API call",
+      "Accuracy over completeness: returning null is always preferred over a wrong match",
+      "AI matches get confidence score of 82 and method label 'ai-match'",
+      "Multi-pass: after each processing pass, newly matched URLs become reference rows for improved pattern learning",
+    ],
+  };
+}
+
 export async function aiMatchUnmatched(
   unmatchedRows: AiMatchInput[],
   enInventory: CrawlInventory | null,
@@ -1416,9 +1489,9 @@ export async function aiMatchUnmatched(
 
   if (unmatchedRows.length === 0) return results;
 
-  const openai = new OpenAI({
-    apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
-    baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
+  const anthropic = new Anthropic({
+    apiKey: process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY,
+    baseURL: process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL,
   });
 
   const enInventoryUrls = enInventory ? Array.from(enInventory.urls) : [];
@@ -1454,7 +1527,7 @@ export async function aiMatchUnmatched(
     batches.push(unmatchedRows.slice(i, i + AI_BATCH_SIZE));
   }
 
-  log(`  AI matching: ${unmatchedRows.length} unmatched URLs in ${batches.length} batches (inventory: ${enInventoryUrls.length} EN, ${frInventoryUrls.length} FR)`);
+  log(`  AI matching (${AI_MODEL}): ${unmatchedRows.length} unmatched URLs in ${batches.length} batches (inventory: ${enInventoryUrls.length} EN, ${frInventoryUrls.length} FR)`);
 
   const usedEnUrls = new Set<string>(knownEnUrls);
   const usedFrUrls = new Set<string>(knownFrUrls);
@@ -1483,59 +1556,29 @@ export async function aiMatchUnmatched(
       ? frInventoryUrls.join("\n")
       : frInventoryUrls.slice(0, 500).join("\n") + `\n... (${frInventoryUrls.length - 500} more)`;
 
-    const systemPrompt = `You are a URL matching expert for a multilingual government website. Your task is to find the correct English and/or French equivalent pages for Hebrew source URLs.
+    const systemPrompt = AI_SYSTEM_PROMPT_TEMPLATE
+      .replace("{{patternContext}}", patternContext.join("\n"))
+      .replace("{{exampleLines}}", exampleLines)
+      .replace("{{usedEnUrls}}", Array.from(usedEnUrls).slice(-50).join("\n") || "(none)")
+      .replace("{{usedFrUrls}}", Array.from(usedFrUrls).slice(-50).join("\n") || "(none)");
 
-CRITICAL RULES:
-1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs.
-2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
-3. Each target URL should only be used ONCE across all matches. Do not assign the same target URL to multiple source URLs.
-4. URLs that are already matched should not appear again. Check the "already used" lists.
-5. Focus on matching the page PURPOSE and CONTENT, not just superficial URL similarity.
-6. Pay attention to the URL path structure - pages in the same section should map to the corresponding section in the target language.
-
-WEBSITE STRUCTURE:
-${patternContext.join("\n")}
-
-EXAMPLES OF CORRECTLY MATCHED PAIRS:
-${exampleLines}
-
-ALREADY USED ENGLISH URLs (do NOT reuse these):
-${Array.from(usedEnUrls).slice(-50).join("\n") || "(none)"}
-
-ALREADY USED FRENCH URLs (do NOT reuse these):
-${Array.from(usedFrUrls).slice(-50).join("\n") || "(none)"}`;
-
-    const userPrompt = `Find the matching English and/or French URLs for each of these Hebrew source URLs.
-
-UNMATCHED SOURCE URLs:
-${urlsBlock}
-
-AVAILABLE ENGLISH URLs (pick ONLY from this list):
-${enListForBatch || "(no English inventory available)"}
-
-AVAILABLE FRENCH URLs (pick ONLY from this list):
-${frListForBatch || "(no French inventory available)"}
-
-For each source URL, respond with a JSON array of objects. Each object must have:
-- "sourceUrl": the original Hebrew source URL
-- "englishUrl": the matching English URL from the inventory, or null if no confident match
-- "frenchUrl": the matching French URL from the inventory, or null if no confident match  
-- "reasoning": a brief explanation of why you matched these URLs (or why no match was found)
-
-Return ONLY the JSON array, no other text.`;
+    const userPrompt = AI_USER_PROMPT_TEMPLATE
+      .replace("{{urlsBlock}}", urlsBlock)
+      .replace("{{enInventoryList}}", enListForBatch || "(no English inventory available)")
+      .replace("{{frInventoryList}}", frListForBatch || "(no French inventory available)");
 
     try {
-      const response = await openai.chat.completions.create({
-        model: "gpt-5-mini",
+      const message = await anthropic.messages.create({
+        model: AI_MODEL,
+        max_tokens: 8192,
+        system: systemPrompt,
         messages: [
-          { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
         ],
-        response_format: { type: "json_object" },
-        max_completion_tokens: 8192,
       });
 
-      const content = response.choices[0]?.message?.content;
+      const textBlock = message.content.find(b => b.type === "text");
+      const content = textBlock?.text;
       if (!content) {
         log(`    AI batch ${batchIdx + 1}/${batches.length}: empty response`);
         continue;
@@ -1543,7 +1586,8 @@ Return ONLY the JSON array, no other text.`;
 
       let suggestions: AiSuggestion[] = [];
       try {
-        const parsed = JSON.parse(content);
+        const jsonStr = content.replace(/^```json?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+        const parsed = JSON.parse(jsonStr);
         suggestions = Array.isArray(parsed) ? parsed : (parsed.matches || parsed.results || parsed.urls || []);
       } catch {
         log(`    AI batch ${batchIdx + 1}/${batches.length}: failed to parse response`);
@@ -1570,8 +1614,8 @@ Return ONLY the JSON array, no other text.`;
             log(`    AI REJECTED (already used): EN ${suggestion.englishUrl}`);
           } else {
             result.enUrl = suggestion.englishUrl;
-            result.confidenceEn = 82;
-            result.matchMethodEn = "ai-match";
+            result.confidenceEn = AI_CONFIDENCE_SCORE;
+            result.matchMethodEn = AI_METHOD_LABEL;
             usedEnUrls.add(suggestion.englishUrl);
           }
         }
@@ -1583,8 +1627,8 @@ Return ONLY the JSON array, no other text.`;
             log(`    AI REJECTED (already used): FR ${suggestion.frenchUrl}`);
           } else {
             result.frUrl = suggestion.frenchUrl;
-            result.confidenceFr = 82;
-            result.matchMethodFr = "ai-match";
+            result.confidenceFr = AI_CONFIDENCE_SCORE;
+            result.matchMethodFr = AI_METHOD_LABEL;
             usedFrUrls.add(suggestion.frenchUrl);
           }
         }

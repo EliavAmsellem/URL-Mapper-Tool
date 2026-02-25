@@ -19,6 +19,7 @@ import {
   clearCaches,
   clearAllCaches,
   validateDepthMatch,
+  getAiConfig,
   type TabPatterns,
   type CrawlInventory,
   type BatchMatchResult,
@@ -44,6 +45,10 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+
+  app.get("/api/ai-config", (_req: Request, res: Response) => {
+    res.json(getAiConfig());
+  });
 
   app.post("/api/upload", upload.single("file"), async (req: Request, res: Response) => {
     try {
