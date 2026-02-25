@@ -84,3 +84,65 @@ export async function getJobConflicts(jobId: string): Promise<ReferenceConflict[
 export function getDownloadUrl(jobId: string): string {
   return `/api/jobs/${jobId}/download`;
 }
+
+export interface CrawlSession {
+  id: string;
+  origin: string;
+  rootPath: string;
+  label: string | null;
+  status: string;
+  totalUrls: number;
+  maxPages: number;
+  maxDepth: number;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+}
+
+export async function getCrawlSessions(): Promise<CrawlSession[]> {
+  const res = await fetch("/api/crawl/sessions");
+  if (!res.ok) throw new Error("Failed to fetch crawl sessions");
+  return res.json();
+}
+
+export async function getCrawlSession(id: string): Promise<CrawlSession> {
+  const res = await fetch(`/api/crawl/sessions/${id}`);
+  if (!res.ok) throw new Error("Failed to fetch crawl session");
+  return res.json();
+}
+
+export async function startCrawl(data: {
+  origin: string;
+  rootPath: string;
+  label?: string;
+  maxPages?: number;
+  maxDepth?: number;
+}): Promise<CrawlSession> {
+  const res = await fetch("/api/crawl", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.message || "Failed to start crawl");
+  }
+  return res.json();
+}
+
+export async function refreshCrawl(id: string): Promise<CrawlSession> {
+  const res = await fetch(`/api/crawl/sessions/${id}/refresh`, { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.message || "Failed to refresh crawl");
+  }
+  return res.json();
+}
+
+export async function deleteCrawlSession(id: string): Promise<void> {
+  const res = await fetch(`/api/crawl/sessions/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.message || "Failed to delete crawl session");
+  }
+}

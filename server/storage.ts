@@ -1,10 +1,13 @@
 import {
   type MappingJob, type InsertMappingJob,
   type MappingResult, type InsertMappingResult,
+  type CrawlSession, type InsertCrawlSession,
+  type CrawlInventoryUrl, type InsertCrawlInventoryUrl,
   mappingJobs, mappingResults, translationCache,
+  crawlSessions, crawlInventoryUrls,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, and } from "drizzle-orm";
+import { eq, and, desc } from "drizzle-orm";
 
 export interface IStorage {
   createJob(job: InsertMappingJob): Promise<MappingJob>;
@@ -18,6 +21,15 @@ export interface IStorage {
   getCachedTranslation(sourceText: string, targetLang: string): Promise<string | null>;
   getCachedTranslations(targetLang: string): Promise<Map<string, string>>;
   saveCachedTranslations(entries: { sourceText: string; targetLang: string; translatedText: string }[]): Promise<void>;
+  createCrawlSession(session: InsertCrawlSession): Promise<CrawlSession>;
+  getCrawlSession(id: string): Promise<CrawlSession | undefined>;
+  getCrawlSessions(): Promise<CrawlSession[]>;
+  updateCrawlSession(id: string, updates: Partial<InsertCrawlSession>): Promise<CrawlSession | undefined>;
+  deleteCrawlSession(id: string): Promise<void>;
+  findCompletedCrawlSession(origin: string, rootPath: string): Promise<CrawlSession | undefined>;
+  saveCrawlInventory(sessionId: string, urls: { url: string; title?: string }[]): Promise<void>;
+  loadCrawlInventory(sessionId: string): Promise<{ url: string; title: string | null }[]>;
+  deleteCrawlInventory(sessionId: string): Promise<void>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -93,6 +105,66 @@ export class DatabaseStorage implements IStorage {
       }));
       await db.insert(translationCache).values(batch).onConflictDoNothing();
     }
+  }
+
+  async createCrawlSession(session: InsertCrawlSession): Promise<CrawlSession> {
+    const [created] = await db.insert(crawlSessions).values(session).returning();
+    return created;
+  }
+
+  async getCrawlSession(id: string): Promise<CrawlSession | undefined> {
+    const [session] = await db.select().from(crawlSessions).where(eq(crawlSessions.id, id));
+    return session;
+  }
+
+  async getCrawlSessions(): Promise<CrawlSession[]> {
+    return db.select().from(crawlSessions).orderBy(desc(crawlSessions.createdAt));
+  }
+
+  async updateCrawlSession(id: string, updates: Partial<InsertCrawlSession>): Promise<CrawlSession | undefined> {
+    const [updated] = await db.update(crawlSessions).set(updates).where(eq(crawlSessions.id, id)).returning();
+    return updated;
+  }
+
+  async deleteCrawlSession(id: string): Promise<void> {
+    await db.delete(crawlInventoryUrls).where(eq(crawlInventoryUrls.sessionId, id));
+    await db.delete(crawlSessions).where(eq(crawlSessions.id, id));
+  }
+
+  async findCompletedCrawlSession(origin: string, rootPath: string): Promise<CrawlSession | undefined> {
+    const [session] = await db.select().from(crawlSessions)
+      .where(and(
+        eq(crawlSessions.origin, origin),
+        eq(crawlSessions.rootPath, rootPath),
+        eq(crawlSessions.status, "completed")
+      ))
+      .orderBy(desc(crawlSessions.completedAt))
+      .limit(1);
+    return session;
+  }
+
+  async saveCrawlInventory(sessionId: string, urls: { url: string; title?: string }[]): Promise<void> {
+    if (urls.length === 0) return;
+    await db.delete(crawlInventoryUrls).where(eq(crawlInventoryUrls.sessionId, sessionId));
+    const batchSize = 200;
+    for (let i = 0; i < urls.length; i += batchSize) {
+      const batch = urls.slice(i, i + batchSize).map(u => ({
+        sessionId,
+        url: u.url,
+        title: u.title || null,
+      }));
+      await db.insert(crawlInventoryUrls).values(batch);
+    }
+  }
+
+  async loadCrawlInventory(sessionId: string): Promise<{ url: string; title: string | null }[]> {
+    return db.select({ url: crawlInventoryUrls.url, title: crawlInventoryUrls.title })
+      .from(crawlInventoryUrls)
+      .where(eq(crawlInventoryUrls.sessionId, sessionId));
+  }
+
+  async deleteCrawlInventory(sessionId: string): Promise<void> {
+    await db.delete(crawlInventoryUrls).where(eq(crawlInventoryUrls.sessionId, sessionId));
   }
 }
 

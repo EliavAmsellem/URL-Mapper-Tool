@@ -42,11 +42,38 @@ export const translationCache = pgTable("translation_cache", {
   createdAt: timestamp("created_at").defaultNow(),
 });
 
+export const crawlSessions = pgTable("crawl_sessions", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  origin: text("origin").notNull(),
+  rootPath: text("root_path").notNull(),
+  label: text("label"),
+  status: text("status").notNull().default("pending"),
+  totalUrls: integer("total_urls").notNull().default(0),
+  maxPages: integer("max_pages").notNull().default(2000),
+  maxDepth: integer("max_depth").notNull().default(6),
+  startedAt: timestamp("started_at"),
+  completedAt: timestamp("completed_at"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const crawlInventoryUrls = pgTable("crawl_inventory_urls", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  sessionId: varchar("session_id").notNull(),
+  url: text("url").notNull(),
+  title: text("title"),
+});
+
 export const insertMappingJobSchema = createInsertSchema(mappingJobs).omit({ id: true, createdAt: true });
 export const insertMappingResultSchema = createInsertSchema(mappingResults).omit({ id: true });
 export const insertTranslationCacheSchema = createInsertSchema(translationCache).omit({ id: true, createdAt: true });
+export const insertCrawlSessionSchema = createInsertSchema(crawlSessions).omit({ id: true, createdAt: true });
+export const insertCrawlInventoryUrlSchema = createInsertSchema(crawlInventoryUrls).omit({ id: true });
 
 export type InsertMappingJob = z.infer<typeof insertMappingJobSchema>;
 export type MappingJob = typeof mappingJobs.$inferSelect;
 export type InsertMappingResult = z.infer<typeof insertMappingResultSchema>;
 export type MappingResult = typeof mappingResults.$inferSelect;
+export type CrawlSession = typeof crawlSessions.$inferSelect;
+export type InsertCrawlSession = z.infer<typeof insertCrawlSessionSchema>;
+export type CrawlInventoryUrl = typeof crawlInventoryUrls.$inferSelect;
+export type InsertCrawlInventoryUrl = z.infer<typeof insertCrawlInventoryUrlSchema>;

@@ -534,7 +534,8 @@ export function findTargetDirectory(
 
 const CRAWL_CONCURRENCY = 30;
 const CRAWL_TIMEOUT = 8000;
-const CRAWL_MAX_PAGES = 500;
+const CRAWL_MAX_PAGES = 2000;
+const CRAWL_MAX_DEPTH = 6;
 
 export interface CrawlInventory {
   urls: Set<string>;
@@ -677,7 +678,8 @@ function removeFromInventory(inventory: CrawlInventory, url: string) {
 export async function crawlDirectory(
   origin: string,
   rootPath: string[],
-  onProgress?: (crawled: number, queued: number) => void
+  onProgress?: (crawled: number, queued: number) => void,
+  options?: { maxPages?: number; maxDepth?: number }
 ): Promise<CrawlInventory> {
   const inventory: CrawlInventory = {
     urls: new Set(),
@@ -687,34 +689,37 @@ export async function crawlDirectory(
     lastSegWordIndex: new Map(),
   };
 
+  const maxPages = options?.maxPages ?? CRAWL_MAX_PAGES;
+  const maxDepth = options?.maxDepth ?? CRAWL_MAX_DEPTH;
+
   const scopePrefix = "/" + rootPath.join("/");
   const startUrl = origin + scopePrefix + "/";
 
   const visited = new Set<string>();
-  const queue: string[] = [startUrl];
+  const queue: { url: string; depth: number }[] = [{ url: startUrl, depth: 0 }];
 
   if (rootPath.length > 0) {
     const defaultUrl = origin + scopePrefix + "/Pages/default.aspx";
-    queue.push(defaultUrl);
+    queue.push({ url: defaultUrl, depth: 0 });
   }
 
   let crawled = 0;
 
-  while (queue.length > 0 && crawled < CRAWL_MAX_PAGES) {
+  while (queue.length > 0 && crawled < maxPages) {
     const batch = queue.splice(0, CRAWL_CONCURRENCY);
-    const toFetch = batch.filter((url) => !visited.has(url));
-    for (const url of toFetch) visited.add(url);
+    const toFetch = batch.filter((item) => !visited.has(item.url));
+    for (const item of toFetch) visited.add(item.url);
 
     if (toFetch.length === 0) continue;
 
     const results = await Promise.all(
-      toFetch.map(async (url) => {
-        const html = await fetchPage(url);
-        return { url, html };
+      toFetch.map(async (item) => {
+        const html = await fetchPage(item.url);
+        return { url: item.url, depth: item.depth, html };
       })
     );
 
-    for (const { url, html } of results) {
+    for (const { url, depth, html } of results) {
       crawled++;
 
       if (html) {
@@ -735,10 +740,12 @@ export async function crawlDirectory(
           }
         }
 
-        const links = extractLinks(html, url, scopePrefix);
-        for (const link of links) {
-          if (!visited.has(link)) {
-            queue.push(link);
+        if (depth < maxDepth) {
+          const links = extractLinks(html, url, scopePrefix);
+          for (const link of links) {
+            if (!visited.has(link)) {
+              queue.push({ url: link, depth: depth + 1 });
+            }
           }
         }
       }
@@ -749,6 +756,23 @@ export async function crawlDirectory(
     }
   }
 
+  return inventory;
+}
+
+export function buildInventoryFromDbRows(rows: { url: string; title: string | null }[]): CrawlInventory {
+  const inventory: CrawlInventory = {
+    urls: new Set(),
+    normalizedIndex: new Map(),
+    tailIndex: new Map(),
+    titleIndex: new Map(),
+    lastSegWordIndex: new Map(),
+  };
+  for (const row of rows) {
+    addToInventory(inventory, row.url);
+    if (row.title) {
+      inventory.titleIndex.set(row.url, row.title);
+    }
+  }
   return inventory;
 }
 

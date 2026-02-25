@@ -9,6 +9,7 @@ import {
   learnTabPatterns,
   validateReferenceRows,
   crawlDirectory,
+  buildInventoryFromDbRows,
   matchInDirectory,
   findTargetDirectory,
   getScopedInventory,
@@ -247,7 +248,126 @@ export async function registerRoutes(
     }
   }, 3000);
 
+  app.get("/api/crawl/sessions", async (_req: Request, res: Response) => {
+    try {
+      const sessions = await storage.getCrawlSessions();
+      res.json(sessions);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get("/api/crawl/sessions/:id", async (req: Request, res: Response) => {
+    try {
+      const session = await storage.getCrawlSession(req.params.id);
+      if (!session) return res.status(404).json({ message: "Session not found" });
+      res.json(session);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/crawl", async (req: Request, res: Response) => {
+    try {
+      const { origin, rootPath, label, maxPages, maxDepth } = req.body;
+      if (!origin || !rootPath) {
+        return res.status(400).json({ message: "origin and rootPath are required" });
+      }
+
+      const session = await storage.createCrawlSession({
+        origin,
+        rootPath,
+        label: label || null,
+        status: "pending",
+        totalUrls: 0,
+        maxPages: maxPages || 2000,
+        maxDepth: maxDepth || 6,
+      });
+
+      runCrawlSession(session.id).catch(err => {
+        log(`Crawl session ${session.id} error: ${err.message}`);
+        storage.updateCrawlSession(session.id, { status: "failed" });
+      });
+
+      res.json(session);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/crawl/sessions/:id/refresh", async (req: Request, res: Response) => {
+    try {
+      const session = await storage.getCrawlSession(req.params.id);
+      if (!session) return res.status(404).json({ message: "Session not found" });
+      if (session.status === "crawling") return res.status(400).json({ message: "Crawl already in progress" });
+
+      await storage.updateCrawlSession(session.id, { status: "pending", totalUrls: 0 });
+
+      runCrawlSession(session.id).catch(err => {
+        log(`Crawl refresh ${session.id} error: ${err.message}`);
+        storage.updateCrawlSession(session.id, { status: "failed" });
+      });
+
+      const updated = await storage.getCrawlSession(session.id);
+      res.json(updated);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.delete("/api/crawl/sessions/:id", async (req: Request, res: Response) => {
+    try {
+      const session = await storage.getCrawlSession(req.params.id);
+      if (!session) return res.status(404).json({ message: "Session not found" });
+      if (session.status === "crawling") return res.status(400).json({ message: "Cannot delete while crawling" });
+      await storage.deleteCrawlSession(session.id);
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
   return httpServer;
+}
+
+async function runCrawlSession(sessionId: string) {
+  const session = await storage.getCrawlSession(sessionId);
+  if (!session) throw new Error("Session not found");
+
+  await storage.updateCrawlSession(sessionId, {
+    status: "crawling",
+    startedAt: new Date(),
+  } as any);
+
+  log(`Starting crawl: ${session.origin}${session.rootPath} (maxPages=${session.maxPages}, maxDepth=${session.maxDepth})`);
+
+  const rootPathParts = session.rootPath.split("/").filter(Boolean);
+
+  const inventory = await crawlDirectory(
+    session.origin,
+    rootPathParts,
+    (crawled, queued) => {
+      if (crawled % 100 === 0) {
+        log(`  Crawl progress: ${crawled} pages fetched, ${queued} queued`);
+      }
+    },
+    { maxPages: session.maxPages || 2000, maxDepth: session.maxDepth || 6 }
+  );
+
+  const urlEntries = Array.from(inventory.urls).map(url => ({
+    url,
+    title: inventory.titleIndex.get(url) || undefined,
+  }));
+
+  await storage.saveCrawlInventory(sessionId, urlEntries);
+
+  await storage.updateCrawlSession(sessionId, {
+    status: "completed",
+    totalUrls: urlEntries.length,
+    completedAt: new Date(),
+  } as any);
+
+  log(`Crawl complete: ${session.origin}${session.rootPath} — ${urlEntries.length} URLs discovered and saved`);
 }
 
 const DB_BATCH_SIZE = 200;
@@ -388,12 +508,22 @@ async function matchTab(
         enInventory = crawlCache.get(enCacheKey)!;
         log(`  EN directory cached: ${enInventory.urls.size} URLs`);
       } else {
-        log(`  Crawling EN directory: /${enCrawlRoot.join("/")}/`);
-        crawlPromises.push(
-          crawlDirectory(origin, enCrawlRoot, (c, q) => {
-            if (c % 50 === 0) log(`    EN crawl progress: ${c} pages fetched, ${q} queued`);
-          }).then(inv => { enInventory = inv; crawlCache.set(enCacheKey, inv); log(`  EN crawl complete: ${inv.urls.size} URLs discovered`); })
-        );
+        const rootPathStr = "/" + enCrawlRoot.join("/");
+        const dbSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
+        if (dbSession) {
+          log(`  EN loading from DB inventory (session ${dbSession.id}): ${dbSession.totalUrls} URLs`);
+          const rows = await storage.loadCrawlInventory(dbSession.id);
+          enInventory = buildInventoryFromDbRows(rows);
+          crawlCache.set(enCacheKey, enInventory);
+          log(`  EN inventory loaded: ${enInventory.urls.size} URLs`);
+        } else {
+          log(`  Crawling EN directory: /${enCrawlRoot.join("/")}/`);
+          crawlPromises.push(
+            crawlDirectory(origin, enCrawlRoot, (c, q) => {
+              if (c % 100 === 0) log(`    EN crawl progress: ${c} pages fetched, ${q} queued`);
+            }).then(inv => { enInventory = inv; crawlCache.set(enCacheKey, inv); log(`  EN crawl complete: ${inv.urls.size} URLs discovered`); })
+          );
+        }
       }
     }
   }
@@ -406,12 +536,22 @@ async function matchTab(
         frInventory = crawlCache.get(frCacheKey)!;
         log(`  FR directory cached: ${frInventory.urls.size} URLs`);
       } else {
-        log(`  Crawling FR directory: /${frCrawlRoot.join("/")}/`);
-        crawlPromises.push(
-          crawlDirectory(origin, frCrawlRoot, (c, q) => {
-            if (c % 50 === 0) log(`    FR crawl progress: ${c} pages fetched, ${q} queued`);
-          }).then(inv => { frInventory = inv; crawlCache.set(frCacheKey, inv); log(`  FR crawl complete: ${inv.urls.size} URLs discovered`); })
-        );
+        const rootPathStr = "/" + frCrawlRoot.join("/");
+        const dbSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
+        if (dbSession) {
+          log(`  FR loading from DB inventory (session ${dbSession.id}): ${dbSession.totalUrls} URLs`);
+          const rows = await storage.loadCrawlInventory(dbSession.id);
+          frInventory = buildInventoryFromDbRows(rows);
+          crawlCache.set(frCacheKey, frInventory);
+          log(`  FR inventory loaded: ${frInventory.urls.size} URLs`);
+        } else {
+          log(`  Crawling FR directory: /${frCrawlRoot.join("/")}/`);
+          crawlPromises.push(
+            crawlDirectory(origin, frCrawlRoot, (c, q) => {
+              if (c % 100 === 0) log(`    FR crawl progress: ${c} pages fetched, ${q} queued`);
+            }).then(inv => { frInventory = inv; crawlCache.set(frCacheKey, inv); log(`  FR crawl complete: ${inv.urls.size} URLs discovered`); })
+          );
+        }
       }
     }
   }
