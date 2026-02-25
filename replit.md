@@ -2,7 +2,7 @@
 
 ## Overview
 
-LinguaMap is a multilingual URL mapping and site structure alignment tool. Users upload Excel/CSV files containing URLs, and the system automatically finds corresponding pages across different language versions of a website. It uses pattern-based URL construction learned from reference rows in each Excel tab, with HEAD request verification to confirm URL existence.
+LinguaMap is a multilingual URL mapping and site structure alignment tool. Users upload Excel/CSV files containing URLs, and the system automatically finds corresponding pages across different language versions of a website. It uses a **context-focused directory matching** approach: reference rows teach the system which source directories map to which target directories, then the system crawls target directories and matches pages within those scoped inventories.
 
 The app follows a single-page application pattern with a three-phase workflow: file upload → processing with real-time progress → results display with export.
 
@@ -26,7 +26,6 @@ Preferred communication style: Simple, everyday language.
 - **Language**: TypeScript, executed via `tsx` in development
 - **API Pattern**: REST endpoints under `/api/` prefix
 - **File Handling**: Multer for file uploads (stored in `/tmp/uploads/`), XLSX library for parsing Excel/CSV files
-- **URL Verification**: Batch HEAD requests with 50 concurrent connections, 3s timeout, and URL existence caching
 - **Job System**: Asynchronous processing with polling — jobs are created on upload, started via API, and clients poll for status updates every 2 seconds
 
 ### Key API Endpoints
@@ -45,72 +44,63 @@ Preferred communication style: Simple, everyday language.
   - `translation_cache` — Persistent cache for Hebrew→EN/FR translations (keyed by source_text + target_lang), avoids redundant API calls across runs
 - **Push migrations**: Use `npm run db:push` (drizzle-kit push) to sync schema to database
 
-### Pattern-Based URL Construction Engine (`server/scraper.ts`)
+### Context-Focused Directory Matching Engine (`server/scraper.ts`)
 
-The engine uses a three-step approach:
+The engine uses a **directory-scoped, crawl-inventory-based** approach. Instead of constructing URLs and verifying them with HEAD requests, it narrows the search space by mapping source directories to target directories, then matches pages within those scoped inventories.
 
-#### Step 1: Pattern Learning from Reference Rows
+#### Step 1: Pattern Learning & Directory Mapping
 Each Excel tab contains pre-filled reference rows where source URLs already have their EN/FR equivalents. The engine:
 1. Strips `default.aspx` suffixes from both source and target paths
-2. Performs fuzzy tail-matching from the end of path segments (normalizing underscores, spaces, and percent-encoding)
-3. Identifies the "source root" (segments unique to source path) and "target root" (segments unique to target path)
-4. Finds common root mappings across all reference pairs in a tab
-5. Builds segment-level translations for path components that differ
+2. Extracts **directory mappings** from reference pairs (e.g., `/he/about/pages/` → `/en/about/pages/`)
+3. Finds common root mappings across all reference pairs
+4. Builds segment-level translations for path components that differ
+5. Stores directory mappings hierarchically — sub-directories inherit parent mappings
 
-Example: Source `/HaravotBarzel1/Harada_HB/Pages/` → EN `/English%20Homepage/Updates-security-situation/Harada_HB/Pages/`
-- Source root: `HaravotBarzel1`
-- Target root: `English%20Homepage/Updates-security-situation`
-- Tail match: `Harada_HB/Pages`
+#### Step 2: Directory-Scoped Crawling
+- Crawls target language sections to build an inventory of existing URLs
+- The crawl scope is derived from learned directory mappings or common root paths
+- Each crawled page is indexed by: normalized path, tail segments (last 1-3 segments), page title, and word index
 
-#### Step 2: URL Construction
-For each source URL needing a target:
-1. Strip `default.aspx` suffix
-2. Replace source root segments with target root segments
-3. Apply segment-level translations to remaining path parts
-4. Construct full target URL
+#### Step 3: Context-Focused Matching
+For each unmatched source URL:
+1. **Determine directory context** — Find which source directory the URL belongs to and look up the corresponding target directory
+2. **Scope the inventory** — Filter the crawl inventory to only include pages under the mapped target directory
+3. **Match within scope** using these strategies (in order):
+   - **Pattern match** — Translate path segments and look for exact match in scoped inventory (confidence 95)
+   - **Path match** — Match by relative path within the directory scope (confidence 93)
+   - **Tail match** — Match on last 1-2 URL segments within scope (confidence 88-90)
+   - **Translated tail match** — Translate segments then match tails (confidence 86)
+   - **Fuzzy match** — Jaccard word-overlap similarity on last segments (confidence 80-90)
+4. **Broad fallback** — If no match in scoped inventory, search the full inventory with reduced confidence (-5 points)
 
-#### Step 3: Crawl Inventory Matching
-- Directory crawling builds an inventory of all URLs in target language sections
-- Exact match against constructed URLs (confidence 95)
-- Normalized path matching (confidence 93)
-- Tail-segment matching from the end of URL paths (confidence 85-88)
-- Segment fuzzy matching using word-overlap Jaccard similarity (confidence 80-90)
-- Translated segment matching using learned segment translations (confidence 86)
-
-#### Step 4: Batch HEAD Verification
-- All constructed URLs are verified with HTTP HEAD requests (50 concurrent, 3s timeout)
-- URLs returning non-200 status are discarded
-- Verified URLs get confidence score of 90
-
-#### Step 5: Title-Based Matching with Section Awareness
-- For URLs still unmatched after pattern/crawl matching, page titles are extracted and translated Hebrew→EN/FR using Google Translate GTX endpoint
+#### Step 4: Title-Based Matching
+- For URLs still unmatched, page titles are translated Hebrew→EN/FR using Google Translate GTX endpoint
 - Translated titles are fuzzy-matched against crawl inventory page titles using word-overlap similarity
-- **Section-aware scoring**: Titles like "Unemployment - Conditions of entitlement" are split into section prefix ("Unemployment") and page name ("Conditions of entitlement"). When both source and target titles have section prefixes, matching sections provide a similarity boost (up to +0.15), helping disambiguate pages with similar names across different website sections
-- Section matching is purely additive (boost-only) — it never excludes or penalizes candidates, preserving recall
+- Title matching is also directory-scoped: unmatched URLs are grouped by their target directory, and title matching searches within the corresponding scoped inventory
+- Section-aware scoring splits titles like "Topic - Page Name" and provides section similarity boosts
 - 5 concurrent translation requests with rate limiting (200ms between batches)
 - Translation results are cached persistently in the database `translation_cache` table
 
-#### Step 6: AI-Powered Matching (Final Fallback)
+#### Step 5: AI-Powered Matching (Final Fallback)
 - For URLs still unmatched after all deterministic steps, an AI agent (Claude Opus 4.6 via Replit Anthropic AI Integrations) attempts matching
-- The AI receives: unmatched source URLs with translated titles, the full crawl inventory of available target URLs, learned URL patterns and segment translations, and examples of already-matched pairs
+- The AI receives **directory context** for each URL: which source directory it's from and the corresponding target directory
+- AI gets a **scoped candidate list** — only URLs from the relevant target directories, not the full site inventory
 - AI is constrained to ONLY select from the crawl inventory — never invents URLs
 - Batches of ~15 unmatched URLs are processed per API call
-- All AI-suggested URLs are HEAD-verified before acceptance (same as pattern matches)
-- AI matches are labeled with method "ai-match" and confidence score 82
-- Duplicate prevention: AI cannot reuse URLs already assigned by earlier matching steps
+- AI matches are labeled with method "dir-ai" and confidence score 82
 - The system prompt emphasizes accuracy over completeness — better to return null than a wrong match
 
 #### Multi-Pass Processing
 - Jobs automatically run up to 3 passes per processing run
-- After each pass, newly matched URLs are treated as additional reference rows for learning improved transformation patterns
-- Subsequent passes re-run pattern learning and matching on remaining unmatched URLs
+- After each pass, newly matched URLs are treated as additional reference rows
+- This expands directory mappings and segment translations for subsequent passes
 - Processing stops early if a pass produces no new matches
-- This eliminates the need for manual download→re-upload cycles to improve match rates
 
 #### Key Data Structures
-- `TabPatterns`: Contains `enRoot`, `frRoot`, `enSrcRoot`, `frSrcRoot`, `segmentMap`, `patternValidated`
-- `RootMapping`: Contains `sourceRoot` and `targetRoot` arrays
-- Patterns are auto-trusted when derived from reference rows (no sample validation needed)
+- `TabPatterns`: Contains `directoryMappings`, `segmentMap`, `enRoot`, `frRoot`, `enSrcRoot`, `frSrcRoot`
+- `DirectoryMapping`: Maps a source directory path to a target directory path for a specific language
+- `CrawlInventory`: Full index of crawled URLs with normalized paths, tail segments, titles, and word indices
+- Scoped inventories are derived from the full inventory by filtering to a specific directory prefix
 
 #### Pipe-separated URL Handling
 Source URL cells may contain Hebrew text prepended with a pipe character (e.g., `ביטוח לאומי|https://...`). The parser extracts the URL from after the pipe.
@@ -133,10 +123,11 @@ Source URL cells may contain Hebrew text prepended with a pipe character (e.g., 
 - `xlsx` — Excel file reading and writing
 - `multer` — Multipart file upload handling
 - `framer-motion` — Client-side animations
-- `papaparse` — CSV parsing (client-side)
+- `cheerio` — HTML parsing for crawl inventory
 - `zod` + `drizzle-zod` — Schema validation
 - `@anthropic-ai/sdk` — Anthropic SDK for AI-powered URL matching (Claude Opus 4.6 via Replit AI Integrations)
 - `GET /api/ai-config` — Returns the AI agent's full configuration (model, system prompt, user prompt template, validation pipeline, matching rules)
 
 ### External Web Requests
-- The engine makes HTTP HEAD requests to verify constructed target URLs exist. Uses 50 concurrent connections with a 3s timeout per request and an in-memory existence cache to avoid redundant checks.
+- The engine crawls target language directories via HTTP GET requests to build page inventories (30 concurrent, 8s timeout per page, max 500 pages per scope)
+- Title translations use the Google Translate GTX endpoint with rate limiting

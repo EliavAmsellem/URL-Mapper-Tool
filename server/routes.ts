@@ -7,18 +7,14 @@ import fs from "fs";
 import { storage } from "./storage";
 import {
   learnTabPatterns,
-  batchConstructUrls,
-  constructTargetUrl,
-  validatePatterns,
-  batchHeadCheck,
   crawlDirectory,
-  matchAgainstInventory,
+  matchInDirectory,
+  findTargetDirectory,
+  getScopedInventory,
   titleMatchUnmatched,
   aiMatchUnmatched,
   batchTranslate,
-  clearCaches,
   clearAllCaches,
-  validateDepthMatch,
   getAiConfig,
   type TabPatterns,
   type CrawlInventory,
@@ -296,12 +292,12 @@ async function matchTab(
   let enInventory: CrawlInventory | null = null;
   let frInventory: CrawlInventory | null = null;
 
-  if (needsMatching.length === 0 || (tabPatterns.enRoot.length === 0 && tabPatterns.frRoot.length === 0)) {
+  const hasEnMappings = tabPatterns.enRoot.length > 0 || tabPatterns.directoryMappings.some(m => m.lang === "en");
+  const hasFrMappings = tabPatterns.frRoot.length > 0 || tabPatterns.directoryMappings.some(m => m.lang === "fr");
+
+  if (needsMatching.length === 0 || (!hasEnMappings && !hasFrMappings)) {
     return { matchResults, enInventory, frInventory, tabPatterns };
   }
-
-  if (tabPatterns.enRoot.length > 0) tabPatterns.patternValidated.en = true;
-  if (tabPatterns.frRoot.length > 0) tabPatterns.patternValidated.fr = true;
 
   const origin = (() => {
     for (const ref of tabRefRows) {
@@ -313,42 +309,70 @@ async function matchTab(
     return "";
   })();
 
+  function deriveCrawlRoot(lang: "en" | "fr"): string[] {
+    const root = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
+    if (root.length > 0) return root;
+
+    const langMappings = tabPatterns.directoryMappings.filter(m => m.lang === lang);
+    if (langMappings.length === 0) return [];
+
+    const targetDirParts = langMappings.map(m => m.targetDir.split("/").filter(Boolean));
+    if (targetDirParts.length === 0) return [];
+    if (targetDirParts.length === 1) return targetDirParts[0].slice(0, 2);
+
+    const prefix: string[] = [];
+    const minLen = Math.min(...targetDirParts.map(a => a.length));
+    for (let i = 0; i < minLen; i++) {
+      const first = targetDirParts[0][i].toLowerCase();
+      if (targetDirParts.every(arr => arr[i].toLowerCase() === first)) {
+        prefix.push(targetDirParts[0][i]);
+      } else {
+        break;
+      }
+    }
+    return prefix.length > 0 ? prefix : targetDirParts[0].slice(0, 1);
+  }
+
   const crawlPromises: Promise<void>[] = [];
-  if (origin && tabPatterns.enRoot.length > 0) {
-    const enScope = tabPatterns.enCrawlScope.length > 0 ? tabPatterns.enCrawlScope : tabPatterns.enRoot;
-    const enCacheKey = `en:${enScope.join("/")}`;
-    if (crawlCache.has(enCacheKey)) {
-      enInventory = crawlCache.get(enCacheKey)!;
-      log(`  EN directory cached: ${enInventory.urls.size} URLs`);
-    } else {
-      log(`  Crawling EN directory: /${enScope.join("/")}/`);
-      crawlPromises.push(
-        crawlDirectory(origin, enScope, (c, q) => {
-          if (c % 50 === 0) log(`    EN crawl progress: ${c} pages fetched, ${q} queued`);
-        }).then(inv => { enInventory = inv; crawlCache.set(enCacheKey, inv); log(`  EN crawl complete: ${inv.urls.size} URLs discovered`); })
-      );
+
+  if (origin && hasEnMappings) {
+    const enCrawlRoot = deriveCrawlRoot("en");
+    if (enCrawlRoot.length > 0) {
+      const enCacheKey = `en:${enCrawlRoot.join("/")}`;
+      if (crawlCache.has(enCacheKey)) {
+        enInventory = crawlCache.get(enCacheKey)!;
+        log(`  EN directory cached: ${enInventory.urls.size} URLs`);
+      } else {
+        log(`  Crawling EN directory: /${enCrawlRoot.join("/")}/`);
+        crawlPromises.push(
+          crawlDirectory(origin, enCrawlRoot, (c, q) => {
+            if (c % 50 === 0) log(`    EN crawl progress: ${c} pages fetched, ${q} queued`);
+          }).then(inv => { enInventory = inv; crawlCache.set(enCacheKey, inv); log(`  EN crawl complete: ${inv.urls.size} URLs discovered`); })
+        );
+      }
     }
   }
 
-  if (origin && tabPatterns.frRoot.length > 0) {
-    const frScope = tabPatterns.frCrawlScope.length > 0 ? tabPatterns.frCrawlScope : tabPatterns.frRoot;
-    const frCacheKey = `fr:${frScope.join("/")}`;
-    if (crawlCache.has(frCacheKey)) {
-      frInventory = crawlCache.get(frCacheKey)!;
-      log(`  FR directory cached: ${frInventory.urls.size} URLs`);
-    } else {
-      log(`  Crawling FR directory: /${frScope.join("/")}/`);
-      crawlPromises.push(
-        crawlDirectory(origin, frScope, (c, q) => {
-          if (c % 50 === 0) log(`    FR crawl progress: ${c} pages fetched, ${q} queued`);
-        }).then(inv => { frInventory = inv; crawlCache.set(frCacheKey, inv); log(`  FR crawl complete: ${inv.urls.size} URLs discovered`); })
-      );
+  if (origin && hasFrMappings) {
+    const frCrawlRoot = deriveCrawlRoot("fr");
+    if (frCrawlRoot.length > 0) {
+      const frCacheKey = `fr:${frCrawlRoot.join("/")}`;
+      if (crawlCache.has(frCacheKey)) {
+        frInventory = crawlCache.get(frCacheKey)!;
+        log(`  FR directory cached: ${frInventory.urls.size} URLs`);
+      } else {
+        log(`  Crawling FR directory: /${frCrawlRoot.join("/")}/`);
+        crawlPromises.push(
+          crawlDirectory(origin, frCrawlRoot, (c, q) => {
+            if (c % 50 === 0) log(`    FR crawl progress: ${c} pages fetched, ${q} queued`);
+          }).then(inv => { frInventory = inv; crawlCache.set(frCacheKey, inv); log(`  FR crawl complete: ${inv.urls.size} URLs discovered`); })
+        );
+      }
     }
   }
 
   if (crawlPromises.length > 0) await Promise.all(crawlPromises);
 
-  const unmatchedForHead: { index: number; lang: "en" | "fr"; constructedUrl: string; sourceUrl: string }[] = [];
   for (const row of needsMatching) {
     if (control.cancel) break;
     const result: BatchMatchResult = {
@@ -357,82 +381,53 @@ async function matchTab(
       matchMethodEn: null, matchMethodFr: null,
     };
 
-    if (row.needsEn && tabPatterns.patternValidated.en && enInventory) {
-      const match = matchAgainstInventory(row.sourceUrl, "en", tabPatterns, enInventory);
-      if (match) {
-        result.enUrl = match.url;
-        result.confidenceEn = match.confidence;
-        result.matchMethodEn = match.method;
-      } else {
-        const constructed = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
-        if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: constructed, sourceUrl: row.sourceUrl });
+    if (row.needsEn && enInventory) {
+      const targetDir = findTargetDirectory(row.sourceUrl, "en", tabPatterns);
+      if (targetDir) {
+        const scopedInv = getScopedInventory(enInventory, targetDir, origin);
+        if (scopedInv.urls.size > 0) {
+          const match = matchInDirectory(row.sourceUrl, "en", tabPatterns, scopedInv);
+          if (match) {
+            result.enUrl = match.url;
+            result.confidenceEn = match.confidence;
+            result.matchMethodEn = match.method;
+          }
+        }
+      }
+      if (!result.enUrl) {
+        const match = matchInDirectory(row.sourceUrl, "en", tabPatterns, enInventory);
+        if (match) {
+          result.enUrl = match.url;
+          result.confidenceEn = Math.max((match.confidence || 0) - 5, 70);
+          result.matchMethodEn = match.method + "-broad";
+        }
       }
     }
 
-    if (row.needsFr && tabPatterns.patternValidated.fr && frInventory) {
-      const match = matchAgainstInventory(row.sourceUrl, "fr", tabPatterns, frInventory);
-      if (match) {
-        result.frUrl = match.url;
-        result.confidenceFr = match.confidence;
-        result.matchMethodFr = match.method;
-      } else {
-        const constructed = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
-        if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: constructed, sourceUrl: row.sourceUrl });
+    if (row.needsFr && frInventory) {
+      const targetDir = findTargetDirectory(row.sourceUrl, "fr", tabPatterns);
+      if (targetDir) {
+        const scopedInv = getScopedInventory(frInventory, targetDir, origin);
+        if (scopedInv.urls.size > 0) {
+          const match = matchInDirectory(row.sourceUrl, "fr", tabPatterns, scopedInv);
+          if (match) {
+            result.frUrl = match.url;
+            result.confidenceFr = match.confidence;
+            result.matchMethodFr = match.method;
+          }
+        }
+      }
+      if (!result.frUrl) {
+        const match = matchInDirectory(row.sourceUrl, "fr", tabPatterns, frInventory);
+        if (match) {
+          result.frUrl = match.url;
+          result.confidenceFr = Math.max((match.confidence || 0) - 5, 70);
+          result.matchMethodFr = match.method + "-broad";
+        }
       }
     }
 
     matchResults.set(row.rowIndex, result);
-  }
-
-  if (unmatchedForHead.length > 0) {
-    log(`  Falling back to HEAD checks for ${unmatchedForHead.length} unmatched URLs...`);
-    const headUrls = unmatchedForHead.map((u) => u.constructedUrl);
-    const existence = await batchHeadCheck(headUrls);
-    let headMatched = 0;
-    let headDepthRejected = 0;
-    const enSrcRoot = tabPatterns.enSrcRoot;
-    const frSrcRoot = tabPatterns.frSrcRoot;
-    const enTgtRoot = tabPatterns.enRoot;
-    const frTgtRoot = tabPatterns.frRoot;
-
-    for (const item of unmatchedForHead) {
-      if (existence.get(item.constructedUrl)) {
-        const srcRoot = item.lang === "en" ? enSrcRoot : frSrcRoot;
-        const tgtRoot = item.lang === "en" ? enTgtRoot : frTgtRoot;
-
-        try {
-          const srcParts = new URL(item.sourceUrl).pathname.split("/").filter(Boolean);
-          const srcDepth = srcParts.length - srcRoot.length;
-          const tgtParts = new URL(item.constructedUrl).pathname.split("/").filter(Boolean);
-          const tgtDepth = tgtParts.length - tgtRoot.length;
-          if (srcDepth >= 2 && tgtDepth <= 0) {
-            log(`    HEAD match REJECTED (parent-only): ${item.sourceUrl} -> ${item.constructedUrl}`);
-            headDepthRejected++;
-            continue;
-          }
-          if (srcDepth >= 3 && tgtDepth <= 1) {
-            log(`    HEAD match REJECTED (too shallow): ${item.sourceUrl} -> ${item.constructedUrl}`);
-            headDepthRejected++;
-            continue;
-          }
-        } catch {}
-
-        const result = matchResults.get(item.index);
-        if (result) {
-          if (item.lang === "en") {
-            result.enUrl = item.constructedUrl;
-            result.confidenceEn = 90;
-            result.matchMethodEn = "pattern+head";
-          } else {
-            result.frUrl = item.constructedUrl;
-            result.confidenceFr = 90;
-            result.matchMethodFr = "pattern+head";
-          }
-          headMatched++;
-        }
-      }
-    }
-    log(`  HEAD fallback: ${headMatched}/${unmatchedForHead.length} verified${headDepthRejected > 0 ? `, ${headDepthRejected} depth-rejected` : ''}`);
   }
 
   const unmatchedForTitle = needsMatching.filter(row => {
@@ -455,102 +450,70 @@ async function matchTab(
   if (unmatchedForTitle.length > 0 && (enInventory || frInventory)) {
     log(`  Attempting title-based matching for ${unmatchedForTitle.length} unmatched URLs...`);
 
-    const enAllowedRoots = new Set<string>();
-    const frAllowedRoots = new Set<string>();
-
-    if (tabPatterns.enRoot.length > 0) {
-      enAllowedRoots.add("/" + tabPatterns.enRoot.join("/") + "/");
-    }
-    if (tabPatterns.frRoot.length > 0) {
-      frAllowedRoots.add("/" + tabPatterns.frRoot.join("/") + "/");
-    }
-
-    for (const ref of tabRefRows) {
-      if (ref.enUrl) {
-        try {
-          const enPath = new URL(ref.enUrl).pathname;
-          const enParts = enPath.split("/").filter(Boolean);
-          if (enParts.length >= 2) {
-            enAllowedRoots.add("/" + enParts.slice(0, 2).join("/") + "/");
-          } else if (enParts.length >= 1) {
-            enAllowedRoots.add("/" + enParts[0] + "/");
-          }
-        } catch {}
-      }
-      if (ref.frUrl) {
-        try {
-          const frPath = new URL(ref.frUrl).pathname;
-          const frParts = frPath.split("/").filter(Boolean);
-          if (frParts.length >= 2) {
-            frAllowedRoots.add("/" + frParts.slice(0, 2).join("/") + "/");
-          } else if (frParts.length >= 1) {
-            frAllowedRoots.add("/" + frParts[0] + "/");
-          }
-        } catch {}
-      }
-    }
-
-    const enRootsArr = Array.from(enAllowedRoots);
-    const frRootsArr = Array.from(frAllowedRoots);
-    if (enRootsArr.length > 0) log(`  EN allowed roots for title matching: ${enRootsArr.join(", ")}`);
-    else log(`  EN title matching SKIPPED: no allowed roots could be determined`);
-    if (frRootsArr.length > 0) log(`  FR allowed roots for title matching: ${frRootsArr.join(", ")}`);
-    else log(`  FR title matching SKIPPED: no allowed roots could be determined`);
-
-    const enRefDepths: number[] = [];
-    const frRefDepths: number[] = [];
     const knownEnUrls = new Set<string>();
     const knownFrUrls = new Set<string>();
 
     for (const ref of tabRefRows) {
-      if (ref.enUrl) {
-        try {
-          enRefDepths.push(new URL(ref.enUrl).pathname.split("/").filter(Boolean).length);
-          knownEnUrls.add(ref.enUrl);
-        } catch {}
-      }
-      if (ref.frUrl) {
-        try {
-          frRefDepths.push(new URL(ref.frUrl).pathname.split("/").filter(Boolean).length);
-          knownFrUrls.add(ref.frUrl);
-        } catch {}
-      }
+      if (ref.enUrl) knownEnUrls.add(ref.enUrl);
+      if (ref.frUrl) knownFrUrls.add(ref.frUrl);
     }
-
     for (const [, mr] of Array.from(matchResults.entries())) {
       if (mr.enUrl) knownEnUrls.add(mr.enUrl);
       if (mr.frUrl) knownFrUrls.add(mr.frUrl);
     }
 
-    if (enRefDepths.length > 0) log(`  EN ref depths: min=${Math.min(...enRefDepths)} max=${Math.max(...enRefDepths)} (${enRefDepths.length} refs)`);
-    if (frRefDepths.length > 0) log(`  FR ref depths: min=${Math.min(...frRefDepths)} max=${Math.max(...frRefDepths)} (${frRefDepths.length} refs)`);
     log(`  Known URLs to exclude: ${knownEnUrls.size} EN, ${knownFrUrls.size} FR`);
 
-    const titleMatches = await titleMatchUnmatched(
-      unmatchedForTitle, enInventory, frInventory, storage,
-      enRootsArr,
-      frRootsArr,
-      enRefDepths.length > 0 ? enRefDepths : undefined,
-      frRefDepths.length > 0 ? frRefDepths : undefined,
-      knownEnUrls,
-      knownFrUrls,
-    );
+    const groupedByDir = new Map<string, typeof unmatchedForTitle>();
+    for (const row of unmatchedForTitle) {
+      const enDir = row.needsEn ? findTargetDirectory(row.sourceUrl, "en", tabPatterns) : null;
+      const frDir = row.needsFr ? findTargetDirectory(row.sourceUrl, "fr", tabPatterns) : null;
+      const key = `${enDir || ""}|${frDir || ""}`;
+      if (!groupedByDir.has(key)) groupedByDir.set(key, []);
+      groupedByDir.get(key)!.push(row);
+    }
 
-    for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
-      let result = matchResults.get(rowIndex);
-      if (!result) {
-        result = { enUrl: null, frUrl: null, confidenceEn: null, confidenceFr: null, matchMethodEn: null, matchMethodFr: null };
-        matchResults.set(rowIndex, result);
+    for (const [dirKey, rows] of groupedByDir) {
+      const [enDir, frDir] = dirKey.split("|");
+
+      let enScopedInv: CrawlInventory | null = null;
+      let frScopedInv: CrawlInventory | null = null;
+
+      if (enDir && enInventory) {
+        enScopedInv = getScopedInventory(enInventory, enDir, origin);
+        if (enScopedInv.urls.size === 0) enScopedInv = enInventory;
+      } else if (enInventory) {
+        enScopedInv = enInventory;
       }
-      if (titleResult.enUrl && !result.enUrl) {
-        result.enUrl = titleResult.enUrl;
-        result.confidenceEn = titleResult.confidenceEn;
-        result.matchMethodEn = titleResult.matchMethodEn;
+
+      if (frDir && frInventory) {
+        frScopedInv = getScopedInventory(frInventory, frDir, origin);
+        if (frScopedInv.urls.size === 0) frScopedInv = frInventory;
+      } else if (frInventory) {
+        frScopedInv = frInventory;
       }
-      if (titleResult.frUrl && !result.frUrl) {
-        result.frUrl = titleResult.frUrl;
-        result.confidenceFr = titleResult.confidenceFr;
-        result.matchMethodFr = titleResult.matchMethodFr;
+
+      const titleMatches = await titleMatchUnmatched(
+        rows, enScopedInv, frScopedInv, storage,
+        knownEnUrls, knownFrUrls,
+      );
+
+      for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
+        let result = matchResults.get(rowIndex);
+        if (!result) {
+          result = { enUrl: null, frUrl: null, confidenceEn: null, confidenceFr: null, matchMethodEn: null, matchMethodFr: null };
+          matchResults.set(rowIndex, result);
+        }
+        if (titleResult.enUrl && !result.enUrl) {
+          result.enUrl = titleResult.enUrl;
+          result.confidenceEn = titleResult.confidenceEn;
+          result.matchMethodEn = titleResult.matchMethodEn;
+        }
+        if (titleResult.frUrl && !result.frUrl) {
+          result.frUrl = titleResult.frUrl;
+          result.confidenceFr = titleResult.confidenceFr;
+          result.matchMethodFr = titleResult.matchMethodFr;
+        }
       }
     }
   }
@@ -661,7 +624,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
     if (pass > 1) {
       log(`\n========== PASS ${pass} ==========`);
-      log(`Re-learning patterns from ${pass === 1 ? "original" : "updated"} reference rows...`);
+      log(`Re-learning patterns from updated reference rows...`);
 
       for (const tabData of allTabData) {
         const prevResults = globalMatchResults.get(tabData.sheetName);
@@ -818,6 +781,8 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
           sourceUrl: row.sourceUrl,
           needsEn: row.needsEn && (!m || !m.enUrl),
           needsFr: row.needsFr && (!m || !m.frUrl),
+          enDirectoryContext: findTargetDirectory(row.sourceUrl, "en", inv.tabPatterns) || undefined,
+          frDirectoryContext: findTargetDirectory(row.sourceUrl, "fr", inv.tabPatterns) || undefined,
         };
       });
 
@@ -852,6 +817,13 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
         frTranslations = await batchTranslate(titlesForFr, "fr", storage);
       }
 
+      const origin = (() => {
+        for (const ref of tabData.tabRefRows) {
+          try { return new URL(ref.sourceUrl).origin; } catch {}
+        }
+        return "";
+      })();
+
       const aiMatches = await aiMatchUnmatched(
         unmatchedForAi,
         inv.enInventory,
@@ -862,64 +834,13 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
         frTranslations,
         knownEnUrls,
         knownFrUrls,
+        origin,
       );
 
       if (aiMatches.size > 0) {
-        const aiUrls: string[] = [];
-        for (const [, aiResult] of Array.from(aiMatches.entries())) {
-          if (aiResult.enUrl) aiUrls.push(aiResult.enUrl);
-          if (aiResult.frUrl) aiUrls.push(aiResult.frUrl);
-        }
-
-        log(`  HEAD-verifying ${aiUrls.length} AI-suggested URLs...`);
-        const existence = await batchHeadCheck(aiUrls);
-
-        const rowSourceMap = new Map<number, string>();
-        for (const r of unmatchedForAi) {
-          rowSourceMap.set(r.rowIndex, r.sourceUrl);
-        }
-
         let aiAccepted = 0;
-        let aiHeadRejected = 0;
-        let aiDepthRejected = 0;
 
         for (const [rowIndex, aiResult] of Array.from(aiMatches.entries())) {
-          const srcUrl = rowSourceMap.get(rowIndex) || "";
-
-          if (aiResult.enUrl && !existence.get(aiResult.enUrl)) {
-            log(`    AI HEAD REJECTED: EN ${aiResult.enUrl}`);
-            aiResult.enUrl = null;
-            aiResult.confidenceEn = null;
-            aiResult.matchMethodEn = null;
-            aiHeadRejected++;
-          }
-          if (aiResult.frUrl && !existence.get(aiResult.frUrl)) {
-            log(`    AI HEAD REJECTED: FR ${aiResult.frUrl}`);
-            aiResult.frUrl = null;
-            aiResult.confidenceFr = null;
-            aiResult.matchMethodFr = null;
-            aiHeadRejected++;
-          }
-
-          if (aiResult.enUrl && srcUrl && inv.tabPatterns.enSrcRoot.length > 0) {
-            if (!validateDepthMatch(srcUrl, aiResult.enUrl, inv.tabPatterns.enSrcRoot, inv.tabPatterns.enRoot)) {
-              log(`    AI DEPTH REJECTED: EN ${aiResult.enUrl}`);
-              aiResult.enUrl = null;
-              aiResult.confidenceEn = null;
-              aiResult.matchMethodEn = null;
-              aiDepthRejected++;
-            }
-          }
-          if (aiResult.frUrl && srcUrl && inv.tabPatterns.frSrcRoot.length > 0) {
-            if (!validateDepthMatch(srcUrl, aiResult.frUrl, inv.tabPatterns.frSrcRoot, inv.tabPatterns.frRoot)) {
-              log(`    AI DEPTH REJECTED: FR ${aiResult.frUrl}`);
-              aiResult.frUrl = null;
-              aiResult.confidenceFr = null;
-              aiResult.matchMethodFr = null;
-              aiDepthRejected++;
-            }
-          }
-
           if (aiResult.enUrl || aiResult.frUrl) {
             let existing = sheetGlobal.get(rowIndex);
             if (!existing) {
@@ -942,7 +863,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
         }
 
         matchedCount += aiAccepted;
-        log(`  AI results: ${aiAccepted} accepted, ${aiHeadRejected} HEAD-rejected, ${aiDepthRejected} depth-rejected`);
+        log(`  AI results: ${aiAccepted} accepted`);
         await storage.updateJob(jobId, { matchedUrls: matchedCount });
       }
     }
