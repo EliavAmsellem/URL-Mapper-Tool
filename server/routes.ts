@@ -508,6 +508,33 @@ async function matchTab(
 
   const crawlPromises: Promise<void>[] = [];
 
+  function getTargetDirs(lang: "en" | "fr"): string[] {
+    const langMappings = tabPatterns.directoryMappings.filter(m => m.lang === lang);
+    return [...new Set(langMappings.map(m => {
+      const parts = m.targetDir.split("/").filter(Boolean);
+      return "/" + parts.join("/");
+    }))];
+  }
+
+  function filterSessionsByTargetDirs(sessions: { id: string; totalUrls: number; rootPath: string }[], targetDirs: string[], lang: string): { id: string; totalUrls: number; rootPath: string }[] {
+    if (targetDirs.length === 0 || sessions.length <= 1) return sessions;
+    const filtered = sessions.filter(s => {
+      const sessionRoot = s.rootPath.toLowerCase();
+      return targetDirs.some(td => {
+        const tdLower = td.toLowerCase();
+        return sessionRoot === tdLower || sessionRoot.startsWith(tdLower + "/") || tdLower.startsWith(sessionRoot + "/");
+      });
+    });
+    if (filtered.length > 0) {
+      const excluded = sessions.filter(s => !filtered.includes(s));
+      if (excluded.length > 0) {
+        log(`  ${lang.toUpperCase()} inventory scoping: kept ${filtered.length} session(s), excluded ${excluded.length} unrelated: ${excluded.map(s => s.rootPath).join(", ")}`);
+      }
+      return filtered;
+    }
+    return sessions;
+  }
+
   if (origin && hasEnMappings) {
     const enCrawlRoot = deriveCrawlRoot("en");
     if (enCrawlRoot.length > 0) {
@@ -517,13 +544,15 @@ async function matchTab(
         log(`  EN directory cached: ${enInventory.urls.size} URLs`);
       } else {
         const rootPathStr = "/" + enCrawlRoot.join("/");
-        let dbSessions: { id: string; totalUrls: number }[] = [];
+        let dbSessions: { id: string; totalUrls: number; rootPath: string }[] = [];
         const exactSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
         if (exactSession) {
           dbSessions = [exactSession];
         } else {
           const prefixSessions = await storage.findCompletedCrawlSessionsByPrefix(origin, rootPathStr);
-          if (prefixSessions.length > 0) dbSessions = prefixSessions;
+          if (prefixSessions.length > 0) {
+            dbSessions = filterSessionsByTargetDirs(prefixSessions, getTargetDirs("en"), "en");
+          }
         }
         if (dbSessions.length > 0) {
           const allRows: { url: string; title: string | null }[] = [];
@@ -556,13 +585,15 @@ async function matchTab(
         log(`  FR directory cached: ${frInventory.urls.size} URLs`);
       } else {
         const rootPathStr = "/" + frCrawlRoot.join("/");
-        let dbSessions: { id: string; totalUrls: number }[] = [];
+        let dbSessions: { id: string; totalUrls: number; rootPath: string }[] = [];
         const exactSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
         if (exactSession) {
           dbSessions = [exactSession];
         } else {
           const prefixSessions = await storage.findCompletedCrawlSessionsByPrefix(origin, rootPathStr);
-          if (prefixSessions.length > 0) dbSessions = prefixSessions;
+          if (prefixSessions.length > 0) {
+            dbSessions = filterSessionsByTargetDirs(prefixSessions, getTargetDirs("fr"), "fr");
+          }
         }
         if (dbSessions.length > 0) {
           const allRows: { url: string; title: string | null }[] = [];
@@ -858,7 +889,7 @@ function clearCheckpoint(jobId: string) {
   if (fs.existsSync(cpPath)) fs.unlinkSync(cpPath);
 }
 
-async function processJob(jobId: string, _threshold: number, control: { cancel: boolean }) {
+async function processJob(jobId: string, _threshold: number, control: { cancel: boolean; stopAfterCurrentRound: boolean }) {
   const filePath = `/tmp/uploads/${jobId}.xlsx`;
   if (!fs.existsSync(filePath)) {
     throw new Error("Source file not found");
@@ -1073,7 +1104,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
   const MAX_AI_ROUNDS = 3;
 
-  for (let aiRound = skipToPostAi ? MAX_AI_ROUNDS + 1 : resumeAiRound; aiRound <= MAX_AI_ROUNDS && !control.cancel; aiRound++) {
+  for (let aiRound = skipToPostAi ? MAX_AI_ROUNDS + 1 : resumeAiRound; aiRound <= MAX_AI_ROUNDS && !control.cancel && !control.stopAfterCurrentRound; aiRound++) {
     const roundLabel = aiRound > 1 ? ` (round ${aiRound})` : "";
     await storage.updateJob(jobId, { currentStep: `ai-matching${roundLabel}` });
 
@@ -1276,6 +1307,11 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
     if (roundAiTotal === 0) {
       log(`No new AI matches in round ${aiRound}, stopping AI re-learning loop.`);
+      break;
+    }
+
+    if (control.stopAfterCurrentRound) {
+      log(`Stop requested after AI round ${aiRound}. Finishing with ${matchedCount} matches.`);
       break;
     }
   }

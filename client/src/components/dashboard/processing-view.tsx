@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { Check, Loader2, Search, GitMerge, Save, Brain } from "lucide-react";
+import { Check, Loader2, Search, GitMerge, Save, Brain, StopCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useEffect, useState, useRef } from "react";
 import { getJobStatus, type JobStatus } from "@/lib/api";
@@ -35,9 +35,22 @@ function parseStep(currentStep: string): { phase: string; tabName: string | null
 export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
   const [job, setJob] = useState<JobStatus | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
+  const [stopRequested, setStopRequested] = useState(false);
   const pollRef = useRef<NodeJS.Timeout | null>(null);
   const prevStepRef = useRef<string>("");
   const prevMatchedRef = useRef<number>(0);
+
+  const handleStopAI = async () => {
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/stop-ai`, { method: "POST" });
+      if (res.ok) {
+        setStopRequested(true);
+        setLogs(prev => ["Stop requested — will finish after current AI round...", ...prev].slice(0, 10));
+      }
+    } catch (err) {
+      console.error("Failed to stop AI:", err);
+    }
+  };
 
   const steps = [
     { id: "learning", title: "Learning Patterns", icon: Search, desc: "Learning directory mappings from reference rows..." },
@@ -181,8 +194,24 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
         </div>
 
         {job && (
-          <div className="flex justify-between text-sm text-muted-foreground">
+          <div className="flex justify-between items-center text-sm text-muted-foreground">
             <span data-testid="text-matches">Matches found: <strong className="text-foreground">{job.matchedUrls}</strong></span>
+            {currentPhase === "ai-matching" && job.status === "processing" && (
+              <button
+                data-testid="button-stop-ai"
+                onClick={handleStopAI}
+                disabled={stopRequested}
+                className={cn(
+                  "flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors",
+                  stopRequested
+                    ? "bg-amber-500/10 text-amber-600 border border-amber-500/20 cursor-not-allowed"
+                    : "bg-red-500/10 text-red-600 border border-red-500/20 hover:bg-red-500/20"
+                )}
+              >
+                <StopCircle className="w-3.5 h-3.5" />
+                {stopRequested ? "Stopping after round..." : "Stop after this round"}
+              </button>
+            )}
             <span>File: <strong className="text-foreground">{job.fileName}</strong></span>
           </div>
         )}
