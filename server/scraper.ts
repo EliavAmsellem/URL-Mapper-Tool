@@ -1739,14 +1739,17 @@ export async function aiMatchUnmatched(
       }
     }
 
-    if (batchEnUrls.size === 0 && needsEn && enInventory) {
+    const INVENTORY_CAP = 500;
+    if (needsEn && enInventory && batchEnUrls.size < INVENTORY_CAP) {
       for (const url of enInventory.urls) {
-        if (!usedEnUrls.has(url)) batchEnUrls.add(url);
+        if (batchEnUrls.size >= INVENTORY_CAP) break;
+        if (!usedEnUrls.has(url) && !batchEnUrls.has(url)) batchEnUrls.add(url);
       }
     }
-    if (batchFrUrls.size === 0 && needsFr && frInventory) {
+    if (needsFr && frInventory && batchFrUrls.size < INVENTORY_CAP) {
       for (const url of frInventory.urls) {
-        if (!usedFrUrls.has(url)) batchFrUrls.add(url);
+        if (batchFrUrls.size >= INVENTORY_CAP) break;
+        if (!usedFrUrls.has(url) && !batchFrUrls.has(url)) batchFrUrls.add(url);
       }
     }
 
