@@ -1709,40 +1709,44 @@ export async function aiMatchUnmatched(
       }
     }
 
-    const needsEnFallback = batch.some(r => r.needsEn) && batchEnUrls.size === 0;
-    const needsFrFallback = batch.some(r => r.needsFr) && batchFrUrls.size === 0;
+    const needsEn = batch.some(r => r.needsEn);
+    const needsFr = batch.some(r => r.needsFr);
 
-    if (needsEnFallback || needsFrFallback) {
-      const batchTitles = batch
-        .map(r => enTranslations.get(r.title) || frTranslations.get(r.title))
-        .filter(Boolean) as string[];
+    const batchTitles = batch
+      .map(r => enTranslations.get(r.title) || frTranslations.get(r.title))
+      .filter(Boolean) as string[];
 
-      if (batchTitles.length > 0) {
-        if (needsEnFallback && enInventory) {
-          const ranked = rankInventoryByTitleSimilarity(enInventory, batchTitles, usedEnUrls);
-          for (const url of ranked) batchEnUrls.add(url);
-          if (ranked.length > 0) {
-            log(`    Fallback scoping (EN): title-ranked ${ranked.length} candidates (from ${enInventory.urls.size} total)`);
-          }
-        }
-        if (needsFrFallback && frInventory) {
-          const ranked = rankInventoryByTitleSimilarity(frInventory, batchTitles, usedFrUrls);
-          for (const url of ranked) batchFrUrls.add(url);
-          if (ranked.length > 0) {
-            log(`    Fallback scoping (FR): title-ranked ${ranked.length} candidates (from ${frInventory.urls.size} total)`);
-          }
-        }
-      }
-
-      if (batchEnUrls.size === 0 && needsEnFallback && enInventory) {
-        for (const url of enInventory.urls) {
+    if (batchTitles.length > 0) {
+      if (needsEn && enInventory) {
+        const scopedBefore = batchEnUrls.size;
+        const ranked = rankInventoryByTitleSimilarity(enInventory, batchTitles, usedEnUrls);
+        for (const url of ranked) {
           if (!usedEnUrls.has(url)) batchEnUrls.add(url);
         }
+        if (ranked.length > 0) {
+          log(`    Title-supplement (EN): +${batchEnUrls.size - scopedBefore} title-ranked candidates added to ${scopedBefore} scoped (from ${enInventory.urls.size} total)`);
+        }
       }
-      if (batchFrUrls.size === 0 && needsFrFallback && frInventory) {
-        for (const url of frInventory.urls) {
+      if (needsFr && frInventory) {
+        const scopedBefore = batchFrUrls.size;
+        const ranked = rankInventoryByTitleSimilarity(frInventory, batchTitles, usedFrUrls);
+        for (const url of ranked) {
           if (!usedFrUrls.has(url)) batchFrUrls.add(url);
         }
+        if (ranked.length > 0) {
+          log(`    Title-supplement (FR): +${batchFrUrls.size - scopedBefore} title-ranked candidates added to ${scopedBefore} scoped (from ${frInventory.urls.size} total)`);
+        }
+      }
+    }
+
+    if (batchEnUrls.size === 0 && needsEn && enInventory) {
+      for (const url of enInventory.urls) {
+        if (!usedEnUrls.has(url)) batchEnUrls.add(url);
+      }
+    }
+    if (batchFrUrls.size === 0 && needsFr && frInventory) {
+      for (const url of frInventory.urls) {
+        if (!usedFrUrls.has(url)) batchFrUrls.add(url);
       }
     }
 
