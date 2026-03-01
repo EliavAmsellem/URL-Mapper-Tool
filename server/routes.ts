@@ -108,7 +108,7 @@ export async function registerRoutes(
         }
       }
 
-      const control = { cancel: false };
+      const control = { cancel: false, stopAfterCurrentRound: false };
       activeJobs.set(jobId, control);
 
       await storage.updateJob(jobId, { status: "processing", currentStep: "learning" });
@@ -122,6 +122,14 @@ export async function registerRoutes(
     } catch (error: any) {
       res.status(500).json({ message: error.message });
     }
+  });
+
+  app.post("/api/jobs/:id/stop-ai", async (req: Request, res: Response) => {
+    const control = activeJobs.get(req.params.id as string);
+    if (!control) return res.status(404).json({ message: "No active job found" });
+    control.stopAfterCurrentRound = true;
+    log(`Stop-after-current-round requested for job ${req.params.id}`);
+    res.json({ message: "Job will stop after the current AI round completes" });
   });
 
   app.get("/api/jobs/:id", async (req: Request, res: Response) => {
@@ -234,7 +242,7 @@ export async function registerRoutes(
           const cpPath = `/tmp/uploads/${job.id}_checkpoint.json`;
           if (fs.existsSync(cpPath) && fs.existsSync(`/tmp/uploads/${job.id}.xlsx`)) {
             log(`Auto-resuming interrupted job ${job.id} from checkpoint...`);
-            const control = { cancel: false };
+            const control = { cancel: false, stopAfterCurrentRound: false };
             activeJobs.set(job.id, control);
             processJob(job.id, 85, control).catch((err) => {
               log(`Auto-resume job error: ${err.message}`);
@@ -438,7 +446,7 @@ function parseSheet(
 async function matchTab(
   tabData: TabData,
   crawlCache: Map<string, CrawlInventory>,
-  control: { cancel: boolean },
+  control: { cancel: boolean; stopAfterCurrentRound: boolean },
 ): Promise<{
   matchResults: Map<number, BatchMatchResult>;
   enInventory: CrawlInventory | null;
