@@ -5,6 +5,7 @@ import XLSX from "xlsx";
 import path from "path";
 import fs from "fs";
 import { storage } from "./storage";
+import type { CrawlSession } from "@shared/schema";
 import {
   learnTabPatterns,
   validateReferenceRows,
@@ -39,7 +40,7 @@ const upload = multer({
   },
 });
 
-const activeJobs = new Map<string, { cancel: boolean }>();
+const activeJobs = new Map<string, { cancel: boolean; stopAfterCurrentRound: boolean }>();
 
 export async function registerRoutes(
   httpServer: Server,
@@ -130,6 +131,35 @@ export async function registerRoutes(
     control.stopAfterCurrentRound = true;
     log(`Stop-after-current-round requested for job ${req.params.id}`);
     res.json({ message: "Job will stop after the current AI round completes" });
+  });
+
+  app.post("/api/jobs/:id/cancel", async (req: Request, res: Response) => {
+    const jobId = req.params.id as string;
+    const control = activeJobs.get(jobId);
+    if (control) {
+      control.cancel = true;
+      activeJobs.delete(jobId);
+    }
+    await storage.updateJob(jobId, { status: "cancelled", currentStep: "done" });
+    log(`Job ${jobId} cancelled via API`);
+    res.json({ message: "Job cancelled" });
+  });
+
+  app.delete("/api/jobs/:id", async (req: Request, res: Response) => {
+    const jobId = req.params.id as string;
+    const control = activeJobs.get(jobId);
+    if (control) {
+      control.cancel = true;
+      activeJobs.delete(jobId);
+    }
+    await storage.deleteResultsByJob(jobId);
+    await storage.deleteJob(jobId);
+    const cpPath = `/tmp/uploads/${jobId}_checkpoint.json`;
+    if (fs.existsSync(cpPath)) fs.unlinkSync(cpPath);
+    const conflictsPath = `/tmp/uploads/${jobId}_conflicts.json`;
+    if (fs.existsSync(conflictsPath)) fs.unlinkSync(conflictsPath);
+    log(`Job ${jobId} deleted via API`);
+    res.json({ message: "Job deleted" });
   });
 
   app.get("/api/jobs/:id", async (req: Request, res: Response) => {
@@ -517,13 +547,32 @@ async function matchTab(
         log(`  EN directory cached: ${enInventory.urls.size} URLs`);
       } else {
         const rootPathStr = "/" + enCrawlRoot.join("/");
-        let dbSessions: { id: string; totalUrls: number }[] = [];
+        let dbSessions: CrawlSession[] = [];
         const exactSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
         if (exactSession) {
           dbSessions = [exactSession];
         } else {
           const prefixSessions = await storage.findCompletedCrawlSessionsByPrefix(origin, rootPathStr);
-          if (prefixSessions.length > 0) dbSessions = prefixSessions;
+          if (prefixSessions.length > 0) {
+            const enTargetDirs = tabPatterns.directoryMappings
+              .filter(m => m.lang === "en")
+              .map(m => "/" + m.targetDir.split("/").filter(Boolean).join("/"));
+            if (enTargetDirs.length > 0) {
+              const filtered = prefixSessions.filter(s => {
+                const sp = s.rootPath.replace(/\/$/, "");
+                return enTargetDirs.some(td => {
+                  const ntd = td.replace(/\/$/, "");
+                  return sp === ntd || ntd.startsWith(sp + "/") || sp.startsWith(ntd + "/");
+                });
+              });
+              dbSessions = filtered;
+              if (filtered.length < prefixSessions.length) {
+                log(`  EN inventory filtered: ${filtered.length}/${prefixSessions.length} sessions match target dirs [${enTargetDirs.join(", ")}]`);
+              }
+            } else {
+              dbSessions = prefixSessions;
+            }
+          }
         }
         if (dbSessions.length > 0) {
           const allRows: { url: string; title: string | null }[] = [];
@@ -556,13 +605,32 @@ async function matchTab(
         log(`  FR directory cached: ${frInventory.urls.size} URLs`);
       } else {
         const rootPathStr = "/" + frCrawlRoot.join("/");
-        let dbSessions: { id: string; totalUrls: number }[] = [];
+        let dbSessions: CrawlSession[] = [];
         const exactSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
         if (exactSession) {
           dbSessions = [exactSession];
         } else {
           const prefixSessions = await storage.findCompletedCrawlSessionsByPrefix(origin, rootPathStr);
-          if (prefixSessions.length > 0) dbSessions = prefixSessions;
+          if (prefixSessions.length > 0) {
+            const frTargetDirs = tabPatterns.directoryMappings
+              .filter(m => m.lang === "fr")
+              .map(m => "/" + m.targetDir.split("/").filter(Boolean).join("/"));
+            if (frTargetDirs.length > 0) {
+              const filtered = prefixSessions.filter(s => {
+                const sp = s.rootPath.replace(/\/$/, "");
+                return frTargetDirs.some(td => {
+                  const ntd = td.replace(/\/$/, "");
+                  return sp === ntd || ntd.startsWith(sp + "/") || sp.startsWith(ntd + "/");
+                });
+              });
+              dbSessions = filtered;
+              if (filtered.length < prefixSessions.length) {
+                log(`  FR inventory filtered: ${filtered.length}/${prefixSessions.length} sessions match target dirs [${frTargetDirs.join(", ")}]`);
+              }
+            } else {
+              dbSessions = prefixSessions;
+            }
+          }
         }
         if (dbSessions.length > 0) {
           const allRows: { url: string; title: string | null }[] = [];
@@ -858,7 +926,7 @@ function clearCheckpoint(jobId: string) {
   if (fs.existsSync(cpPath)) fs.unlinkSync(cpPath);
 }
 
-async function processJob(jobId: string, _threshold: number, control: { cancel: boolean }) {
+async function processJob(jobId: string, _threshold: number, control: { cancel: boolean; stopAfterCurrentRound: boolean }) {
   const filePath = `/tmp/uploads/${jobId}.xlsx`;
   if (!fs.existsSync(filePath)) {
     throw new Error("Source file not found");
@@ -1073,7 +1141,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
   const MAX_AI_ROUNDS = 3;
 
-  for (let aiRound = skipToPostAi ? MAX_AI_ROUNDS + 1 : resumeAiRound; aiRound <= MAX_AI_ROUNDS && !control.cancel; aiRound++) {
+  for (let aiRound = skipToPostAi ? MAX_AI_ROUNDS + 1 : resumeAiRound; aiRound <= MAX_AI_ROUNDS && !control.cancel && !control.stopAfterCurrentRound; aiRound++) {
     const roundLabel = aiRound > 1 ? ` (round ${aiRound})` : "";
     await storage.updateJob(jobId, { currentStep: `ai-matching${roundLabel}` });
 

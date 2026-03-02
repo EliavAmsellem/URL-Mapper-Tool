@@ -17,6 +17,7 @@ export interface IStorage {
   createResult(result: InsertMappingResult): Promise<MappingResult>;
   createResults(results: InsertMappingResult[]): Promise<void>;
   deleteResultsByJob(jobId: string): Promise<void>;
+  deleteJob(jobId: string): Promise<void>;
   getResultsByJob(jobId: string): Promise<MappingResult[]>;
   getCachedTranslation(sourceText: string, targetLang: string): Promise<string | null>;
   getCachedTranslations(targetLang: string): Promise<Map<string, string>>;
@@ -68,6 +69,10 @@ export class DatabaseStorage implements IStorage {
 
   async deleteResultsByJob(jobId: string): Promise<void> {
     await db.delete(mappingResults).where(eq(mappingResults.jobId, jobId));
+  }
+
+  async deleteJob(jobId: string): Promise<void> {
+    await db.delete(mappingJobs).where(eq(mappingJobs.id, jobId));
   }
 
   async getResultsByJob(jobId: string): Promise<MappingResult[]> {
