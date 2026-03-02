@@ -105,8 +105,10 @@ For each unmatched source URL:
 #### Step 6: AI-Powered Matching (Final Fallback)
 - For URLs still unmatched after all deterministic steps, an AI agent (Claude Opus 4.6 via Replit Anthropic AI Integrations) attempts matching
 - The AI receives **directory context** for each URL: which source directory it's from and the corresponding target directory
-- AI gets the **full inventory** as candidates (up to INVENTORY_CAP=500 per language), with title-ranked URLs listed first for relevance
-- Uniqueness is enforced at the acceptance stage: `usedEnUrls`/`usedFrUrls` sets prevent duplicate target URL assignments across batches
+- AI gets **pre-filtered inventory** as candidates (up to INVENTORY_CAP=500 per language), with title-ranked URLs listed first for relevance
+- **Already-used URLs are excluded from the inventory** sent to the AI — `usedEnUrls`/`usedFrUrls` are filtered out at both the title-ranking and fallback-fill stages, so the AI only sees URLs it can actually use
+- Uniqueness is still enforced at the acceptance stage as a safety net
+- **Diagnostic logging** shows per-batch inventory breakdown: total inventory size, title-ranked count, fallback count, and filtered-as-used count
 - AI is constrained to ONLY select from the crawl inventory — never invents URLs
 - Batches of ~15 unmatched URLs are processed per API call
 - JSON parse failures trigger an automatic retry via a reformatting AI call; failed responses are logged for debugging

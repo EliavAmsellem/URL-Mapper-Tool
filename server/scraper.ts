@@ -1506,7 +1506,7 @@ CRITICAL RULES:
 1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs.
 2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
 3. Each target URL should only be used ONCE across all matches. Do not assign the same target URL to multiple source URLs.
-4. URLs that are already matched should not appear again. Check the "already used" lists.
+4. Every URL in the inventory lists is available for matching — previously matched URLs have already been removed.
 5. Focus on matching the page PURPOSE and CONTENT, not just superficial URL similarity.
 6. Pay attention to the DIRECTORY CONTEXT - each source URL belongs to a specific directory, and its match should be found within the corresponding target directory.
 
@@ -1519,11 +1519,10 @@ DIRECTORY CONTEXT:
 EXAMPLES OF CORRECTLY MATCHED PAIRS:
 {{exampleLines}}
 
-ALREADY USED ENGLISH URLs (do NOT reuse these):
+NOTE ON ALREADY-MATCHED URLs:
 {{usedEnUrls}}
-
-ALREADY USED FRENCH URLs (do NOT reuse these):
-{{usedFrUrls}}`;
+{{usedFrUrls}}
+All URLs in the inventory lists below are available for matching — previously matched URLs have already been removed.`;
 
 export const AI_USER_PROMPT_TEMPLATE = `Find the matching English and/or French URLs for each of these Hebrew source URLs. Each URL includes its directory context - focus your search within the indicated target directories.
 
@@ -1730,36 +1729,45 @@ export async function aiMatchUnmatched(
 
     const INVENTORY_CAP = 500;
 
+    let enTitleRanked = 0;
+    let frTitleRanked = 0;
+    let enUsedFiltered = 0;
+    let frUsedFiltered = 0;
+
     const batchTitles = batch
       .map(r => enTranslations.get(r.title) || frTranslations.get(r.title))
       .filter(Boolean) as string[];
 
     if (batchTitles.length > 0) {
       if (needsEn && enInventory) {
-        const ranked = rankInventoryByTitleSimilarity(enInventory, batchTitles);
+        const ranked = rankInventoryByTitleSimilarity(enInventory, batchTitles, usedEnUrls);
         for (const url of ranked) {
           if (batchEnUrls.size >= INVENTORY_CAP) break;
           batchEnUrls.add(url);
         }
+        enTitleRanked = batchEnUrls.size;
       }
       if (needsFr && frInventory) {
-        const ranked = rankInventoryByTitleSimilarity(frInventory, batchTitles);
+        const ranked = rankInventoryByTitleSimilarity(frInventory, batchTitles, usedFrUrls);
         for (const url of ranked) {
           if (batchFrUrls.size >= INVENTORY_CAP) break;
           batchFrUrls.add(url);
         }
+        frTitleRanked = batchFrUrls.size;
       }
     }
 
     if (needsEn && enInventory && batchEnUrls.size < INVENTORY_CAP) {
       for (const url of enInventory.urls) {
         if (batchEnUrls.size >= INVENTORY_CAP) break;
+        if (usedEnUrls.has(url)) { enUsedFiltered++; continue; }
         if (!batchEnUrls.has(url)) batchEnUrls.add(url);
       }
     }
     if (needsFr && frInventory && batchFrUrls.size < INVENTORY_CAP) {
       for (const url of frInventory.urls) {
         if (batchFrUrls.size >= INVENTORY_CAP) break;
+        if (usedFrUrls.has(url)) { frUsedFiltered++; continue; }
         if (!batchFrUrls.has(url)) batchFrUrls.add(url);
       }
     }
@@ -1793,8 +1801,8 @@ export async function aiMatchUnmatched(
       .replace("{{patternContext}}", patternContext.join("\n"))
       .replace("{{directoryContext}}", dirContextLines.join("\n") || "(no directory mappings available)")
       .replace("{{exampleLines}}", exampleLines)
-      .replace("{{usedEnUrls}}", Array.from(usedEnUrls).slice(-50).join("\n") || "(none)")
-      .replace("{{usedFrUrls}}", Array.from(usedFrUrls).slice(-50).join("\n") || "(none)");
+      .replace("{{usedEnUrls}}", `(${usedEnUrls.size} URLs pre-filtered from inventory — all URLs listed below are available)`)
+      .replace("{{usedFrUrls}}", `(${usedFrUrls.size} URLs pre-filtered from inventory — all URLs listed below are available)`);
 
     const userPrompt = AI_USER_PROMPT_TEMPLATE
       .replace("{{urlsBlock}}", urlsBlock)
@@ -1802,7 +1810,11 @@ export async function aiMatchUnmatched(
       .replace("{{frInventoryList}}", frListStr || "(no French inventory available)");
 
     try {
-      log(`  AI batch ${batchIdx + 1}/${batches.length}: ${batch.length} URLs, inventory scope: ${enList.length} EN, ${frList.length} FR`);
+      const enTotal = enInventory?.urls.size || 0;
+      const frTotal = frInventory?.urls.size || 0;
+      log(`  AI batch ${batchIdx + 1}/${batches.length}: ${batch.length} URLs`);
+      log(`    EN scope: ${enList.length}/${enTotal} inventory URLs (${enTitleRanked} title-ranked, ${enList.length - enTitleRanked} fallback, ${enUsedFiltered + usedEnUrls.size} filtered as used)`);
+      log(`    FR scope: ${frList.length}/${frTotal} inventory URLs (${frTitleRanked} title-ranked, ${frList.length - frTitleRanked} fallback, ${frUsedFiltered + usedFrUrls.size} filtered as used)`);
 
       const message = await anthropic.messages.create({
         model: AI_MODEL,
