@@ -518,18 +518,27 @@ async function matchTab(
 
   function filterSessionsByTargetDirs(sessions: { id: string; totalUrls: number; rootPath: string }[], targetDirs: string[], lang: string): { id: string; totalUrls: number; rootPath: string }[] {
     if (targetDirs.length === 0 || sessions.length <= 1) return sessions;
-    const filtered = sessions.filter(s => {
+
+    const sessionScores = sessions.map(s => {
       const sessionRoot = s.rootPath.toLowerCase();
-      return targetDirs.some(td => {
+      const matchCount = targetDirs.filter(td => {
         const tdLower = td.toLowerCase();
         return sessionRoot === tdLower || sessionRoot.startsWith(tdLower + "/") || tdLower.startsWith(sessionRoot + "/");
-      });
+      }).length;
+      return { session: s, matchCount };
     });
-    if (filtered.length > 0) {
+
+    const maxScore = Math.max(...sessionScores.map(s => s.matchCount));
+    if (maxScore === 0) return sessions;
+
+    const threshold = Math.max(1, Math.floor(maxScore * 0.2));
+    const filtered = sessionScores
+      .filter(s => s.matchCount >= threshold)
+      .map(s => s.session);
+
+    if (filtered.length > 0 && filtered.length < sessions.length) {
       const excluded = sessions.filter(s => !filtered.includes(s));
-      if (excluded.length > 0) {
-        log(`  ${lang.toUpperCase()} inventory scoping: kept ${filtered.length} session(s), excluded ${excluded.length} unrelated: ${excluded.map(s => s.rootPath).join(", ")}`);
-      }
+      log(`  ${lang.toUpperCase()} inventory scoping: kept ${filtered.length} session(s) (score≥${threshold}), excluded ${excluded.length}: ${excluded.map(s => s.rootPath).join(", ")}`);
       return filtered;
     }
     return sessions;
