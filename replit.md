@@ -87,12 +87,13 @@ For each unmatched source URL:
    - **Tail match** — Match on last 1-2 URL segments within scope (confidence 88-90)
    - **Translated tail match** — Translate segments then match tails (confidence 86)
    - **Fuzzy match** — Jaccard word-overlap similarity on last segments (confidence 80-90)
-4. **Broad fallback** — If no match in scoped inventory, search the full inventory with reduced confidence (-5 points)
+4. **Parent directory fallback** — If the exact target directory scope is empty, progressively try parent directories (e.g., `/en/About/faq` → `/en/About/` → `/en/`) with a small confidence penalty (-2 points)
+5. **Broad fallback** — If no match in scoped or parent inventories, search the full inventory with reduced confidence (-5 points), but ONLY accept matches whose directory shares at least 2 common path segments with the expected target directory (prevents cross-section contamination like Benefits URLs matching About sources)
 
 #### Step 5: Title-Based Matching
 - For URLs still unmatched, page titles are translated Hebrew→EN/FR using Google Translate GTX endpoint
 - Translated titles are fuzzy-matched against crawl inventory page titles using word-overlap similarity
-- Title matching is also directory-scoped: unmatched URLs are grouped by their target directory, and title matching searches within the corresponding scoped inventory
+- Title matching is also directory-scoped: unmatched URLs are grouped by their target directory, and title matching searches within the corresponding scoped inventory (with parent directory fallback when the exact scope is empty)
 - Section-aware scoring splits titles like "Topic - Page Name" and provides section similarity boosts
 - 5 concurrent translation requests with rate limiting (200ms between batches)
 - Translation results are cached persistently in the database `translation_cache` table

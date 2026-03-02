@@ -531,7 +531,7 @@ async function matchTab(
     const maxScore = Math.max(...sessionScores.map(s => s.matchCount));
     if (maxScore === 0) return sessions;
 
-    const threshold = Math.max(1, Math.floor(maxScore * 0.2));
+    const threshold = Math.max(1, Math.ceil(maxScore * 0.5));
     const filtered = sessionScores
       .filter(s => s.matchCount >= threshold)
       .map(s => s.session);
@@ -628,6 +628,46 @@ async function matchTab(
 
   if (crawlPromises.length > 0) await Promise.all(crawlPromises);
 
+  function getParentDirectoryScopes(dir: string): string[] {
+    const parts = dir.split("/").filter(Boolean);
+    const scopes: string[] = [];
+    for (let i = parts.length - 1; i >= 1; i--) {
+      scopes.push("/" + parts.slice(0, i).join("/"));
+    }
+    return scopes;
+  }
+
+  function getUrlDirectory(urlStr: string): string | null {
+    try {
+      const parsed = new URL(urlStr);
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      if (parts.length <= 1) return "/" + parts.join("/");
+      const lastSeg = parts[parts.length - 1].toLowerCase();
+      if (lastSeg === "default.aspx" || lastSeg.includes(".")) {
+        parts.pop();
+      }
+      if (parts.length > 0 && parts[parts.length - 1].toLowerCase() === "pages") {
+        parts.pop();
+      }
+      return "/" + parts.join("/");
+    } catch {
+      return null;
+    }
+  }
+
+  function directoriesAreRelated(dir1: string, dir2: string): boolean {
+    const segs1 = dir1.toLowerCase().split("/").filter(Boolean);
+    const segs2 = dir2.toLowerCase().split("/").filter(Boolean);
+    if (segs1.length === 0 || segs2.length === 0) return false;
+    let commonLen = 0;
+    const minLen = Math.min(segs1.length, segs2.length);
+    for (let i = 0; i < minLen; i++) {
+      if (segs1[i] === segs2[i]) commonLen++;
+      else break;
+    }
+    return commonLen >= 2;
+  }
+
   for (const row of needsMatching) {
     if (control.cancel) break;
     const result: BatchMatchResult = {
@@ -648,10 +688,32 @@ async function matchTab(
             result.matchMethodEn = match.method;
           }
         }
+        if (!result.enUrl) {
+          const parentScopes = getParentDirectoryScopes(targetDir);
+          for (const parentDir of parentScopes) {
+            const parentInv = getScopedInventory(enInventory, parentDir, origin);
+            if (parentInv.urls.size > 0) {
+              const match = matchInDirectory(row.sourceUrl, "en", tabPatterns, parentInv);
+              if (match) {
+                result.enUrl = match.url;
+                result.confidenceEn = Math.max((match.confidence || 0) - 2, 70);
+                result.matchMethodEn = match.method + "-parent";
+                break;
+              }
+            }
+          }
+        }
       }
       if (!result.enUrl) {
         const match = matchInDirectory(row.sourceUrl, "en", tabPatterns, enInventory);
-        if (match) {
+        if (match && targetDir) {
+          const matchDir = getUrlDirectory(match.url);
+          if (matchDir && directoriesAreRelated(matchDir, targetDir)) {
+            result.enUrl = match.url;
+            result.confidenceEn = Math.max((match.confidence || 0) - 5, 70);
+            result.matchMethodEn = match.method + "-broad";
+          }
+        } else if (match && !targetDir) {
           result.enUrl = match.url;
           result.confidenceEn = Math.max((match.confidence || 0) - 5, 70);
           result.matchMethodEn = match.method + "-broad";
@@ -671,10 +733,32 @@ async function matchTab(
             result.matchMethodFr = match.method;
           }
         }
+        if (!result.frUrl) {
+          const parentScopes = getParentDirectoryScopes(targetDir);
+          for (const parentDir of parentScopes) {
+            const parentInv = getScopedInventory(frInventory, parentDir, origin);
+            if (parentInv.urls.size > 0) {
+              const match = matchInDirectory(row.sourceUrl, "fr", tabPatterns, parentInv);
+              if (match) {
+                result.frUrl = match.url;
+                result.confidenceFr = Math.max((match.confidence || 0) - 2, 70);
+                result.matchMethodFr = match.method + "-parent";
+                break;
+              }
+            }
+          }
+        }
       }
       if (!result.frUrl) {
         const match = matchInDirectory(row.sourceUrl, "fr", tabPatterns, frInventory);
-        if (match) {
+        if (match && targetDir) {
+          const matchDir = getUrlDirectory(match.url);
+          if (matchDir && directoriesAreRelated(matchDir, targetDir)) {
+            result.frUrl = match.url;
+            result.confidenceFr = Math.max((match.confidence || 0) - 5, 70);
+            result.matchMethodFr = match.method + "-broad";
+          }
+        } else if (match && !targetDir) {
           result.frUrl = match.url;
           result.confidenceFr = Math.max((match.confidence || 0) - 5, 70);
           result.matchMethodFr = match.method + "-broad";
@@ -736,6 +820,13 @@ async function matchTab(
 
       if (enDir && enInventory) {
         enScopedInv = getScopedInventory(enInventory, enDir, origin);
+        if (enScopedInv.urls.size === 0) {
+          const parentScopes = getParentDirectoryScopes(enDir);
+          for (const parentDir of parentScopes) {
+            enScopedInv = getScopedInventory(enInventory, parentDir, origin);
+            if (enScopedInv.urls.size > 0) break;
+          }
+        }
         if (enScopedInv.urls.size === 0) enScopedInv = enInventory;
       } else if (enInventory) {
         enScopedInv = enInventory;
@@ -743,6 +834,13 @@ async function matchTab(
 
       if (frDir && frInventory) {
         frScopedInv = getScopedInventory(frInventory, frDir, origin);
+        if (frScopedInv.urls.size === 0) {
+          const parentScopes = getParentDirectoryScopes(frDir);
+          for (const parentDir of parentScopes) {
+            frScopedInv = getScopedInventory(frInventory, parentDir, origin);
+            if (frScopedInv.urls.size > 0) break;
+          }
+        }
         if (frScopedInv.urls.size === 0) frScopedInv = frInventory;
       } else if (frInventory) {
         frScopedInv = frInventory;
