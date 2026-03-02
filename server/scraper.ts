@@ -987,12 +987,24 @@ function bestJaccardMatch(
   return best;
 }
 
+export function stripHebrewTitleSuffix(title: string): string {
+  const sepIdx = title.lastIndexOf(" - ");
+  if (sepIdx > 0) {
+    const suffix = title.substring(sepIdx + 3).trim();
+    const hebrewPattern = /[\u0590-\u05FF]/;
+    if (hebrewPattern.test(suffix) && suffix.length > 5) {
+      return title.substring(0, sepIdx).trim();
+    }
+  }
+  return title;
+}
+
 function normalizeTitle(title: string): string {
   return title
     .toLowerCase()
     .replace(/[-–—_|:]/g, " ")
     .replace(/\s+/g, " ")
-    .replace(/\b(the|a|an|le|la|les|un|une|des|de|du|et|and|or|ou|in|en|à|au|aux)\b/g, "")
+    .replace(/\b(the|a|an|le|la|les|un|une|des|de|du|et|and|or|ou|in|en|à|au|aux|for|of|to|is|on|by|with|from|about|national|insurance|institute)\b/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -1079,12 +1091,14 @@ export interface TitleMatchResult {
 export function matchByTitle(
   translatedTitle: string,
   inventory: CrawlInventory,
-  minSimilarity: number = 0.85,
+  minSimilarity: number = 0.70,
   sourceSegments?: Set<string>,
 ): TitleMatchResult | null {
   let bestMatch: TitleMatchResult | null = null;
   let bestSimilarity = minSimilarity;
   let secondBestSimilarity = 0;
+  let bestCandidateUrl = "";
+  let bestCandidateScore = 0;
 
   const translatedParts = splitTitleParts(translatedTitle);
   const translatedSection = translatedParts.section ? normalizeTitle(translatedParts.section) : "";
@@ -1110,6 +1124,11 @@ export function matchByTitle(
 
     const sim = Math.min(baseSim + sectionBonus, 1.0);
 
+    if (sim > bestCandidateScore) {
+      bestCandidateScore = sim;
+      bestCandidateUrl = url;
+    }
+
     if (sim > bestSimilarity) {
       secondBestSimilarity = bestSimilarity;
       bestSimilarity = sim;
@@ -1123,6 +1142,10 @@ export function matchByTitle(
       secondBestSimilarity = sim;
     }
   });
+
+  if (!bestMatch && bestCandidateScore > 0.3) {
+    log(`    Title match NO_MATCH: "${translatedTitle.substring(0, 60)}" best_score=${bestCandidateScore.toFixed(3)} best_url=${bestCandidateUrl.substring(bestCandidateUrl.lastIndexOf("/", bestCandidateUrl.lastIndexOf("/") - 1))}`);
+  }
 
   const finalMatch = bestMatch as TitleMatchResult | null;
   if (finalMatch) {
@@ -1299,8 +1322,8 @@ export async function titleMatchUnmatched(
   const titles = unmatchedRows.map((r) => r.title).filter(Boolean);
   if (titles.length === 0) return results;
 
-  const enTitlesNeeded = unmatchedRows.filter(r => r.needsEn && enScopedInventory && enScopedInventory.titleIndex.size > 0).map(r => r.title).filter(Boolean);
-  const frTitlesNeeded = unmatchedRows.filter(r => r.needsFr && frScopedInventory && frScopedInventory.titleIndex.size > 0).map(r => r.title).filter(Boolean);
+  const enTitlesNeeded = unmatchedRows.filter(r => r.needsEn && enScopedInventory && enScopedInventory.titleIndex.size > 0).map(r => stripHebrewTitleSuffix(r.title)).filter(Boolean);
+  const frTitlesNeeded = unmatchedRows.filter(r => r.needsFr && frScopedInventory && frScopedInventory.titleIndex.size > 0).map(r => stripHebrewTitleSuffix(r.title)).filter(Boolean);
 
   let enTranslations = new Map<string, string>();
   let frTranslations = new Map<string, string>();
@@ -1341,16 +1364,18 @@ export async function titleMatchUnmatched(
     let frMatch: TitleMatchResult | null = null;
 
     if (row.needsEn && enScopedInventory && enScopedInventory.titleIndex.size > 0) {
-      const enTitle = enTranslations.get(row.title);
+      const strippedTitle = stripHebrewTitleSuffix(row.title);
+      const enTitle = enTranslations.get(strippedTitle);
       if (enTitle) {
-        enMatch = matchByTitle(enTitle, enScopedInventory, 0.85, sourceSegments);
+        enMatch = matchByTitle(enTitle, enScopedInventory, 0.70, sourceSegments);
       }
     }
 
     if (row.needsFr && frScopedInventory && frScopedInventory.titleIndex.size > 0) {
-      const frTitle = frTranslations.get(row.title);
+      const strippedTitle = stripHebrewTitleSuffix(row.title);
+      const frTitle = frTranslations.get(strippedTitle);
       if (frTitle) {
-        frMatch = matchByTitle(frTitle, frScopedInventory, 0.85, sourceSegments);
+        frMatch = matchByTitle(frTitle, frScopedInventory, 0.70, sourceSegments);
       }
     }
 
@@ -1387,25 +1412,25 @@ export async function titleMatchUnmatched(
         }
       } catch {}
 
-      if (enMatch && enMatch.similarity < 0.90) {
-        log(`    Paired EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.90): "${enMatch.url}"`);
+      if (enMatch && enMatch.similarity < 0.78) {
+        log(`    Paired EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.78): "${enMatch.url}"`);
         enMatch = null;
         rejected.crossValidation++;
       }
-      if (frMatch && frMatch.similarity < 0.90) {
-        log(`    Paired FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.90): "${frMatch.url}"`);
+      if (frMatch && frMatch.similarity < 0.78) {
+        log(`    Paired FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.78): "${frMatch.url}"`);
         frMatch = null;
         rejected.crossValidation++;
       }
     } else if (enMatch && !frMatch) {
-      if (enMatch.similarity < 0.92) {
-        log(`    Single-lang EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.92): "${enMatch.url}"`);
+      if (enMatch.similarity < 0.82) {
+        log(`    Single-lang EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.82): "${enMatch.url}"`);
         enMatch = null;
         rejected.crossValidation++;
       }
     } else if (frMatch && !enMatch) {
-      if (frMatch.similarity < 0.92) {
-        log(`    Single-lang FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.92): "${frMatch.url}"`);
+      if (frMatch.similarity < 0.82) {
+        log(`    Single-lang FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.82): "${frMatch.url}"`);
         frMatch = null;
         rejected.crossValidation++;
       }

@@ -92,9 +92,13 @@ For each unmatched source URL:
 
 #### Step 5: Title-Based Matching
 - For URLs still unmatched, page titles are translated Hebrew→EN/FR using Google Translate GTX endpoint
-- Translated titles are fuzzy-matched against crawl inventory page titles using word-overlap similarity
+- **Hebrew suffix stripping**: Before translation, common trailing Hebrew suffixes (after " - ") are stripped from titles to produce cleaner translations and more focused comparisons
+- Translated titles are fuzzy-matched against crawl inventory page titles using word-overlap (Jaccard) similarity
 - Title matching is also directory-scoped: unmatched URLs are grouped by their target directory, and title matching searches within the corresponding scoped inventory (with parent directory fallback when the exact scope is empty)
 - Section-aware scoring splits titles like "Topic - Page Name" and provides section similarity boosts
+- **Similarity thresholds**: Initial gate at 0.70, paired matches require 0.78, single-language matches require 0.82
+- **Stop word filtering**: `normalizeTitle` strips common English/French articles AND site-wide common words (national, insurance, institute) to focus scoring on distinctive content words
+- **Diagnostic logging**: When no match is found but the best candidate scores above 0.30, the score and URL are logged
 - 5 concurrent translation requests with rate limiting (200ms between batches)
 - Translation results are cached persistently in the database `translation_cache` table
 

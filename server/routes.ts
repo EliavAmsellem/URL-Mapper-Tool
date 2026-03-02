@@ -19,6 +19,7 @@ import {
   clearAllCaches,
   getAiConfig,
   crossLanguageDerive,
+  stripHebrewTitleSuffix,
   type TabPatterns,
   type CrawlInventory,
   type BatchMatchResult,
@@ -1343,17 +1344,29 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
       const matchedExamples = tabData.tabRefRows.slice(0, 10);
 
-      const titlesForEn = unmatchedForAi.filter(r => r.needsEn).map(r => r.title).filter(Boolean);
-      const titlesForFr = unmatchedForAi.filter(r => r.needsFr).map(r => r.title).filter(Boolean);
+      const titlesForEn = unmatchedForAi.filter(r => r.needsEn).map(r => stripHebrewTitleSuffix(r.title)).filter(Boolean);
+      const titlesForFr = unmatchedForAi.filter(r => r.needsFr).map(r => stripHebrewTitleSuffix(r.title)).filter(Boolean);
 
       let enTranslations = new Map<string, string>();
       let frTranslations = new Map<string, string>();
 
       if (titlesForEn.length > 0) {
-        enTranslations = await batchTranslate(titlesForEn, "en", storage);
+        const strippedEnTranslations = await batchTranslate(titlesForEn, "en", storage);
+        for (const r of unmatchedForAi) {
+          if (!r.needsEn) continue;
+          const stripped = stripHebrewTitleSuffix(r.title);
+          const translated = strippedEnTranslations.get(stripped);
+          if (translated) enTranslations.set(r.title, translated);
+        }
       }
       if (titlesForFr.length > 0) {
-        frTranslations = await batchTranslate(titlesForFr, "fr", storage);
+        const strippedFrTranslations = await batchTranslate(titlesForFr, "fr", storage);
+        for (const r of unmatchedForAi) {
+          if (!r.needsFr) continue;
+          const stripped = stripHebrewTitleSuffix(r.title);
+          const translated = strippedFrTranslations.get(stripped);
+          if (translated) frTranslations.set(r.title, translated);
+        }
       }
 
       const origin = (() => {
