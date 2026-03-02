@@ -987,24 +987,12 @@ function bestJaccardMatch(
   return best;
 }
 
-export function stripHebrewTitleSuffix(title: string): string {
-  const sepIdx = title.lastIndexOf(" - ");
-  if (sepIdx > 0) {
-    const suffix = title.substring(sepIdx + 3).trim();
-    const hebrewPattern = /[\u0590-\u05FF]/;
-    if (hebrewPattern.test(suffix) && suffix.length > 5) {
-      return title.substring(0, sepIdx).trim();
-    }
-  }
-  return title;
-}
-
 function normalizeTitle(title: string): string {
   return title
     .toLowerCase()
     .replace(/[-–—_|:]/g, " ")
     .replace(/\s+/g, " ")
-    .replace(/\b(the|a|an|le|la|les|un|une|des|de|du|et|and|or|ou|in|en|à|au|aux|for|of|to|is|on|by|with|from|about|national|insurance|institute)\b/g, "")
+    .replace(/\b(the|a|an|le|la|les|un|une|des|de|du|et|and|or|ou|in|en|à|au|aux)\b/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -1091,14 +1079,12 @@ export interface TitleMatchResult {
 export function matchByTitle(
   translatedTitle: string,
   inventory: CrawlInventory,
-  minSimilarity: number = 0.70,
+  minSimilarity: number = 0.85,
   sourceSegments?: Set<string>,
 ): TitleMatchResult | null {
   let bestMatch: TitleMatchResult | null = null;
   let bestSimilarity = minSimilarity;
   let secondBestSimilarity = 0;
-  let bestCandidateUrl = "";
-  let bestCandidateScore = 0;
 
   const translatedParts = splitTitleParts(translatedTitle);
   const translatedSection = translatedParts.section ? normalizeTitle(translatedParts.section) : "";
@@ -1124,11 +1110,6 @@ export function matchByTitle(
 
     const sim = Math.min(baseSim + sectionBonus, 1.0);
 
-    if (sim > bestCandidateScore) {
-      bestCandidateScore = sim;
-      bestCandidateUrl = url;
-    }
-
     if (sim > bestSimilarity) {
       secondBestSimilarity = bestSimilarity;
       bestSimilarity = sim;
@@ -1142,10 +1123,6 @@ export function matchByTitle(
       secondBestSimilarity = sim;
     }
   });
-
-  if (!bestMatch && bestCandidateScore > 0.3) {
-    log(`    Title match NO_MATCH: "${translatedTitle.substring(0, 60)}" best_score=${bestCandidateScore.toFixed(3)} best_url=${bestCandidateUrl.substring(bestCandidateUrl.lastIndexOf("/", bestCandidateUrl.lastIndexOf("/") - 1))}`);
-  }
 
   const finalMatch = bestMatch as TitleMatchResult | null;
   if (finalMatch) {
@@ -1322,8 +1299,8 @@ export async function titleMatchUnmatched(
   const titles = unmatchedRows.map((r) => r.title).filter(Boolean);
   if (titles.length === 0) return results;
 
-  const enTitlesNeeded = unmatchedRows.filter(r => r.needsEn && enScopedInventory && enScopedInventory.titleIndex.size > 0).map(r => stripHebrewTitleSuffix(r.title)).filter(Boolean);
-  const frTitlesNeeded = unmatchedRows.filter(r => r.needsFr && frScopedInventory && frScopedInventory.titleIndex.size > 0).map(r => stripHebrewTitleSuffix(r.title)).filter(Boolean);
+  const enTitlesNeeded = unmatchedRows.filter(r => r.needsEn && enScopedInventory && enScopedInventory.titleIndex.size > 0).map(r => r.title).filter(Boolean);
+  const frTitlesNeeded = unmatchedRows.filter(r => r.needsFr && frScopedInventory && frScopedInventory.titleIndex.size > 0).map(r => r.title).filter(Boolean);
 
   let enTranslations = new Map<string, string>();
   let frTranslations = new Map<string, string>();
@@ -1364,18 +1341,16 @@ export async function titleMatchUnmatched(
     let frMatch: TitleMatchResult | null = null;
 
     if (row.needsEn && enScopedInventory && enScopedInventory.titleIndex.size > 0) {
-      const strippedTitle = stripHebrewTitleSuffix(row.title);
-      const enTitle = enTranslations.get(strippedTitle);
+      const enTitle = enTranslations.get(row.title);
       if (enTitle) {
-        enMatch = matchByTitle(enTitle, enScopedInventory, 0.70, sourceSegments);
+        enMatch = matchByTitle(enTitle, enScopedInventory, 0.85, sourceSegments);
       }
     }
 
     if (row.needsFr && frScopedInventory && frScopedInventory.titleIndex.size > 0) {
-      const strippedTitle = stripHebrewTitleSuffix(row.title);
-      const frTitle = frTranslations.get(strippedTitle);
+      const frTitle = frTranslations.get(row.title);
       if (frTitle) {
-        frMatch = matchByTitle(frTitle, frScopedInventory, 0.70, sourceSegments);
+        frMatch = matchByTitle(frTitle, frScopedInventory, 0.85, sourceSegments);
       }
     }
 
@@ -1412,25 +1387,25 @@ export async function titleMatchUnmatched(
         }
       } catch {}
 
-      if (enMatch && enMatch.similarity < 0.78) {
-        log(`    Paired EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.78): "${enMatch.url}"`);
+      if (enMatch && enMatch.similarity < 0.90) {
+        log(`    Paired EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.90): "${enMatch.url}"`);
         enMatch = null;
         rejected.crossValidation++;
       }
-      if (frMatch && frMatch.similarity < 0.78) {
-        log(`    Paired FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.78): "${frMatch.url}"`);
+      if (frMatch && frMatch.similarity < 0.90) {
+        log(`    Paired FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.90): "${frMatch.url}"`);
         frMatch = null;
         rejected.crossValidation++;
       }
     } else if (enMatch && !frMatch) {
-      if (enMatch.similarity < 0.82) {
-        log(`    Single-lang EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.82): "${enMatch.url}"`);
+      if (enMatch.similarity < 0.92) {
+        log(`    Single-lang EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.92): "${enMatch.url}"`);
         enMatch = null;
         rejected.crossValidation++;
       }
     } else if (frMatch && !enMatch) {
-      if (frMatch.similarity < 0.82) {
-        log(`    Single-lang FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.82): "${frMatch.url}"`);
+      if (frMatch.similarity < 0.92) {
+        log(`    Single-lang FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.92): "${frMatch.url}"`);
         frMatch = null;
         rejected.crossValidation++;
       }
@@ -1506,7 +1481,7 @@ CRITICAL RULES:
 1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs.
 2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
 3. Each target URL should only be used ONCE across all matches. Do not assign the same target URL to multiple source URLs.
-4. Every URL in the inventory lists is available for matching — previously matched URLs have already been removed.
+4. URLs that are already matched should not appear again. Check the "already used" lists.
 5. Focus on matching the page PURPOSE and CONTENT, not just superficial URL similarity.
 6. Pay attention to the DIRECTORY CONTEXT - each source URL belongs to a specific directory, and its match should be found within the corresponding target directory.
 
@@ -1519,10 +1494,11 @@ DIRECTORY CONTEXT:
 EXAMPLES OF CORRECTLY MATCHED PAIRS:
 {{exampleLines}}
 
-NOTE ON ALREADY-MATCHED URLs:
+ALREADY USED ENGLISH URLs (do NOT reuse these):
 {{usedEnUrls}}
-{{usedFrUrls}}
-All URLs in the inventory lists below are available for matching — previously matched URLs have already been removed.`;
+
+ALREADY USED FRENCH URLs (do NOT reuse these):
+{{usedFrUrls}}`;
 
 export const AI_USER_PROMPT_TEMPLATE = `Find the matching English and/or French URLs for each of these Hebrew source URLs. Each URL includes its directory context - focus your search within the indicated target directories.
 
@@ -1541,7 +1517,7 @@ For each source URL, respond with a JSON array of objects. Each object must have
 - "frenchUrl": the matching French URL from the inventory, or null if no confident match
 - "reasoning": a brief explanation of why you matched these URLs (or why no match was found)
 
-IMPORTANT: Return ONLY a valid JSON array. No markdown, no code fences, no explanation text before or after the JSON. The response must start with [ and end with ].`;
+Return ONLY the JSON array, no markdown formatting, no code fences, no other text.`;
 
 export const AI_VALIDATION_PIPELINE = [
   { step: 1, name: "Inventory membership check", description: "Every URL suggested by the AI must exist in the crawl inventory. URLs not in inventory are rejected." },
@@ -1573,13 +1549,13 @@ export function getAiConfig() {
 function rankInventoryByTitleSimilarity(
   inventory: CrawlInventory,
   translatedTitles: string[],
-  usedUrls?: Set<string>,
+  usedUrls: Set<string>,
   maxResults: number = 200,
 ): string[] {
   const scored: { url: string; score: number }[] = [];
 
   for (const [url, pageTitle] of inventory.titleIndex.entries()) {
-    if (usedUrls && usedUrls.has(url)) continue;
+    if (usedUrls.has(url)) continue;
     let bestSim = 0;
     for (const title of translatedTitles) {
       const sim = titleSimilarity(title, pageTitle);
@@ -1663,7 +1639,6 @@ export async function aiMatchUnmatched(
   knownEnUrls: Set<string>,
   knownFrUrls: Set<string>,
   origin: string,
-  control?: { cancel: boolean; stopAfterCurrentRound: boolean },
 ): Promise<Map<number, BatchMatchResult>> {
   const results = new Map<number, BatchMatchResult>();
 
@@ -1714,61 +1689,60 @@ export async function aiMatchUnmatched(
   let aiMatches = 0;
 
   for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
-    if (control?.cancel || control?.stopAfterCurrentRound) {
-      log(`  AI batch loop stopped at batch ${batchIdx + 1}/${batches.length} (cancel=${control.cancel}, stopAfterRound=${control.stopAfterCurrentRound})`);
-      break;
-    }
-
     const batch = batches[batchIdx];
 
     const batchEnUrls = new Set<string>();
     const batchFrUrls = new Set<string>();
 
-    const needsEn = batch.some(r => r.needsEn);
-    const needsFr = batch.some(r => r.needsFr);
-
-    const INVENTORY_CAP = 500;
-
-    let enTitleRanked = 0;
-    let frTitleRanked = 0;
-    let enUsedFiltered = 0;
-    let frUsedFiltered = 0;
-
-    const batchTitles = batch
-      .map(r => enTranslations.get(r.title) || frTranslations.get(r.title))
-      .filter(Boolean) as string[];
-
-    if (batchTitles.length > 0) {
-      if (needsEn && enInventory) {
-        const ranked = rankInventoryByTitleSimilarity(enInventory, batchTitles, usedEnUrls);
-        for (const url of ranked) {
-          if (batchEnUrls.size >= INVENTORY_CAP) break;
-          batchEnUrls.add(url);
+    for (const row of batch) {
+      if (row.needsEn && row.enDirectoryContext && enInventory) {
+        const scoped = getScopedInventory(enInventory, row.enDirectoryContext, origin);
+        for (const url of scoped.urls) {
+          if (!usedEnUrls.has(url)) batchEnUrls.add(url);
         }
-        enTitleRanked = batchEnUrls.size;
       }
-      if (needsFr && frInventory) {
-        const ranked = rankInventoryByTitleSimilarity(frInventory, batchTitles, usedFrUrls);
-        for (const url of ranked) {
-          if (batchFrUrls.size >= INVENTORY_CAP) break;
-          batchFrUrls.add(url);
+      if (row.needsFr && row.frDirectoryContext && frInventory) {
+        const scoped = getScopedInventory(frInventory, row.frDirectoryContext, origin);
+        for (const url of scoped.urls) {
+          if (!usedFrUrls.has(url)) batchFrUrls.add(url);
         }
-        frTitleRanked = batchFrUrls.size;
       }
     }
 
-    if (needsEn && enInventory && batchEnUrls.size < INVENTORY_CAP) {
-      for (const url of enInventory.urls) {
-        if (batchEnUrls.size >= INVENTORY_CAP) break;
-        if (usedEnUrls.has(url)) { enUsedFiltered++; continue; }
-        if (!batchEnUrls.has(url)) batchEnUrls.add(url);
+    const needsEnFallback = batch.some(r => r.needsEn) && batchEnUrls.size === 0;
+    const needsFrFallback = batch.some(r => r.needsFr) && batchFrUrls.size === 0;
+
+    if (needsEnFallback || needsFrFallback) {
+      const batchTitles = batch
+        .map(r => enTranslations.get(r.title) || frTranslations.get(r.title))
+        .filter(Boolean) as string[];
+
+      if (batchTitles.length > 0) {
+        if (needsEnFallback && enInventory) {
+          const ranked = rankInventoryByTitleSimilarity(enInventory, batchTitles, usedEnUrls);
+          for (const url of ranked) batchEnUrls.add(url);
+          if (ranked.length > 0) {
+            log(`    Fallback scoping (EN): title-ranked ${ranked.length} candidates (from ${enInventory.urls.size} total)`);
+          }
+        }
+        if (needsFrFallback && frInventory) {
+          const ranked = rankInventoryByTitleSimilarity(frInventory, batchTitles, usedFrUrls);
+          for (const url of ranked) batchFrUrls.add(url);
+          if (ranked.length > 0) {
+            log(`    Fallback scoping (FR): title-ranked ${ranked.length} candidates (from ${frInventory.urls.size} total)`);
+          }
+        }
       }
-    }
-    if (needsFr && frInventory && batchFrUrls.size < INVENTORY_CAP) {
-      for (const url of frInventory.urls) {
-        if (batchFrUrls.size >= INVENTORY_CAP) break;
-        if (usedFrUrls.has(url)) { frUsedFiltered++; continue; }
-        if (!batchFrUrls.has(url)) batchFrUrls.add(url);
+
+      if (batchEnUrls.size === 0 && needsEnFallback && enInventory) {
+        for (const url of enInventory.urls) {
+          if (!usedEnUrls.has(url)) batchEnUrls.add(url);
+        }
+      }
+      if (batchFrUrls.size === 0 && needsFrFallback && frInventory) {
+        for (const url of frInventory.urls) {
+          if (!usedFrUrls.has(url)) batchFrUrls.add(url);
+        }
       }
     }
 
@@ -1801,8 +1775,8 @@ export async function aiMatchUnmatched(
       .replace("{{patternContext}}", patternContext.join("\n"))
       .replace("{{directoryContext}}", dirContextLines.join("\n") || "(no directory mappings available)")
       .replace("{{exampleLines}}", exampleLines)
-      .replace("{{usedEnUrls}}", `(${usedEnUrls.size} URLs pre-filtered from inventory — all URLs listed below are available)`)
-      .replace("{{usedFrUrls}}", `(${usedFrUrls.size} URLs pre-filtered from inventory — all URLs listed below are available)`);
+      .replace("{{usedEnUrls}}", Array.from(usedEnUrls).slice(-50).join("\n") || "(none)")
+      .replace("{{usedFrUrls}}", Array.from(usedFrUrls).slice(-50).join("\n") || "(none)");
 
     const userPrompt = AI_USER_PROMPT_TEMPLATE
       .replace("{{urlsBlock}}", urlsBlock)
@@ -1810,11 +1784,7 @@ export async function aiMatchUnmatched(
       .replace("{{frInventoryList}}", frListStr || "(no French inventory available)");
 
     try {
-      const enTotal = enInventory?.urls.size || 0;
-      const frTotal = frInventory?.urls.size || 0;
-      log(`  AI batch ${batchIdx + 1}/${batches.length}: ${batch.length} URLs`);
-      log(`    EN scope: ${enList.length}/${enTotal} inventory URLs (${enTitleRanked} title-ranked, ${enList.length - enTitleRanked} fallback, ${enUsedFiltered + usedEnUrls.size} filtered as used)`);
-      log(`    FR scope: ${frList.length}/${frTotal} inventory URLs (${frTitleRanked} title-ranked, ${frList.length - frTitleRanked} fallback, ${frUsedFiltered + usedFrUrls.size} filtered as used)`);
+      log(`  AI batch ${batchIdx + 1}/${batches.length}: ${batch.length} URLs, inventory scope: ${enList.length} EN, ${frList.length} FR`);
 
       const message = await anthropic.messages.create({
         model: AI_MODEL,
@@ -1838,26 +1808,8 @@ export async function aiMatchUnmatched(
         const parsed = JSON.parse(jsonStr);
         suggestions = Array.isArray(parsed) ? parsed : (parsed.matches || parsed.results || parsed.urls || []);
       } catch {
-        log(`    AI batch ${batchIdx + 1}/${batches.length}: failed to parse response, retrying...`);
-        log(`    Response preview: ${content.substring(0, 300)}`);
-        try {
-          const retryMessage = await anthropic.messages.create({
-            model: AI_MODEL,
-            max_tokens: 8192,
-            system: "You are a JSON formatter. Convert the previous response into a valid JSON array.",
-            messages: [
-              { role: "user", content: `Convert this to a valid JSON array of objects with sourceUrl, englishUrl, frenchUrl, reasoning fields:\n\n${content}` },
-            ],
-          });
-          const retryText = retryMessage.content.find(b => b.type === "text")?.text || "";
-          const retryJson = retryText.replace(/^```json?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
-          const retryParsed = JSON.parse(retryJson);
-          suggestions = Array.isArray(retryParsed) ? retryParsed : (retryParsed.matches || retryParsed.results || retryParsed.urls || []);
-          log(`    AI batch ${batchIdx + 1}/${batches.length}: retry parse succeeded (${suggestions.length} suggestions)`);
-        } catch {
-          log(`    AI batch ${batchIdx + 1}/${batches.length}: retry also failed, skipping batch`);
-          continue;
-        }
+        log(`    AI batch ${batchIdx + 1}/${batches.length}: failed to parse response`);
+        continue;
       }
 
       let batchMatches = 0;

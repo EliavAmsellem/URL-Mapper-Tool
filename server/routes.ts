@@ -19,7 +19,6 @@ import {
   clearAllCaches,
   getAiConfig,
   crossLanguageDerive,
-  stripHebrewTitleSuffix,
   type TabPatterns,
   type CrawlInventory,
   type BatchMatchResult,
@@ -509,42 +508,6 @@ async function matchTab(
 
   const crawlPromises: Promise<void>[] = [];
 
-  function getTargetDirs(lang: "en" | "fr"): string[] {
-    const langMappings = tabPatterns.directoryMappings.filter(m => m.lang === lang);
-    return [...new Set(langMappings.map(m => {
-      const parts = m.targetDir.split("/").filter(Boolean);
-      return "/" + parts.join("/");
-    }))];
-  }
-
-  function filterSessionsByTargetDirs(sessions: { id: string; totalUrls: number; rootPath: string }[], targetDirs: string[], lang: string): { id: string; totalUrls: number; rootPath: string }[] {
-    if (targetDirs.length === 0 || sessions.length <= 1) return sessions;
-
-    const sessionScores = sessions.map(s => {
-      const sessionRoot = s.rootPath.toLowerCase();
-      const matchCount = targetDirs.filter(td => {
-        const tdLower = td.toLowerCase();
-        return sessionRoot === tdLower || sessionRoot.startsWith(tdLower + "/") || tdLower.startsWith(sessionRoot + "/");
-      }).length;
-      return { session: s, matchCount };
-    });
-
-    const maxScore = Math.max(...sessionScores.map(s => s.matchCount));
-    if (maxScore === 0) return sessions;
-
-    const threshold = Math.max(1, Math.ceil(maxScore * 0.5));
-    const filtered = sessionScores
-      .filter(s => s.matchCount >= threshold)
-      .map(s => s.session);
-
-    if (filtered.length > 0 && filtered.length < sessions.length) {
-      const excluded = sessions.filter(s => !filtered.includes(s));
-      log(`  ${lang.toUpperCase()} inventory scoping: kept ${filtered.length} session(s) (score≥${threshold}), excluded ${excluded.length}: ${excluded.map(s => s.rootPath).join(", ")}`);
-      return filtered;
-    }
-    return sessions;
-  }
-
   if (origin && hasEnMappings) {
     const enCrawlRoot = deriveCrawlRoot("en");
     if (enCrawlRoot.length > 0) {
@@ -554,15 +517,13 @@ async function matchTab(
         log(`  EN directory cached: ${enInventory.urls.size} URLs`);
       } else {
         const rootPathStr = "/" + enCrawlRoot.join("/");
-        let dbSessions: { id: string; totalUrls: number; rootPath: string }[] = [];
+        let dbSessions: { id: string; totalUrls: number }[] = [];
         const exactSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
         if (exactSession) {
           dbSessions = [exactSession];
         } else {
           const prefixSessions = await storage.findCompletedCrawlSessionsByPrefix(origin, rootPathStr);
-          if (prefixSessions.length > 0) {
-            dbSessions = filterSessionsByTargetDirs(prefixSessions, getTargetDirs("en"), "en");
-          }
+          if (prefixSessions.length > 0) dbSessions = prefixSessions;
         }
         if (dbSessions.length > 0) {
           const allRows: { url: string; title: string | null }[] = [];
@@ -595,15 +556,13 @@ async function matchTab(
         log(`  FR directory cached: ${frInventory.urls.size} URLs`);
       } else {
         const rootPathStr = "/" + frCrawlRoot.join("/");
-        let dbSessions: { id: string; totalUrls: number; rootPath: string }[] = [];
+        let dbSessions: { id: string; totalUrls: number }[] = [];
         const exactSession = await storage.findCompletedCrawlSession(origin, rootPathStr);
         if (exactSession) {
           dbSessions = [exactSession];
         } else {
           const prefixSessions = await storage.findCompletedCrawlSessionsByPrefix(origin, rootPathStr);
-          if (prefixSessions.length > 0) {
-            dbSessions = filterSessionsByTargetDirs(prefixSessions, getTargetDirs("fr"), "fr");
-          }
+          if (prefixSessions.length > 0) dbSessions = prefixSessions;
         }
         if (dbSessions.length > 0) {
           const allRows: { url: string; title: string | null }[] = [];
@@ -629,46 +588,6 @@ async function matchTab(
 
   if (crawlPromises.length > 0) await Promise.all(crawlPromises);
 
-  function getParentDirectoryScopes(dir: string): string[] {
-    const parts = dir.split("/").filter(Boolean);
-    const scopes: string[] = [];
-    for (let i = parts.length - 1; i >= 1; i--) {
-      scopes.push("/" + parts.slice(0, i).join("/"));
-    }
-    return scopes;
-  }
-
-  function getUrlDirectory(urlStr: string): string | null {
-    try {
-      const parsed = new URL(urlStr);
-      const parts = parsed.pathname.split("/").filter(Boolean);
-      if (parts.length <= 1) return "/" + parts.join("/");
-      const lastSeg = parts[parts.length - 1].toLowerCase();
-      if (lastSeg === "default.aspx" || lastSeg.includes(".")) {
-        parts.pop();
-      }
-      if (parts.length > 0 && parts[parts.length - 1].toLowerCase() === "pages") {
-        parts.pop();
-      }
-      return "/" + parts.join("/");
-    } catch {
-      return null;
-    }
-  }
-
-  function directoriesAreRelated(dir1: string, dir2: string): boolean {
-    const segs1 = dir1.toLowerCase().split("/").filter(Boolean);
-    const segs2 = dir2.toLowerCase().split("/").filter(Boolean);
-    if (segs1.length === 0 || segs2.length === 0) return false;
-    let commonLen = 0;
-    const minLen = Math.min(segs1.length, segs2.length);
-    for (let i = 0; i < minLen; i++) {
-      if (segs1[i] === segs2[i]) commonLen++;
-      else break;
-    }
-    return commonLen >= 2;
-  }
-
   for (const row of needsMatching) {
     if (control.cancel) break;
     const result: BatchMatchResult = {
@@ -689,32 +608,10 @@ async function matchTab(
             result.matchMethodEn = match.method;
           }
         }
-        if (!result.enUrl) {
-          const parentScopes = getParentDirectoryScopes(targetDir);
-          for (const parentDir of parentScopes) {
-            const parentInv = getScopedInventory(enInventory, parentDir, origin);
-            if (parentInv.urls.size > 0) {
-              const match = matchInDirectory(row.sourceUrl, "en", tabPatterns, parentInv);
-              if (match) {
-                result.enUrl = match.url;
-                result.confidenceEn = Math.max((match.confidence || 0) - 2, 70);
-                result.matchMethodEn = match.method + "-parent";
-                break;
-              }
-            }
-          }
-        }
       }
       if (!result.enUrl) {
         const match = matchInDirectory(row.sourceUrl, "en", tabPatterns, enInventory);
-        if (match && targetDir) {
-          const matchDir = getUrlDirectory(match.url);
-          if (matchDir && directoriesAreRelated(matchDir, targetDir)) {
-            result.enUrl = match.url;
-            result.confidenceEn = Math.max((match.confidence || 0) - 5, 70);
-            result.matchMethodEn = match.method + "-broad";
-          }
-        } else if (match && !targetDir) {
+        if (match) {
           result.enUrl = match.url;
           result.confidenceEn = Math.max((match.confidence || 0) - 5, 70);
           result.matchMethodEn = match.method + "-broad";
@@ -734,32 +631,10 @@ async function matchTab(
             result.matchMethodFr = match.method;
           }
         }
-        if (!result.frUrl) {
-          const parentScopes = getParentDirectoryScopes(targetDir);
-          for (const parentDir of parentScopes) {
-            const parentInv = getScopedInventory(frInventory, parentDir, origin);
-            if (parentInv.urls.size > 0) {
-              const match = matchInDirectory(row.sourceUrl, "fr", tabPatterns, parentInv);
-              if (match) {
-                result.frUrl = match.url;
-                result.confidenceFr = Math.max((match.confidence || 0) - 2, 70);
-                result.matchMethodFr = match.method + "-parent";
-                break;
-              }
-            }
-          }
-        }
       }
       if (!result.frUrl) {
         const match = matchInDirectory(row.sourceUrl, "fr", tabPatterns, frInventory);
-        if (match && targetDir) {
-          const matchDir = getUrlDirectory(match.url);
-          if (matchDir && directoriesAreRelated(matchDir, targetDir)) {
-            result.frUrl = match.url;
-            result.confidenceFr = Math.max((match.confidence || 0) - 5, 70);
-            result.matchMethodFr = match.method + "-broad";
-          }
-        } else if (match && !targetDir) {
+        if (match) {
           result.frUrl = match.url;
           result.confidenceFr = Math.max((match.confidence || 0) - 5, 70);
           result.matchMethodFr = match.method + "-broad";
@@ -821,13 +696,6 @@ async function matchTab(
 
       if (enDir && enInventory) {
         enScopedInv = getScopedInventory(enInventory, enDir, origin);
-        if (enScopedInv.urls.size === 0) {
-          const parentScopes = getParentDirectoryScopes(enDir);
-          for (const parentDir of parentScopes) {
-            enScopedInv = getScopedInventory(enInventory, parentDir, origin);
-            if (enScopedInv.urls.size > 0) break;
-          }
-        }
         if (enScopedInv.urls.size === 0) enScopedInv = enInventory;
       } else if (enInventory) {
         enScopedInv = enInventory;
@@ -835,13 +703,6 @@ async function matchTab(
 
       if (frDir && frInventory) {
         frScopedInv = getScopedInventory(frInventory, frDir, origin);
-        if (frScopedInv.urls.size === 0) {
-          const parentScopes = getParentDirectoryScopes(frDir);
-          for (const parentDir of parentScopes) {
-            frScopedInv = getScopedInventory(frInventory, parentDir, origin);
-            if (frScopedInv.urls.size > 0) break;
-          }
-        }
         if (frScopedInv.urls.size === 0) frScopedInv = frInventory;
       } else if (frInventory) {
         frScopedInv = frInventory;
@@ -997,7 +858,7 @@ function clearCheckpoint(jobId: string) {
   if (fs.existsSync(cpPath)) fs.unlinkSync(cpPath);
 }
 
-async function processJob(jobId: string, _threshold: number, control: { cancel: boolean; stopAfterCurrentRound: boolean }) {
+async function processJob(jobId: string, _threshold: number, control: { cancel: boolean }) {
   const filePath = `/tmp/uploads/${jobId}.xlsx`;
   if (!fs.existsSync(filePath)) {
     throw new Error("Source file not found");
@@ -1212,7 +1073,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
   const MAX_AI_ROUNDS = 3;
 
-  for (let aiRound = skipToPostAi ? MAX_AI_ROUNDS + 1 : resumeAiRound; aiRound <= MAX_AI_ROUNDS && !control.cancel && !control.stopAfterCurrentRound; aiRound++) {
+  for (let aiRound = skipToPostAi ? MAX_AI_ROUNDS + 1 : resumeAiRound; aiRound <= MAX_AI_ROUNDS && !control.cancel; aiRound++) {
     const roundLabel = aiRound > 1 ? ` (round ${aiRound})` : "";
     await storage.updateJob(jobId, { currentStep: `ai-matching${roundLabel}` });
 
@@ -1344,29 +1205,17 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
       const matchedExamples = tabData.tabRefRows.slice(0, 10);
 
-      const titlesForEn = unmatchedForAi.filter(r => r.needsEn).map(r => stripHebrewTitleSuffix(r.title)).filter(Boolean);
-      const titlesForFr = unmatchedForAi.filter(r => r.needsFr).map(r => stripHebrewTitleSuffix(r.title)).filter(Boolean);
+      const titlesForEn = unmatchedForAi.filter(r => r.needsEn).map(r => r.title).filter(Boolean);
+      const titlesForFr = unmatchedForAi.filter(r => r.needsFr).map(r => r.title).filter(Boolean);
 
       let enTranslations = new Map<string, string>();
       let frTranslations = new Map<string, string>();
 
       if (titlesForEn.length > 0) {
-        const strippedEnTranslations = await batchTranslate(titlesForEn, "en", storage);
-        for (const r of unmatchedForAi) {
-          if (!r.needsEn) continue;
-          const stripped = stripHebrewTitleSuffix(r.title);
-          const translated = strippedEnTranslations.get(stripped);
-          if (translated) enTranslations.set(r.title, translated);
-        }
+        enTranslations = await batchTranslate(titlesForEn, "en", storage);
       }
       if (titlesForFr.length > 0) {
-        const strippedFrTranslations = await batchTranslate(titlesForFr, "fr", storage);
-        for (const r of unmatchedForAi) {
-          if (!r.needsFr) continue;
-          const stripped = stripHebrewTitleSuffix(r.title);
-          const translated = strippedFrTranslations.get(stripped);
-          if (translated) frTranslations.set(r.title, translated);
-        }
+        frTranslations = await batchTranslate(titlesForFr, "fr", storage);
       }
 
       const origin = (() => {
@@ -1387,7 +1236,6 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
         knownEnUrls,
         knownFrUrls,
         origin,
-        control,
       );
 
       if (aiMatches.size > 0) {
@@ -1428,11 +1276,6 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
     if (roundAiTotal === 0) {
       log(`No new AI matches in round ${aiRound}, stopping AI re-learning loop.`);
-      break;
-    }
-
-    if (control.stopAfterCurrentRound) {
-      log(`Stop requested after AI round ${aiRound}. Finishing with ${matchedCount} matches.`);
       break;
     }
   }

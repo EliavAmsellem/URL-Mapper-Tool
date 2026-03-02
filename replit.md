@@ -87,34 +87,24 @@ For each unmatched source URL:
    - **Tail match** — Match on last 1-2 URL segments within scope (confidence 88-90)
    - **Translated tail match** — Translate segments then match tails (confidence 86)
    - **Fuzzy match** — Jaccard word-overlap similarity on last segments (confidence 80-90)
-4. **Parent directory fallback** — If the exact target directory scope is empty, progressively try parent directories (e.g., `/en/About/faq` → `/en/About/` → `/en/`) with a small confidence penalty (-2 points)
-5. **Broad fallback** — If no match in scoped or parent inventories, search the full inventory with reduced confidence (-5 points), but ONLY accept matches whose directory shares at least 2 common path segments with the expected target directory (prevents cross-section contamination like Benefits URLs matching About sources)
+4. **Broad fallback** — If no match in scoped inventory, search the full inventory with reduced confidence (-5 points)
 
 #### Step 5: Title-Based Matching
 - For URLs still unmatched, page titles are translated Hebrew→EN/FR using Google Translate GTX endpoint
-- **Hebrew suffix stripping**: Before translation, common trailing Hebrew suffixes (after " - ") are stripped from titles to produce cleaner translations and more focused comparisons
-- Translated titles are fuzzy-matched against crawl inventory page titles using word-overlap (Jaccard) similarity
-- Title matching is also directory-scoped: unmatched URLs are grouped by their target directory, and title matching searches within the corresponding scoped inventory (with parent directory fallback when the exact scope is empty)
+- Translated titles are fuzzy-matched against crawl inventory page titles using word-overlap similarity
+- Title matching is also directory-scoped: unmatched URLs are grouped by their target directory, and title matching searches within the corresponding scoped inventory
 - Section-aware scoring splits titles like "Topic - Page Name" and provides section similarity boosts
-- **Similarity thresholds**: Initial gate at 0.70, paired matches require 0.78, single-language matches require 0.82
-- **Stop word filtering**: `normalizeTitle` strips common English/French articles AND site-wide common words (national, insurance, institute) to focus scoring on distinctive content words
-- **Diagnostic logging**: When no match is found but the best candidate scores above 0.30, the score and URL are logged
 - 5 concurrent translation requests with rate limiting (200ms between batches)
 - Translation results are cached persistently in the database `translation_cache` table
 
 #### Step 6: AI-Powered Matching (Final Fallback)
 - For URLs still unmatched after all deterministic steps, an AI agent (Claude Opus 4.6 via Replit Anthropic AI Integrations) attempts matching
 - The AI receives **directory context** for each URL: which source directory it's from and the corresponding target directory
-- AI gets **pre-filtered inventory** as candidates (up to INVENTORY_CAP=500 per language), with title-ranked URLs listed first for relevance
-- **Already-used URLs are excluded from the inventory** sent to the AI — `usedEnUrls`/`usedFrUrls` are filtered out at both the title-ranking and fallback-fill stages, so the AI only sees URLs it can actually use
-- Uniqueness is still enforced at the acceptance stage as a safety net
-- **Diagnostic logging** shows per-batch inventory breakdown: total inventory size, title-ranked count, fallback count, and filtered-as-used count
+- AI gets a **scoped candidate list** — only URLs from the relevant target directories, not the full site inventory
 - AI is constrained to ONLY select from the crawl inventory — never invents URLs
 - Batches of ~15 unmatched URLs are processed per API call
-- JSON parse failures trigger an automatic retry via a reformatting AI call; failed responses are logged for debugging
 - AI matches are labeled with method "dir-ai" and confidence score 82
 - The system prompt emphasizes accuracy over completeness — better to return null than a wrong match
-- The job `control` object is passed to the AI batch loop, allowing mid-batch cancellation via the "Stop after this round" button
 
 #### Multi-Pass Processing
 - Jobs automatically run up to 3 passes per processing run
