@@ -1517,7 +1517,7 @@ For each source URL, respond with a JSON array of objects. Each object must have
 - "frenchUrl": the matching French URL from the inventory, or null if no confident match
 - "reasoning": a brief explanation of why you matched these URLs (or why no match was found)
 
-Return ONLY the JSON array, no markdown formatting, no code fences, no other text.`;
+IMPORTANT: Return ONLY a valid JSON array. No markdown, no code fences, no explanation text before or after the JSON. The response must start with [ and end with ].`;
 
 export const AI_VALIDATION_PIPELINE = [
   { step: 1, name: "Inventory membership check", description: "Every URL suggested by the AI must exist in the crawl inventory. URLs not in inventory are rejected." },
@@ -1549,13 +1549,13 @@ export function getAiConfig() {
 function rankInventoryByTitleSimilarity(
   inventory: CrawlInventory,
   translatedTitles: string[],
-  usedUrls: Set<string>,
+  usedUrls?: Set<string>,
   maxResults: number = 200,
 ): string[] {
   const scored: { url: string; score: number }[] = [];
 
   for (const [url, pageTitle] of inventory.titleIndex.entries()) {
-    if (usedUrls.has(url)) continue;
+    if (usedUrls && usedUrls.has(url)) continue;
     let bestSim = 0;
     for (const title of translatedTitles) {
       const sim = titleSimilarity(title, pageTitle);
@@ -1639,6 +1639,7 @@ export async function aiMatchUnmatched(
   knownEnUrls: Set<string>,
   knownFrUrls: Set<string>,
   origin: string,
+  control?: { cancel: boolean; stopAfterCurrentRound: boolean },
 ): Promise<Map<number, BatchMatchResult>> {
   const results = new Map<number, BatchMatchResult>();
 
@@ -1689,28 +1690,20 @@ export async function aiMatchUnmatched(
   let aiMatches = 0;
 
   for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
+    if (control?.cancel || control?.stopAfterCurrentRound) {
+      log(`  AI batch loop stopped at batch ${batchIdx + 1}/${batches.length} (cancel=${control.cancel}, stopAfterRound=${control.stopAfterCurrentRound})`);
+      break;
+    }
+
     const batch = batches[batchIdx];
 
     const batchEnUrls = new Set<string>();
     const batchFrUrls = new Set<string>();
 
-    for (const row of batch) {
-      if (row.needsEn && row.enDirectoryContext && enInventory) {
-        const scoped = getScopedInventory(enInventory, row.enDirectoryContext, origin);
-        for (const url of scoped.urls) {
-          if (!usedEnUrls.has(url)) batchEnUrls.add(url);
-        }
-      }
-      if (row.needsFr && row.frDirectoryContext && frInventory) {
-        const scoped = getScopedInventory(frInventory, row.frDirectoryContext, origin);
-        for (const url of scoped.urls) {
-          if (!usedFrUrls.has(url)) batchFrUrls.add(url);
-        }
-      }
-    }
-
     const needsEn = batch.some(r => r.needsEn);
     const needsFr = batch.some(r => r.needsFr);
+
+    const INVENTORY_CAP = 500;
 
     const batchTitles = batch
       .map(r => enTranslations.get(r.title) || frTranslations.get(r.title))
@@ -1718,38 +1711,31 @@ export async function aiMatchUnmatched(
 
     if (batchTitles.length > 0) {
       if (needsEn && enInventory) {
-        const scopedBefore = batchEnUrls.size;
-        const ranked = rankInventoryByTitleSimilarity(enInventory, batchTitles, usedEnUrls);
+        const ranked = rankInventoryByTitleSimilarity(enInventory, batchTitles);
         for (const url of ranked) {
-          if (!usedEnUrls.has(url)) batchEnUrls.add(url);
-        }
-        if (ranked.length > 0) {
-          log(`    Title-supplement (EN): +${batchEnUrls.size - scopedBefore} title-ranked candidates added to ${scopedBefore} scoped (from ${enInventory.urls.size} total)`);
+          if (batchEnUrls.size >= INVENTORY_CAP) break;
+          batchEnUrls.add(url);
         }
       }
       if (needsFr && frInventory) {
-        const scopedBefore = batchFrUrls.size;
-        const ranked = rankInventoryByTitleSimilarity(frInventory, batchTitles, usedFrUrls);
+        const ranked = rankInventoryByTitleSimilarity(frInventory, batchTitles);
         for (const url of ranked) {
-          if (!usedFrUrls.has(url)) batchFrUrls.add(url);
-        }
-        if (ranked.length > 0) {
-          log(`    Title-supplement (FR): +${batchFrUrls.size - scopedBefore} title-ranked candidates added to ${scopedBefore} scoped (from ${frInventory.urls.size} total)`);
+          if (batchFrUrls.size >= INVENTORY_CAP) break;
+          batchFrUrls.add(url);
         }
       }
     }
 
-    const INVENTORY_CAP = 500;
     if (needsEn && enInventory && batchEnUrls.size < INVENTORY_CAP) {
       for (const url of enInventory.urls) {
         if (batchEnUrls.size >= INVENTORY_CAP) break;
-        if (!usedEnUrls.has(url) && !batchEnUrls.has(url)) batchEnUrls.add(url);
+        if (!batchEnUrls.has(url)) batchEnUrls.add(url);
       }
     }
     if (needsFr && frInventory && batchFrUrls.size < INVENTORY_CAP) {
       for (const url of frInventory.urls) {
         if (batchFrUrls.size >= INVENTORY_CAP) break;
-        if (!usedFrUrls.has(url) && !batchFrUrls.has(url)) batchFrUrls.add(url);
+        if (!batchFrUrls.has(url)) batchFrUrls.add(url);
       }
     }
 
@@ -1815,8 +1801,26 @@ export async function aiMatchUnmatched(
         const parsed = JSON.parse(jsonStr);
         suggestions = Array.isArray(parsed) ? parsed : (parsed.matches || parsed.results || parsed.urls || []);
       } catch {
-        log(`    AI batch ${batchIdx + 1}/${batches.length}: failed to parse response`);
-        continue;
+        log(`    AI batch ${batchIdx + 1}/${batches.length}: failed to parse response, retrying...`);
+        log(`    Response preview: ${content.substring(0, 300)}`);
+        try {
+          const retryMessage = await anthropic.messages.create({
+            model: AI_MODEL,
+            max_tokens: 8192,
+            system: "You are a JSON formatter. Convert the previous response into a valid JSON array.",
+            messages: [
+              { role: "user", content: `Convert this to a valid JSON array of objects with sourceUrl, englishUrl, frenchUrl, reasoning fields:\n\n${content}` },
+            ],
+          });
+          const retryText = retryMessage.content.find(b => b.type === "text")?.text || "";
+          const retryJson = retryText.replace(/^```json?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+          const retryParsed = JSON.parse(retryJson);
+          suggestions = Array.isArray(retryParsed) ? retryParsed : (retryParsed.matches || retryParsed.results || retryParsed.urls || []);
+          log(`    AI batch ${batchIdx + 1}/${batches.length}: retry parse succeeded (${suggestions.length} suggestions)`);
+        } catch {
+          log(`    AI batch ${batchIdx + 1}/${batches.length}: retry also failed, skipping batch`);
+          continue;
+        }
       }
 
       let batchMatches = 0;

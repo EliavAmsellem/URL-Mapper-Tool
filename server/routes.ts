@@ -1276,6 +1276,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
         knownEnUrls,
         knownFrUrls,
         origin,
+        control,
       );
 
       if (aiMatches.size > 0) {
