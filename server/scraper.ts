@@ -934,6 +934,53 @@ export function validateDepthMatch(
   }
 }
 
+function disambiguateByDepth(
+  sourceUrl: string,
+  candidates: string[],
+  sourceRoot: string[],
+  targetRoot: string[]
+): string | null {
+  try {
+    const srcParts = new URL(sourceUrl).pathname.split("/").filter(Boolean);
+    const srcClean = stripSuffix(srcParts);
+    const srcDepth = srcClean.length - sourceRoot.length;
+
+    let bestCandidate: string | null = null;
+    let bestScore = -1;
+    let tiedCount = 0;
+
+    for (const candidate of candidates) {
+      if (!validateDepthMatch(sourceUrl, candidate, sourceRoot, targetRoot)) continue;
+
+      const tgtParts = new URL(candidate).pathname.split("/").filter(Boolean);
+      const tgtClean = stripSuffix(tgtParts);
+      const tgtDepth = tgtClean.length - targetRoot.length;
+
+      const depthDiff = Math.abs(srcDepth - tgtDepth);
+      const srcTail = srcClean.slice(sourceRoot.length).map(s => normalizeSegment(s));
+      const tgtTail = tgtClean.slice(targetRoot.length).map(s => normalizeSegment(s));
+      let sharedSegs = 0;
+      for (const s of srcTail) {
+        if (tgtTail.includes(s)) sharedSegs++;
+      }
+
+      const score = sharedSegs * 10 - depthDiff;
+      if (score > bestScore) {
+        bestScore = score;
+        bestCandidate = candidate;
+        tiedCount = 1;
+      } else if (score === bestScore) {
+        tiedCount++;
+      }
+    }
+
+    if (tiedCount === 1 && bestCandidate) return bestCandidate;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function matchAgainstInventory(
   sourceUrl: string,
   lang: "en" | "fr",
@@ -1034,6 +1081,11 @@ export function matchAgainstInventory(
             if (validateDepthMatch(sourceUrl, rootFiltered[0], sourceRoot, targetRoot)) {
               return { url: rootFiltered[0], confidence: 92, method: "root-anchored-tail" };
             }
+          } else if (rootFiltered.length > 1 && rootFiltered.length <= 5) {
+            const best = disambiguateByDepth(sourceUrl, rootFiltered, sourceRoot, targetRoot);
+            if (best) {
+              return { url: best, confidence: 89, method: "root-anchored-tail-disambig" };
+            }
           }
         }
 
@@ -1055,6 +1107,11 @@ export function matchAgainstInventory(
                 if (validateDepthMatch(sourceUrl, rootFiltered[0], sourceRoot, targetRoot)) {
                   return { url: rootFiltered[0], confidence: 91, method: "root-anchored-translated-tail" };
                 }
+              } else if (rootFiltered.length > 1 && rootFiltered.length <= 5) {
+                const best = disambiguateByDepth(sourceUrl, rootFiltered, sourceRoot, targetRoot);
+                if (best) {
+                  return { url: best, confidence: 88, method: "root-anchored-translated-tail-disambig" };
+                }
               }
             }
           }
@@ -1074,6 +1131,11 @@ export function matchAgainstInventory(
           if (validateDepthMatch(sourceUrl, sectionFiltered[0], sourceRoot, targetRoot)) {
             return { url: sectionFiltered[0], confidence: 85, method: "crawl-tail" };
           }
+        } else if (sectionFiltered.length > 1 && sectionFiltered.length <= 5) {
+          const best = disambiguateByDepth(sourceUrl, sectionFiltered, sourceRoot, targetRoot);
+          if (best) {
+            return { url: best, confidence: 83, method: "crawl-tail-disambig" };
+          }
         }
 
         if (srcTailParts.length >= 2 && (sectionFiltered.length > 1 || sectionFiltered.length === 0)) {
@@ -1083,6 +1145,11 @@ export function matchAgainstInventory(
           if (sectionFiltered2.length === 1) {
             if (validateDepthMatch(sourceUrl, sectionFiltered2[0], sourceRoot, targetRoot)) {
               return { url: sectionFiltered2[0], confidence: 88, method: "crawl-tail2" };
+            }
+          } else if (sectionFiltered2.length > 1 && sectionFiltered2.length <= 5) {
+            const best = disambiguateByDepth(sourceUrl, sectionFiltered2, sourceRoot, targetRoot);
+            if (best) {
+              return { url: best, confidence: 86, method: "crawl-tail2-disambig" };
             }
           }
         }
@@ -1424,6 +1491,42 @@ export function matchByTitle(
   if (finalMatch) {
     const gap = bestSimilarity - secondBestSimilarity;
     if (gap < 0.05 && bestSimilarity < 0.95) {
+      if (sourceSegments && sourceSegments.size > 0) {
+        const allMatches = Array.from(inventory.urls).filter(url => {
+          const pageTitle = inventory.titles.get(url);
+          if (!pageTitle) return false;
+          const sim = wordSetSimilarity(translatedTitle, pageTitle);
+          return sim >= bestSimilarity - 0.05;
+        });
+        if (allMatches.length >= 2) {
+          let bestPathScore = -1;
+          let bestPathUrl: string | null = null;
+          let pathTied = 0;
+          for (const url of allMatches) {
+            try {
+              const urlSegs = new Set(new URL(url).pathname.split("/").filter(Boolean).map(s => normalizeSegment(s)));
+              let shared = 0;
+              for (const s of sourceSegments) { if (urlSegs.has(s)) shared++; }
+              if (shared > bestPathScore) {
+                bestPathScore = shared;
+                bestPathUrl = url;
+                pathTied = 1;
+              } else if (shared === bestPathScore) {
+                pathTied++;
+              }
+            } catch {}
+          }
+          if (pathTied === 1 && bestPathUrl && bestPathScore > 0) {
+            log(`    Title match DISAMBIGUATED (path segments): "${translatedTitle}" -> ${bestPathUrl} (${bestPathScore} shared segs)`);
+            return {
+              url: bestPathUrl,
+              confidence: 78,
+              method: "title-disambig",
+              similarity: bestSimilarity,
+            };
+          }
+        }
+      }
       log(`    Title match REJECTED (ambiguous): "${translatedTitle}" best=${bestSimilarity.toFixed(3)} second=${secondBestSimilarity.toFixed(3)} gap=${gap.toFixed(3)}`);
       return null;
     }
@@ -1564,25 +1667,25 @@ export async function titleMatchUnmatched(
         }
       } catch {}
 
-      if (enMatch && enMatch.similarity < 0.75) {
-        log(`    Paired EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.75): "${enMatch.url}"`);
+      if (enMatch && enMatch.similarity < 0.60) {
+        log(`    Paired EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.60): "${enMatch.url}"`);
         enMatch = null;
         rejected.crossValidation++;
       }
-      if (frMatch && frMatch.similarity < 0.75) {
-        log(`    Paired FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.75): "${frMatch.url}"`);
+      if (frMatch && frMatch.similarity < 0.60) {
+        log(`    Paired FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.60): "${frMatch.url}"`);
         frMatch = null;
         rejected.crossValidation++;
       }
     } else if (enMatch && !frMatch) {
-      if (enMatch.similarity < 0.80) {
-        log(`    Single-lang EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.80): "${enMatch.url}"`);
+      if (enMatch.similarity < 0.65) {
+        log(`    Single-lang EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.65): "${enMatch.url}"`);
         enMatch = null;
         rejected.crossValidation++;
       }
     } else if (frMatch && !enMatch) {
-      if (frMatch.similarity < 0.80) {
-        log(`    Single-lang FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.80): "${frMatch.url}"`);
+      if (frMatch.similarity < 0.65) {
+        log(`    Single-lang FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.65): "${frMatch.url}"`);
         frMatch = null;
         rejected.crossValidation++;
       }
@@ -1705,6 +1808,7 @@ export async function aiMatchUnmatched(
   const usedEnUrls = new Set<string>(knownEnUrls);
   const usedFrUrls = new Set<string>(knownFrUrls);
   let aiMatches = 0;
+  let consecutiveAuthFailures = 0;
 
   for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
     const batch = batches[batchIdx];
@@ -1784,6 +1888,7 @@ Return ONLY the JSON array, no other text.`;
             max_completion_tokens: 8192,
           });
           content = response.choices[0]?.message?.content || null;
+          consecutiveAuthFailures = 0;
           break;
         } catch (retryErr: any) {
           const status = retryErr?.status || retryErr?.response?.status;
@@ -1799,6 +1904,11 @@ Return ONLY the JSON array, no other text.`;
 
       if (!content) {
         log(`    AI batch ${batchIdx + 1}/${batches.length}: failed after 3 retries (likely auth/rate-limit issue)`);
+        consecutiveAuthFailures++;
+        if (consecutiveAuthFailures >= 3) {
+          log(`  AI matching ABORTED: ${consecutiveAuthFailures} consecutive batches failed with auth errors. Skipping remaining ${batches.length - batchIdx - 1} batches.`);
+          break;
+        }
         continue;
       }
 

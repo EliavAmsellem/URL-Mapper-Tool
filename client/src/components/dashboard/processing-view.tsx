@@ -1,8 +1,8 @@
 import { motion } from "framer-motion";
-import { Check, Loader2, Search, GitMerge, Save, Brain } from "lucide-react";
+import { Check, Loader2, Search, GitMerge, Save, Brain, Square } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useEffect, useState, useRef } from "react";
-import { getJobStatus, type JobStatus } from "@/lib/api";
+import { getJobStatus, stopJob, type JobStatus } from "@/lib/api";
 
 interface ProcessingViewProps {
   jobId: string;
@@ -75,10 +75,12 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
           setLogs(prev => [`Found ${diff} new matches (${status.matchedUrls} total)`, ...prev].slice(0, 10));
         }
 
-        if (status.status === "completed" || status.status === "error") {
+        if (status.status === "completed" || status.status === "error" || status.status === "cancelled") {
           if (pollRef.current) clearInterval(pollRef.current);
           if (status.status === "completed") {
             setLogs(prev => [`Completed! ${status.matchedUrls} matches found across ${status.totalUrls} URLs`, ...prev].slice(0, 10));
+          } else if (status.status === "cancelled") {
+            setLogs(prev => [`Job stopped. ${status.matchedUrls} matches found so far.`, ...prev].slice(0, 10));
           }
           setTimeout(onComplete, 1000);
         }
@@ -181,9 +183,26 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
         </div>
 
         {job && (
-          <div className="flex justify-between text-sm text-muted-foreground">
+          <div className="flex justify-between items-center text-sm text-muted-foreground">
             <span data-testid="text-matches">Matches found: <strong className="text-foreground">{job.matchedUrls}</strong></span>
-            <span>File: <strong className="text-foreground">{job.fileName}</strong></span>
+            <div className="flex items-center gap-3">
+              <span>File: <strong className="text-foreground">{job.fileName}</strong></span>
+              {job.status === "processing" && (
+                <button
+                  data-testid="button-stop-job"
+                  onClick={async () => {
+                    try {
+                      await stopJob(jobId);
+                      setLogs(prev => ["Stopping job...", ...prev].slice(0, 10));
+                    } catch {}
+                  }}
+                  className="px-3 py-1 text-xs font-medium bg-destructive/10 text-destructive border border-destructive/20 rounded-md hover:bg-destructive/20 transition-colors flex items-center gap-1"
+                >
+                  <Square className="w-3 h-3" />
+                  Stop
+                </button>
+              )}
+            </div>
           </div>
         )}
       </div>

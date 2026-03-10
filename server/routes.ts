@@ -119,6 +119,25 @@ export async function registerRoutes(
     }
   });
 
+  app.post("/api/jobs/:id/stop", async (req: Request, res: Response) => {
+    try {
+      const jobId = req.params.id as string;
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+
+      const control = activeJobs.get(jobId);
+      if (control) {
+        control.cancel = true;
+        activeJobs.delete(jobId);
+      }
+      await storage.updateJob(jobId, { status: "cancelled", currentStep: "done" });
+      log(`Job ${jobId} stopped by user`);
+      res.json({ message: "Job stopped" });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
   app.get("/api/jobs/:id", async (req: Request, res: Response) => {
     try {
       const job = await storage.getJob(req.params.id as string);
@@ -401,6 +420,11 @@ async function matchTab(
   const unmatchedForHead: { index: number; lang: "en" | "fr"; constructedUrl: string; sourceUrl: string }[] = [];
   let debugSamples = 0;
   const MAX_DEBUG_SAMPLES = 5;
+  const methodCounts: Record<string, number> = {};
+  let inventoryMatchCount = 0;
+  let inventoryMissCount = 0;
+  let dedupBlockedCount = 0;
+
   for (const row of needsMatching) {
     if (control.cancel) break;
     const result: BatchMatchResult = {
@@ -416,7 +440,10 @@ async function matchTab(
         result.confidenceEn = match.confidence;
         result.matchMethodEn = match.method;
         usedEnUrls.add(match.url);
+        methodCounts[match.method] = (methodCounts[match.method] || 0) + 1;
+        inventoryMatchCount++;
       } else {
+        if (match) dedupBlockedCount++; else inventoryMissCount++;
         const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
         if (debugSamples < MAX_DEBUG_SAMPLES) {
           const reason = match ? `dedup-blocked (${match.url})` : "not-in-inventory";
@@ -442,7 +469,10 @@ async function matchTab(
         result.confidenceFr = match.confidence;
         result.matchMethodFr = match.method;
         usedFrUrls.add(match.url);
+        methodCounts[match.method] = (methodCounts[match.method] || 0) + 1;
+        inventoryMatchCount++;
       } else {
+        if (match) dedupBlockedCount++; else inventoryMissCount++;
         const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
         if (untranslated && !usedFrUrls.has(untranslated)) {
           unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: untranslated, sourceUrl: row.sourceUrl });
@@ -455,6 +485,10 @@ async function matchTab(
 
     matchResults.set(row.rowIndex, result);
   }
+
+  const methodSummary = Object.entries(methodCounts).sort((a, b) => b[1] - a[1]).map(([m, c]) => `${m}:${c}`).join(", ");
+  log(`  Pattern+Crawl stage: ${inventoryMatchCount} matched (${methodSummary || "none"}), ${inventoryMissCount} missed, ${dedupBlockedCount} dedup-blocked`);
+  log(`  HEAD candidates: ${unmatchedForHead.length} URLs to verify`);
 
   const asciiOnly = unmatchedForHead.filter(u => {
     try {

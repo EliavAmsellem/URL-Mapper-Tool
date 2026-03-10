@@ -65,6 +65,14 @@ export async function getJobResults(jobId: string): Promise<MappingResultRow[]> 
   return res.json();
 }
 
+export async function stopJob(jobId: string): Promise<void> {
+  const res = await fetch(`/api/jobs/${jobId}/stop`, { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.message || "Failed to stop job");
+  }
+}
+
 export function getDownloadUrl(jobId: string): string {
   return `/api/jobs/${jobId}/download`;
 }
