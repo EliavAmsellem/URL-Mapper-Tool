@@ -115,7 +115,8 @@ Matching strategies are tried in this order:
 - This eliminates the need for manual download→re-upload cycles to improve match rates
 
 #### Key Data Structures
-- `TabPatterns`: Contains `enRoot`, `frRoot`, `enSrcRoot`, `frSrcRoot`, `segmentMap`, `patternValidated`
+- `TabPatterns`: Contains `enRoot`, `frRoot`, `enSrcRoot`, `frSrcRoot`, `segmentMap`, `rootMappings`, `patternValidated`
+- `rootMappings`: Per-pair root mappings (`Map<lang, Array<{sourceRoot, targetRoot}>>`) — stores ALL unique source→target root pairs from reference rows, not just the common prefix. Used by `constructTargetUrl` and `matchAgainstInventory` to select the most specific root mapping for each source URL (longest prefix match). This handles cases where different subsections have different root structures (e.g., `AVTALA_HB`→`Unemployment` vs `contact_us`→`Public%20Inquiries`)
 - `RootMapping`: Contains `sourceRoot` and `targetRoot` arrays
 - Patterns are auto-trusted when derived from reference rows (no sample validation needed)
 

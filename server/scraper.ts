@@ -19,6 +19,7 @@ export interface TabPatterns {
   enCrawlScope: string[];
   frCrawlScope: string[];
   segmentMap: Map<string, Map<string, string>>;
+  rootMappings: Map<string, Array<{ sourceRoot: string[]; targetRoot: string[] }>>;
   patternValidated: { en: boolean; fr: boolean };
 }
 
@@ -127,10 +128,14 @@ export function learnTabPatterns(
   const enMapping = computeRootMapping(enPairs, segmentMap.get("en")!);
   const frMapping = computeRootMapping(frPairs, segmentMap.get("fr")!);
 
-  const enRoot = enMapping ? enMapping.targetRoot : [];
-  const frRoot = frMapping ? frMapping.targetRoot : [];
-  const enSrcRoot = enMapping ? enMapping.sourceRoot : [];
-  const frSrcRoot = frMapping ? frMapping.sourceRoot : [];
+  const enRoot = enMapping ? enMapping.common.targetRoot : [];
+  const frRoot = frMapping ? frMapping.common.targetRoot : [];
+  const enSrcRoot = enMapping ? enMapping.common.sourceRoot : [];
+  const frSrcRoot = frMapping ? frMapping.common.sourceRoot : [];
+
+  const rootMappings = new Map<string, Array<{ sourceRoot: string[]; targetRoot: string[] }>>();
+  rootMappings.set("en", enMapping ? enMapping.perPair : []);
+  rootMappings.set("fr", frMapping ? frMapping.perPair : []);
 
   let enCrawlScope = enPairs.length > 0
     ? findCommonPrefix(enPairs.map((p) => p.tgt))
@@ -150,6 +155,10 @@ export function learnTabPatterns(
   if (frMapping) log(`  FR: /${frSrcRoot.join("/") || "*"}/ → /${frRoot.join("/")}/`);
   if (enCrawlScope.length > enRoot.length) log(`  EN crawl scope: /${enCrawlScope.join("/")}/`);
   if (frCrawlScope.length > frRoot.length) log(`  FR crawl scope: /${frCrawlScope.join("/")}/`);
+  const enPairCount = rootMappings.get("en")?.length || 0;
+  const frPairCount = rootMappings.get("fr")?.length || 0;
+  if (enPairCount > 1) log(`  EN per-pair root mappings: ${enPairCount} unique`);
+  if (frPairCount > 1) log(`  FR per-pair root mappings: ${frPairCount} unique`);
   const enSeg = segmentMap.get("en")?.size || 0;
   const frSeg = segmentMap.get("fr")?.size || 0;
   log(`  Segment translations: ${enSeg} EN, ${frSeg} FR`);
@@ -161,6 +170,7 @@ export function learnTabPatterns(
     enCrawlScope,
     frCrawlScope,
     segmentMap,
+    rootMappings,
     patternValidated: { en: false, fr: false },
   };
 }
@@ -180,11 +190,12 @@ function stripSuffix(parts: string[]): string[] {
 function computeRootMapping(
   pairs: { src: string[]; tgt: string[] }[],
   segMap: Map<string, string>
-): RootMapping | null {
+): { common: RootMapping; perPair: Array<{ sourceRoot: string[]; targetRoot: string[] }> } | null {
   if (pairs.length === 0) return null;
 
   const srcRoots: string[][] = [];
   const tgtRoots: string[][] = [];
+  const pairRoots: Array<{ sourceRoot: string[]; targetRoot: string[] }> = [];
 
   for (const pair of pairs) {
     const { src, tgt } = pair;
@@ -204,8 +215,12 @@ function computeRootMapping(
     const srcRootLen = src.length - tailMatches;
     const tgtRootLen = tgt.length - tailMatches;
 
-    srcRoots.push(src.slice(0, srcRootLen));
-    tgtRoots.push(tgt.slice(0, tgtRootLen));
+    const pairSrcRoot = src.slice(0, srcRootLen);
+    const pairTgtRoot = tgt.slice(0, tgtRootLen);
+
+    srcRoots.push(pairSrcRoot);
+    tgtRoots.push(pairTgtRoot);
+    pairRoots.push({ sourceRoot: pairSrcRoot, targetRoot: pairTgtRoot });
 
     const minRootLen = Math.min(srcRootLen, tgtRootLen);
     for (let i = 0; i < minRootLen; i++) {
@@ -236,9 +251,34 @@ function computeRootMapping(
 
   if (commonTgtRoot.length === 0 && commonSrcRoot.length === 0) return null;
 
+  const seen = new Set<string>();
+  const uniquePairRoots: Array<{ sourceRoot: string[]; targetRoot: string[] }> = [];
+  for (const pr of pairRoots) {
+    const key = pr.sourceRoot.map(s => normalizeSegment(s)).join("/") + "||" + pr.targetRoot.map(s => normalizeSegment(s)).join("/");
+    if (!seen.has(key)) {
+      seen.add(key);
+      uniquePairRoots.push(pr);
+    }
+  }
+
+  const commonSrcNorms = new Set(commonSrcRoot.map(s => normalizeSegment(s)));
+  const keysToRemove: string[] = [];
+  for (const [key, value] of segMap.entries()) {
+    if (commonSrcNorms.has(key)) {
+      const valueNorm = normalizeSegment(value);
+      const isInCommonTarget = commonTgtRoot.some(s => normalizeSegment(s) === valueNorm);
+      if (!isInCommonTarget) {
+        keysToRemove.push(key);
+      }
+    }
+  }
+  for (const key of keysToRemove) {
+    segMap.delete(key);
+  }
+
   return {
-    sourceRoot: commonSrcRoot,
-    targetRoot: commonTgtRoot,
+    common: { sourceRoot: commonSrcRoot, targetRoot: commonTgtRoot },
+    perPair: uniquePairRoots,
   };
 }
 
@@ -271,19 +311,43 @@ export function constructTargetUrl(
     const pathParts = parsed.pathname.split("/").filter(Boolean);
     if (pathParts.length === 0) return { translated: null, untranslated: null };
 
-    const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
-    const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
-    if (targetRoot.length === 0) return { translated: null, untranslated: null };
+    const commonTargetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
+    const commonSourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
+    if (commonTargetRoot.length === 0) return { translated: null, untranslated: null };
 
     const segments = tabPatterns.segmentMap.get(lang);
-
     const cleanParts = stripSuffix(pathParts);
 
+    let targetRoot = commonTargetRoot;
     let remaining: string[];
-    if (sourceRoot.length > 0) {
+
+    const pairMappings = tabPatterns.rootMappings.get(lang) || [];
+    let bestMapping: { sourceRoot: string[]; targetRoot: string[] } | null = null;
+    let bestMatchLen = 0;
+
+    for (const mapping of pairMappings) {
+      if (mapping.sourceRoot.length <= bestMatchLen) continue;
       let matchLen = 0;
-      for (let i = 0; i < sourceRoot.length && i < cleanParts.length; i++) {
-        if (normalizeSegment(cleanParts[i]) === normalizeSegment(sourceRoot[i])) {
+      for (let i = 0; i < mapping.sourceRoot.length && i < cleanParts.length; i++) {
+        if (normalizeSegment(cleanParts[i]) === normalizeSegment(mapping.sourceRoot[i])) {
+          matchLen++;
+        } else {
+          break;
+        }
+      }
+      if (matchLen === mapping.sourceRoot.length && matchLen > bestMatchLen) {
+        bestMapping = mapping;
+        bestMatchLen = matchLen;
+      }
+    }
+
+    if (bestMapping && bestMatchLen > commonSourceRoot.length) {
+      targetRoot = bestMapping.targetRoot;
+      remaining = cleanParts.slice(bestMatchLen);
+    } else if (commonSourceRoot.length > 0) {
+      let matchLen = 0;
+      for (let i = 0; i < commonSourceRoot.length && i < cleanParts.length; i++) {
+        if (normalizeSegment(cleanParts[i]) === normalizeSegment(commonSourceRoot[i])) {
           matchLen++;
         } else {
           break;
@@ -752,6 +816,37 @@ function validateSectionContext(
   const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
   const segments = tabPatterns.segmentMap.get(lang);
 
+  const pairMappings = tabPatterns.rootMappings.get(lang) || [];
+
+  try {
+    const sourceParts = new URL(sourceUrl).pathname.split("/").filter(Boolean);
+    const cleanSrc = stripSuffix(sourceParts);
+
+    let bestPairTgtRoot: string[] | null = null;
+    let bestPairMatchLen = 0;
+
+    for (const mapping of pairMappings) {
+      if (mapping.sourceRoot.length <= bestPairMatchLen) continue;
+      let matchLen = 0;
+      for (let i = 0; i < mapping.sourceRoot.length && i < cleanSrc.length; i++) {
+        if (normalizeSegment(cleanSrc[i]) === normalizeSegment(mapping.sourceRoot[i])) {
+          matchLen++;
+        } else break;
+      }
+      if (matchLen === mapping.sourceRoot.length && matchLen > bestPairMatchLen) {
+        bestPairTgtRoot = mapping.targetRoot;
+        bestPairMatchLen = matchLen;
+      }
+    }
+
+    if (bestPairTgtRoot && bestPairMatchLen > sourceRoot.length) {
+      const candidateParts = new URL(candidateUrl).pathname.split("/").filter(Boolean);
+      const candidateNorm = candidateParts.slice(0, bestPairTgtRoot.length).map(s => normalizeSegment(s)).join("/");
+      const pairTgtNorm = bestPairTgtRoot.map(s => normalizeSegment(s)).join("/");
+      return candidateNorm === pairTgtNorm;
+    }
+  } catch {}
+
   const srcSection = getSourceSectionSegment(sourceUrl, sourceRoot);
   if (!srcSection) return true;
 
@@ -859,11 +954,32 @@ export function matchAgainstInventory(
     const srcParts = parsed.pathname.split("/").filter(Boolean);
     const cleanSrc = stripSuffix(srcParts);
 
-    let srcTailParts: string[];
-    if (sourceRoot.length > 0) {
+    const pairMappings = tabPatterns.rootMappings.get(lang) || [];
+    let bestPairSrcRoot = sourceRoot;
+    let bestPairTgtRoot = targetRoot;
+    let bestPairMatchLen = 0;
+
+    for (const mapping of pairMappings) {
+      if (mapping.sourceRoot.length <= bestPairMatchLen) continue;
       let matchLen = 0;
-      for (let i = 0; i < sourceRoot.length && i < cleanSrc.length; i++) {
-        if (normalizeSegment(cleanSrc[i]) === normalizeSegment(sourceRoot[i])) {
+      for (let i = 0; i < mapping.sourceRoot.length && i < cleanSrc.length; i++) {
+        if (normalizeSegment(cleanSrc[i]) === normalizeSegment(mapping.sourceRoot[i])) {
+          matchLen++;
+        } else break;
+      }
+      if (matchLen === mapping.sourceRoot.length && matchLen > bestPairMatchLen) {
+        bestPairSrcRoot = mapping.sourceRoot;
+        bestPairTgtRoot = mapping.targetRoot;
+        bestPairMatchLen = matchLen;
+      }
+    }
+
+    let srcTailParts: string[];
+    const effectiveSrcRoot = bestPairMatchLen > sourceRoot.length ? bestPairSrcRoot : sourceRoot;
+    if (effectiveSrcRoot.length > 0) {
+      let matchLen = 0;
+      for (let i = 0; i < effectiveSrcRoot.length && i < cleanSrc.length; i++) {
+        if (normalizeSegment(cleanSrc[i]) === normalizeSegment(effectiveSrcRoot[i])) {
           matchLen++;
         } else break;
       }
@@ -872,10 +988,12 @@ export function matchAgainstInventory(
       srcTailParts = cleanSrc;
     }
 
-    if (targetRoot.length > 0 && srcTailParts.length >= 1) {
+    const effectiveTgtRoot = bestPairMatchLen > sourceRoot.length ? bestPairTgtRoot : targetRoot;
+
+    if (effectiveTgtRoot.length > 0 && srcTailParts.length >= 1) {
       const lastSeg = normalizeSegment(srcTailParts[srcTailParts.length - 1]);
       if (lastSeg && lastSeg !== "pages") {
-        const targetRootNorm = targetRoot.map(s => normalizeSegment(s)).join("/");
+        const tgtRootNorm = effectiveTgtRoot.map(s => normalizeSegment(s)).join("/");
 
         for (let tailLen = 1; tailLen <= Math.min(srcTailParts.length, 3); tailLen++) {
           const tailKey = srcTailParts.slice(-tailLen).map(s => normalizeSegment(s)).join("/");
@@ -883,8 +1001,8 @@ export function matchAgainstInventory(
           const rootFiltered = candidates.filter(c => {
             try {
               const cParts = new URL(c).pathname.split("/").filter(Boolean);
-              const cRootNorm = cParts.slice(0, targetRoot.length).map(s => normalizeSegment(s)).join("/");
-              return cRootNorm === targetRootNorm;
+              const cRootNorm = cParts.slice(0, effectiveTgtRoot.length).map(s => normalizeSegment(s)).join("/");
+              return cRootNorm === tgtRootNorm;
             } catch { return false; }
           });
 
