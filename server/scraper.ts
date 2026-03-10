@@ -25,8 +25,9 @@ export interface TabPatterns {
 
 const urlExistenceCache = new Map<string, boolean>();
 const translationCache = new Map<string, string>();
-const HEAD_CONCURRENCY = 50;
-const HEAD_TIMEOUT = 3000;
+const HEAD_CONCURRENCY = 10;
+const HEAD_TIMEOUT = 12000;
+const HEAD_BATCH_DELAY = 200;
 
 export function clearCaches() {
   urlExistenceCache.clear();
@@ -77,6 +78,9 @@ export async function batchHeadCheck(urls: string[]): Promise<Map<string, boolea
     );
     for (const { url, exists } of checks) {
       results.set(url, exists);
+    }
+    if (i + HEAD_CONCURRENCY < uncached.length) {
+      await new Promise(resolve => setTimeout(resolve, HEAD_BATCH_DELAY));
     }
   }
   return results;

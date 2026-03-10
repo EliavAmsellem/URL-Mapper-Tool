@@ -372,6 +372,19 @@ async function matchTab(
     }
   }
 
+  for (const row of needsMatching) {
+    if (row.needsEn && tabPatterns.enRoot.length > 0) {
+      const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
+      if (untranslated) enSeedUrls.push(untranslated);
+      if (translated && translated !== untranslated) enSeedUrls.push(translated);
+    }
+    if (row.needsFr && tabPatterns.frRoot.length > 0) {
+      const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
+      if (untranslated) frSeedUrls.push(untranslated);
+      if (translated && translated !== untranslated) frSeedUrls.push(translated);
+    }
+  }
+
   const crawlPromises: Promise<void>[] = [];
   if (origin && tabPatterns.enRoot.length > 0) {
     const enScope = tabPatterns.enCrawlScope.length > 0 ? tabPatterns.enCrawlScope : tabPatterns.enRoot;
@@ -381,7 +394,7 @@ async function matchTab(
       log(`  EN directory cached: ${enInventory.urls.size} URLs`);
     } else {
       const uniqueSeeds = Array.from(new Set(enSeedUrls));
-      log(`  Crawling EN directory: /${enScope.join("/")}/  (${uniqueSeeds.length} seed URLs from reference pairs)`);
+      log(`  Crawling EN directory: /${enScope.join("/")}/  (${uniqueSeeds.length} seed URLs incl. source-derived)`);
       crawlPromises.push(
         crawlDirectory(origin, enScope, (c, q) => {
           if (c % 100 === 0) log(`    EN crawl progress: ${c} pages fetched, ${q} queued`);
@@ -398,7 +411,7 @@ async function matchTab(
       log(`  FR directory cached: ${frInventory.urls.size} URLs`);
     } else {
       const uniqueSeeds = Array.from(new Set(frSeedUrls));
-      log(`  Crawling FR directory: /${frScope.join("/")}/  (${uniqueSeeds.length} seed URLs from reference pairs)`);
+      log(`  Crawling FR directory: /${frScope.join("/")}/  (${uniqueSeeds.length} seed URLs incl. source-derived)`);
       crawlPromises.push(
         crawlDirectory(origin, frScope, (c, q) => {
           if (c % 100 === 0) log(`    FR crawl progress: ${c} pages fetched, ${q} queued`);
@@ -502,9 +515,15 @@ async function matchTab(
   }
 
   if (asciiOnly.length > 0) {
-    log(`  Falling back to HEAD checks for ${asciiOnly.length} URLs...`);
+    log(`  Falling back to HEAD checks for ${asciiOnly.length} URLs (timeout: 12s, concurrency: 10)...`);
+    for (let s = 0; s < Math.min(5, asciiOnly.length); s++) {
+      log(`    [HEAD sample] ${asciiOnly[s].sourceUrl} → ${asciiOnly[s].constructedUrl}`);
+    }
     const headUrls = asciiOnly.map((u) => u.constructedUrl);
     const existence = await batchHeadCheck(headUrls);
+    const headVerified = Array.from(existence.values()).filter(v => v).length;
+    const headFailed = Array.from(existence.values()).filter(v => !v).length;
+    log(`  HEAD results: ${headVerified} verified, ${headFailed} failed out of ${existence.size} checked`);
     let headMatched = 0;
     let headDepthRejected = 0;
     const enSrcRoot = tabPatterns.enSrcRoot;
