@@ -70,7 +70,9 @@ For each source URL needing a target, TWO candidate URLs are constructed:
 Segment translations in root mappings are aligned from the END of root arrays backward, ensuring correct alignment when source and target roots have different segment counts.
 
 #### Step 3: Crawl Inventory Matching (Priority Order)
-Directory crawling builds an inventory of all URLs in target language sections (up to 3000 pages per section). The crawler is seeded with URLs extracted from reference pairs (the reference URL itself, its parent directory, and its Pages/default.aspx) to discover deeply nested subsections that might not be reachable from the root alone. Only seeds matching the crawl scope origin and prefix are accepted.
+Directory crawling builds an inventory of all URLs in target language sections (up to 3000 pages per section). The crawler is seeded with URLs extracted from reference pairs (the reference URL itself, its parent directory, the section's `Pages/` directory, `Pages/default.aspx`, and `Pages/Forms/AllItems.aspx`) to discover deeply nested subsections that might not be reachable from the root alone. Only seeds matching the crawl scope origin and prefix are accepted.
+
+**SharePoint directory discovery**: When the crawler encounters a URL ending in `Pages/default.aspx`, it automatically also queues the `Pages/` directory listing and `Pages/Forms/AllItems.aspx` (SharePoint's library view) for crawling. This discovers sub-pages in SharePoint sections where the landing page doesn't link to its children.
 
 **Global Deduplication**: A `usedEnUrls`/`usedFrUrls` set tracks all assigned target URLs across all matching stages. Each target URL can only be assigned to one source URL — subsequent attempts to assign the same target are rejected. This prevents multiple source URLs from incorrectly mapping to the same target page.
 

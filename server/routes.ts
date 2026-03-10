@@ -314,23 +314,41 @@ async function matchTab(
     if (ref.enUrl) {
       try {
         const enParsed = new URL(ref.enUrl);
-        const parentPath = enParsed.pathname.split("/").filter(Boolean).slice(0, -1);
+        const pathSegs = enParsed.pathname.split("/").filter(Boolean);
+        const parentPath = pathSegs.slice(0, -1);
         const parentUrl = enParsed.origin + "/" + parentPath.join("/") + "/";
         enSeedUrls.push(ref.enUrl);
         enSeedUrls.push(parentUrl);
-        const defaultUrl = enParsed.origin + "/" + parentPath.join("/") + "/Pages/default.aspx";
-        enSeedUrls.push(defaultUrl);
+        const pagesIdx = parentPath.findIndex(s => s.toLowerCase() === "pages");
+        if (pagesIdx >= 0) {
+          const sectionPath = parentPath.slice(0, pagesIdx);
+          const sectionPagesDir = enParsed.origin + "/" + sectionPath.join("/") + "/Pages/";
+          enSeedUrls.push(sectionPagesDir);
+          enSeedUrls.push(sectionPagesDir + "default.aspx");
+          enSeedUrls.push(sectionPagesDir + "Forms/AllItems.aspx");
+        } else {
+          enSeedUrls.push(enParsed.origin + "/" + parentPath.join("/") + "/Pages/default.aspx");
+        }
       } catch {}
     }
     if (ref.frUrl) {
       try {
         const frParsed = new URL(ref.frUrl);
-        const parentPath = frParsed.pathname.split("/").filter(Boolean).slice(0, -1);
+        const pathSegs = frParsed.pathname.split("/").filter(Boolean);
+        const parentPath = pathSegs.slice(0, -1);
         const parentUrl = frParsed.origin + "/" + parentPath.join("/") + "/";
         frSeedUrls.push(ref.frUrl);
         frSeedUrls.push(parentUrl);
-        const defaultUrl = frParsed.origin + "/" + parentPath.join("/") + "/Pages/default.aspx";
-        frSeedUrls.push(defaultUrl);
+        const pagesIdx = parentPath.findIndex(s => s.toLowerCase() === "pages");
+        if (pagesIdx >= 0) {
+          const sectionPath = parentPath.slice(0, pagesIdx);
+          const sectionPagesDir = frParsed.origin + "/" + sectionPath.join("/") + "/Pages/";
+          frSeedUrls.push(sectionPagesDir);
+          frSeedUrls.push(sectionPagesDir + "default.aspx");
+          frSeedUrls.push(sectionPagesDir + "Forms/AllItems.aspx");
+        } else {
+          frSeedUrls.push(frParsed.origin + "/" + parentPath.join("/") + "/Pages/default.aspx");
+        }
       } catch {}
     }
   }

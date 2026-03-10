@@ -637,6 +637,22 @@ export async function crawlDirectory(
             queue.push(link);
           }
         }
+
+        try {
+          const parsed = new URL(url);
+          const lowerPath = parsed.pathname.toLowerCase();
+          if (lowerPath.endsWith("/pages/default.aspx") || lowerPath.endsWith("/pages/")) {
+            const pagesDir = parsed.pathname.replace(/default\.aspx$/i, "");
+            const pagesDirUrl = parsed.origin + pagesDir;
+            if (!visited.has(pagesDirUrl)) {
+              queue.push(pagesDirUrl);
+            }
+            const allItemsUrl = parsed.origin + pagesDir + "Forms/AllItems.aspx";
+            if (!visited.has(allItemsUrl)) {
+              queue.push(allItemsUrl);
+            }
+          }
+        } catch {}
       }
     }
 
