@@ -1493,7 +1493,7 @@ export function matchByTitle(
     if (gap < 0.05 && bestSimilarity < 0.95) {
       if (sourceSegments && sourceSegments.size > 0) {
         const allMatches = Array.from(inventory.urls).filter(url => {
-          const pageTitle = inventory.titles.get(url);
+          const pageTitle = inventory.titleIndex.get(url);
           if (!pageTitle) return false;
           const sim = wordSetSimilarity(translatedTitle, pageTitle);
           return sim >= bestSimilarity - 0.05;
