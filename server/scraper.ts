@@ -347,6 +347,10 @@ export function constructTargetUrl(
       if (targetRoot.length > 0 && targetRoot[targetRoot.length - 1].toLowerCase().endsWith(".aspx") && remaining.length > 0) {
         targetRoot = targetRoot.slice(0, -1);
       }
+      while (remaining.length > 0 && targetRoot.length > 0 &&
+        normalizeSegment(remaining[0]) === normalizeSegment(targetRoot[targetRoot.length - 1])) {
+        remaining = remaining.slice(1);
+      }
     } else if (commonSourceRoot.length > 0) {
       let matchLen = 0;
       for (let i = 0; i < commonSourceRoot.length && i < cleanParts.length; i++) {
