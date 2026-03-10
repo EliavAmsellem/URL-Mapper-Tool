@@ -359,8 +359,14 @@ async function matchTab(
         result.confidenceEn = match.confidence;
         result.matchMethodEn = match.method;
       } else {
-        const constructed = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
-        if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: constructed, sourceUrl: row.sourceUrl });
+        const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
+        const constructed = translated || untranslated;
+        if (constructed) {
+          unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: constructed, sourceUrl: row.sourceUrl });
+          if (untranslated && untranslated !== constructed) {
+            unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: untranslated, sourceUrl: row.sourceUrl });
+          }
+        }
       }
     }
 
@@ -371,8 +377,14 @@ async function matchTab(
         result.confidenceFr = match.confidence;
         result.matchMethodFr = match.method;
       } else {
-        const constructed = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
-        if (constructed) unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: constructed, sourceUrl: row.sourceUrl });
+        const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
+        const constructed = translated || untranslated;
+        if (constructed) {
+          unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: constructed, sourceUrl: row.sourceUrl });
+          if (untranslated && untranslated !== constructed) {
+            unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: untranslated, sourceUrl: row.sourceUrl });
+          }
+        }
       }
     }
 

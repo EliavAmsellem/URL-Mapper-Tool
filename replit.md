@@ -62,20 +62,23 @@ Example: Source `/HaravotBarzel1/Harada_HB/Pages/` → EN `/English%20Homepage/U
 - Target root: `English%20Homepage/Updates-security-situation`
 - Tail match: `Harada_HB/Pages`
 
-#### Step 2: URL Construction
-For each source URL needing a target:
-1. Strip `default.aspx` suffix
-2. Replace source root segments with target root segments
-3. Apply segment-level translations to remaining path parts
-4. Construct full target URL
+#### Step 2: URL Construction (Dual Candidate)
+For each source URL needing a target, TWO candidate URLs are constructed:
+1. **Untranslated (direct)**: Strip source root, prepend target root, keep all remaining segments as-is — handles cases where path segments (like `Atzmai.aspx`) are identical across languages
+2. **Translated**: Same as above but applies learned segment translations to remaining path parts — handles cases where subsection names differ (e.g., `AVTALA_HB` → `Unemployment`)
 
-#### Step 3: Crawl Inventory Matching
-- Directory crawling builds an inventory of all URLs in target language sections
-- Exact match against constructed URLs (confidence 95)
-- Normalized path matching (confidence 93)
-- Tail-segment matching from the end of URL paths (confidence 85-88)
-- Segment fuzzy matching using word-overlap Jaccard similarity (confidence 80-90)
-- Translated segment matching using learned segment translations (confidence 86)
+Segment translations in root mappings are aligned from the END of root arrays backward, ensuring correct alignment when source and target roots have different segment counts.
+
+#### Step 3: Crawl Inventory Matching (Priority Order)
+Directory crawling builds an inventory of all URLs in target language sections. Matching strategies are tried in this order:
+1. **Direct pattern+crawl**: Untranslated constructed URL found in inventory (confidence 96)
+2. **Direct pattern+crawl normalized**: Untranslated URL matches after normalization (confidence 94)
+3. **Translated pattern+crawl**: Translated constructed URL found in inventory (confidence 95)
+4. **Translated pattern+crawl normalized**: Translated URL matches after normalization (confidence 93)
+5. **Root-anchored tail match**: Filter inventory to URLs sharing the target root prefix, then match by last 1-3 segments of the source URL (confidence 92) — disambiguates same-named pages across different site sections
+6. **Tail-segment matching**: Match by last 1-2 segments across full inventory, filtered by section context (confidence 85-88)
+7. **Translated segment matching**: Translate path segments then match tails (confidence 86)
+8. **Segment fuzzy matching**: Word-overlap Jaccard similarity on last segment (confidence 80-90)
 
 #### Step 4: Batch HEAD Verification
 - All constructed URLs are verified with HTTP HEAD requests (50 concurrent, 3s timeout)

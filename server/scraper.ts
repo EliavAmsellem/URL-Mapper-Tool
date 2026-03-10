@@ -265,15 +265,15 @@ export function constructTargetUrl(
   sourceUrl: string,
   lang: "en" | "fr",
   tabPatterns: TabPatterns
-): string | null {
+): { translated: string | null; untranslated: string | null } {
   try {
     const parsed = new URL(sourceUrl);
     const pathParts = parsed.pathname.split("/").filter(Boolean);
-    if (pathParts.length === 0) return null;
+    if (pathParts.length === 0) return { translated: null, untranslated: null };
 
     const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
     const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
-    if (targetRoot.length === 0) return null;
+    if (targetRoot.length === 0) return { translated: null, untranslated: null };
 
     const segments = tabPatterns.segmentMap.get(lang);
 
@@ -294,16 +294,23 @@ export function constructTargetUrl(
       remaining = cleanParts;
     }
 
+    const untranslated = parsed.origin + "/" + [...targetRoot, ...remaining].join("/");
+
     const translatedParts = remaining.map((part) => {
       if (!segments) return part;
       const norm = normalizeSegment(part);
       return segments.has(norm) ? segments.get(norm)! : part;
     });
 
-    return parsed.origin + "/" + [...targetRoot, ...translatedParts].join("/");
+    const translated = parsed.origin + "/" + [...targetRoot, ...translatedParts].join("/");
+
+    return {
+      translated: translated !== untranslated ? translated : null,
+      untranslated,
+    };
   } catch {}
 
-  return null;
+  return { translated: null, untranslated: null };
 }
 
 export async function validatePatterns(
@@ -314,10 +321,15 @@ export async function validatePatterns(
   const frSamples: string[] = [];
 
   for (const sample of sampleUrls) {
-    const candidate = constructTargetUrl(sample.sourceUrl, sample.lang, tabPatterns);
+    const { translated, untranslated } = constructTargetUrl(sample.sourceUrl, sample.lang, tabPatterns);
+    const candidate = untranslated || translated;
     if (candidate) {
       if (sample.lang === "en") enSamples.push(candidate);
       else frSamples.push(candidate);
+    }
+    if (translated && translated !== candidate) {
+      if (sample.lang === "en") enSamples.push(translated);
+      else frSamples.push(translated);
     }
   }
 
@@ -372,7 +384,8 @@ export function batchConstructUrls(
     };
 
     if (item.needsEn && tabPatterns.patternValidated.en) {
-      const enUrl = constructTargetUrl(item.sourceUrl, "en", tabPatterns);
+      const { translated, untranslated } = constructTargetUrl(item.sourceUrl, "en", tabPatterns);
+      const enUrl = translated || untranslated;
       if (enUrl) {
         result.enUrl = enUrl;
         result.confidenceEn = 90;
@@ -381,7 +394,8 @@ export function batchConstructUrls(
     }
 
     if (item.needsFr && tabPatterns.patternValidated.fr) {
-      const frUrl = constructTargetUrl(item.sourceUrl, "fr", tabPatterns);
+      const { translated, untranslated } = constructTargetUrl(item.sourceUrl, "fr", tabPatterns);
+      const frUrl = translated || untranslated;
       if (frUrl) {
         result.frUrl = frUrl;
         result.confidenceFr = 90;
@@ -794,18 +808,32 @@ export function matchAgainstInventory(
   tabPatterns: TabPatterns,
   inventory: CrawlInventory
 ): { url: string; confidence: number; method: string } | null {
-  const constructedUrl = constructTargetUrl(sourceUrl, lang, tabPatterns);
+  const { untranslated: untranslatedUrl, translated: translatedUrl } = constructTargetUrl(sourceUrl, lang, tabPatterns);
   const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
   const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
 
-  if (constructedUrl) {
-    if (!validateDepthMatch(sourceUrl, constructedUrl, sourceRoot, targetRoot)) {
-      log(`    REJECTED (parent-only, depth mismatch): ${sourceUrl} -> ${constructedUrl}`);
-    } else if (inventory.urls.has(constructedUrl)) {
-      return { url: constructedUrl, confidence: 95, method: "pattern+crawl" };
+  if (untranslatedUrl) {
+    if (!validateDepthMatch(sourceUrl, untranslatedUrl, sourceRoot, targetRoot)) {
+      log(`    REJECTED (depth mismatch, untranslated): ${sourceUrl} -> ${untranslatedUrl}`);
+    } else if (inventory.urls.has(untranslatedUrl)) {
+      return { url: untranslatedUrl, confidence: 96, method: "pattern-direct+crawl" };
     } else {
-      const constructedNorm = normalizeUrlPath(constructedUrl);
-      const inventoryUrl = inventory.normalizedIndex.get(constructedNorm);
+      const norm = normalizeUrlPath(untranslatedUrl);
+      const inventoryUrl = inventory.normalizedIndex.get(norm);
+      if (inventoryUrl) {
+        return { url: inventoryUrl, confidence: 94, method: "pattern-direct+crawl-norm" };
+      }
+    }
+  }
+
+  if (translatedUrl) {
+    if (!validateDepthMatch(sourceUrl, translatedUrl, sourceRoot, targetRoot)) {
+      log(`    REJECTED (depth mismatch, translated): ${sourceUrl} -> ${translatedUrl}`);
+    } else if (inventory.urls.has(translatedUrl)) {
+      return { url: translatedUrl, confidence: 95, method: "pattern+crawl" };
+    } else {
+      const norm = normalizeUrlPath(translatedUrl);
+      const inventoryUrl = inventory.normalizedIndex.get(norm);
       if (inventoryUrl) {
         return { url: inventoryUrl, confidence: 93, method: "pattern+crawl-norm" };
       }
@@ -828,6 +856,31 @@ export function matchAgainstInventory(
       srcTailParts = cleanSrc.slice(matchLen);
     } else {
       srcTailParts = cleanSrc;
+    }
+
+    if (targetRoot.length > 0 && srcTailParts.length >= 1) {
+      const lastSeg = normalizeSegment(srcTailParts[srcTailParts.length - 1]);
+      if (lastSeg && lastSeg !== "pages") {
+        const targetRootNorm = targetRoot.map(s => normalizeSegment(s)).join("/");
+
+        for (let tailLen = 1; tailLen <= Math.min(srcTailParts.length, 3); tailLen++) {
+          const tailKey = srcTailParts.slice(-tailLen).map(s => normalizeSegment(s)).join("/");
+          const candidates = inventory.tailIndex.get(tailKey) || [];
+          const rootFiltered = candidates.filter(c => {
+            try {
+              const cParts = new URL(c).pathname.split("/").filter(Boolean);
+              const cRootNorm = cParts.slice(0, targetRoot.length).map(s => normalizeSegment(s)).join("/");
+              return cRootNorm === targetRootNorm;
+            } catch { return false; }
+          });
+
+          if (rootFiltered.length === 1) {
+            if (validateDepthMatch(sourceUrl, rootFiltered[0], sourceRoot, targetRoot)) {
+              return { url: rootFiltered[0], confidence: 92, method: "root-anchored-tail" };
+            }
+          }
+        }
+      }
     }
 
     if (srcTailParts.length >= 1) {
@@ -885,8 +938,11 @@ export function matchAgainstInventory(
     }
   } catch {}
 
-  if (constructedUrl) {
-    urlExistenceCache.set(constructedUrl, false);
+  if (translatedUrl) {
+    urlExistenceCache.set(translatedUrl, false);
+  }
+  if (untranslatedUrl) {
+    urlExistenceCache.set(untranslatedUrl, false);
   }
 
   return null;
