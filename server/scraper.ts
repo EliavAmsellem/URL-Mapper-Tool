@@ -207,11 +207,14 @@ function computeRootMapping(
     srcRoots.push(src.slice(0, srcRootLen));
     tgtRoots.push(tgt.slice(0, tgtRootLen));
 
-    for (let i = 0; i < srcRootLen && i < tgtRootLen; i++) {
-      const sNorm = normalizeSegment(src[i]);
-      const tNorm = normalizeSegment(tgt[i]);
+    const minRootLen = Math.min(srcRootLen, tgtRootLen);
+    for (let i = 0; i < minRootLen; i++) {
+      const sIdx = srcRootLen - 1 - i;
+      const tIdx = tgtRootLen - 1 - i;
+      const sNorm = normalizeSegment(src[sIdx]);
+      const tNorm = normalizeSegment(tgt[tIdx]);
       if (sNorm !== tNorm) {
-        segMap.set(sNorm, tgt[i]);
+        segMap.set(sNorm, tgt[tIdx]);
       }
     }
 
