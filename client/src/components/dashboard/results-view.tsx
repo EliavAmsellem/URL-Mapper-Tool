@@ -1,7 +1,7 @@
 import { motion } from "framer-motion";
-import { Download, RotateCcw, AlertTriangle, ChevronDown, ChevronUp } from "lucide-react";
+import { Download, RotateCcw } from "lucide-react";
 import { useEffect, useState } from "react";
-import { getJobResults, getJobConflicts, getDownloadUrl, type MappingResultRow, type ReferenceConflict } from "@/lib/api";
+import { getJobResults, getDownloadUrl, type MappingResultRow } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 interface ResultsViewProps {
@@ -11,20 +11,12 @@ interface ResultsViewProps {
 
 export function ResultsView({ jobId, onReset }: ResultsViewProps) {
   const [results, setResults] = useState<MappingResultRow[]>([]);
-  const [conflicts, setConflicts] = useState<ReferenceConflict[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<"all" | "matched" | "unmatched">("all");
-  const [showConflicts, setShowConflicts] = useState(false);
 
   useEffect(() => {
-    Promise.all([
-      getJobResults(jobId),
-      getJobConflicts(jobId),
-    ])
-      .then(([res, conf]) => {
-        setResults(res);
-        setConflicts(conf);
-      })
+    getJobResults(jobId)
+      .then(setResults)
       .catch(console.error)
       .finally(() => setLoading(false));
   }, [jobId]);
@@ -80,57 +72,6 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
           </button>
         ))}
       </div>
-
-      {conflicts.length > 0 && (
-        <motion.div
-          initial={{ opacity: 0, y: -10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="rounded-xl border border-yellow-500/30 bg-yellow-500/5 overflow-hidden shadow-sm"
-          data-testid="panel-conflicts"
-        >
-          <button
-            onClick={() => setShowConflicts(!showConflicts)}
-            className="w-full flex items-center justify-between p-4 hover:bg-yellow-500/10 transition-colors"
-            data-testid="button-toggle-conflicts"
-          >
-            <div className="flex items-center gap-3">
-              <AlertTriangle className="w-5 h-5 text-yellow-500" />
-              <div className="text-left">
-                <p className="text-sm font-medium text-yellow-700 dark:text-yellow-400">
-                  {conflicts.length} reference conflict{conflicts.length !== 1 ? "s" : ""} detected
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  These reference pairs were excluded from pattern learning because their directory mappings conflict with the majority.
-                </p>
-              </div>
-            </div>
-            {showConflicts ? <ChevronUp className="w-4 h-4 text-muted-foreground" /> : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
-          </button>
-          {showConflicts && (
-            <div className="border-t border-yellow-500/20 p-4 space-y-3 max-h-80 overflow-y-auto">
-              {conflicts.map((c, i) => (
-                <div key={i} className="text-xs space-y-1 pb-3 border-b border-yellow-500/10 last:border-0 last:pb-0" data-testid={`conflict-item-${i}`}>
-                  <div className="flex items-center gap-2">
-                    <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase bg-yellow-500/20 text-yellow-700 dark:text-yellow-400">
-                      {c.lang}
-                    </span>
-                    {c.sheetName && (
-                      <span className="text-muted-foreground">Sheet: {c.sheetName}</span>
-                    )}
-                  </div>
-                  <div className="font-mono text-foreground/80">
-                    <span className="text-muted-foreground">Source:</span> {c.sourceUrl}
-                  </div>
-                  <div className="font-mono text-red-500/80">
-                    <span className="text-muted-foreground">Wrong target:</span> {c.targetUrl}
-                  </div>
-                  <div className="text-muted-foreground italic">{c.reason}</div>
-                </div>
-              ))}
-            </div>
-          )}
-        </motion.div>
-      )}
 
       <div className="rounded-xl border border-border bg-card overflow-hidden shadow-sm">
         <div className="overflow-x-auto">

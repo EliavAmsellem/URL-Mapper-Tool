@@ -1,53 +1,168 @@
 import { log } from "./index";
 import * as cheerio from "cheerio";
 import type { IStorage } from "./storage";
-import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 
-export interface DirectoryMapping {
-  sourceDir: string;
-  targetDir: string;
-  lang: "en" | "fr";
-}
-
-export interface ReferenceConflict {
-  sourceUrl: string;
-  targetUrl: string;
-  lang: "en" | "fr";
-  reason: string;
-  expectedTargetDir: string;
-  actualTargetDir: string;
-}
-
-export interface ValidatedReferences {
-  cleanedRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[];
-  conflicts: ReferenceConflict[];
+export interface MatchScore {
+  total: number;
+  slugScore: number;
+  titleScore: number;
+  structureScore: number;
+  method: "slug" | "meta" | "structure" | "mixed" | "pattern";
 }
 
 export interface TabPatterns {
-  directoryMappings: DirectoryMapping[];
-  segmentMap: Map<string, Map<string, string>>;
   enRoot: string[];
   frRoot: string[];
   enSrcRoot: string[];
   frSrcRoot: string[];
+  enCrawlScope: string[];
+  frCrawlScope: string[];
+  segmentMap: Map<string, Map<string, string>>;
+  patternValidated: { en: boolean; fr: boolean };
 }
 
-export interface BatchMatchResult {
-  enUrl: string | null;
-  frUrl: string | null;
-  confidenceEn: number | null;
-  confidenceFr: number | null;
-  matchMethodEn: string | null;
-  matchMethodFr: string | null;
-}
-
+const urlExistenceCache = new Map<string, boolean>();
 const translationCache = new Map<string, string>();
+const HEAD_CONCURRENCY = 50;
+const HEAD_TIMEOUT = 3000;
 
 export function clearCaches() {
+  urlExistenceCache.clear();
 }
 
 export function clearAllCaches() {
+  urlExistenceCache.clear();
   translationCache.clear();
+}
+
+async function headCheck(url: string): Promise<boolean> {
+  if (urlExistenceCache.has(url)) return urlExistenceCache.get(url)!;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), HEAD_TIMEOUT);
+    const response = await fetch(url, {
+      method: "HEAD",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; LinguaMap/1.0; URL Mapper Bot)",
+      },
+      redirect: "follow",
+    });
+    clearTimeout(timeout);
+    const exists = response.ok;
+    urlExistenceCache.set(url, exists);
+    return exists;
+  } catch {
+    urlExistenceCache.set(url, false);
+    return false;
+  }
+}
+
+export async function batchHeadCheck(urls: string[]): Promise<Map<string, boolean>> {
+  const results = new Map<string, boolean>();
+  const uncached: string[] = [];
+  for (const url of urls) {
+    if (urlExistenceCache.has(url)) {
+      results.set(url, urlExistenceCache.get(url)!);
+    } else {
+      uncached.push(url);
+    }
+  }
+  for (let i = 0; i < uncached.length; i += HEAD_CONCURRENCY) {
+    const batch = uncached.slice(i, i + HEAD_CONCURRENCY);
+    const checks = await Promise.all(
+      batch.map(async (url) => ({ url, exists: await headCheck(url) }))
+    );
+    for (const { url, exists } of checks) {
+      results.set(url, exists);
+    }
+  }
+  return results;
+}
+
+export interface RootMapping {
+  sourceRoot: string[];
+  targetRoot: string[];
+}
+
+export function learnTabPatterns(
+  rows: { sourceUrl: string; enUrl?: string; frUrl?: string }[]
+): TabPatterns {
+  const segmentMap = new Map<string, Map<string, string>>();
+  segmentMap.set("en", new Map());
+  segmentMap.set("fr", new Map());
+
+  const enPairs: { src: string[]; tgt: string[] }[] = [];
+  const frPairs: { src: string[]; tgt: string[] }[] = [];
+
+  for (const row of rows) {
+    try {
+      const sourceParsed = new URL(row.sourceUrl);
+      const sourceParts = sourceParsed.pathname.split("/").filter(Boolean);
+      if (sourceParts.length === 0) continue;
+
+      if (row.enUrl) {
+        try {
+          const enParsed = new URL(row.enUrl);
+          if (enParsed.origin === sourceParsed.origin) {
+            const enParts = enParsed.pathname.split("/").filter(Boolean);
+            enPairs.push({ src: stripSuffix(sourceParts), tgt: stripSuffix(enParts) });
+          }
+        } catch {}
+      }
+
+      if (row.frUrl) {
+        try {
+          const frParsed = new URL(row.frUrl);
+          if (frParsed.origin === sourceParsed.origin) {
+            const frParts = frParsed.pathname.split("/").filter(Boolean);
+            frPairs.push({ src: stripSuffix(sourceParts), tgt: stripSuffix(frParts) });
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  const enMapping = computeRootMapping(enPairs, segmentMap.get("en")!);
+  const frMapping = computeRootMapping(frPairs, segmentMap.get("fr")!);
+
+  const enRoot = enMapping ? enMapping.targetRoot : [];
+  const frRoot = frMapping ? frMapping.targetRoot : [];
+  const enSrcRoot = enMapping ? enMapping.sourceRoot : [];
+  const frSrcRoot = frMapping ? frMapping.sourceRoot : [];
+
+  let enCrawlScope = enPairs.length > 0
+    ? findCommonPrefix(enPairs.map((p) => p.tgt))
+    : enRoot;
+  let frCrawlScope = frPairs.length > 0
+    ? findCommonPrefix(frPairs.map((p) => p.tgt))
+    : frRoot;
+  if (enCrawlScope.length > 0 && normalizeSegment(enCrawlScope[enCrawlScope.length - 1]) === "pages") {
+    enCrawlScope = enCrawlScope.slice(0, -1);
+  }
+  if (frCrawlScope.length > 0 && normalizeSegment(frCrawlScope[frCrawlScope.length - 1]) === "pages") {
+    frCrawlScope = frCrawlScope.slice(0, -1);
+  }
+
+  log(`Tab patterns learned:`);
+  if (enMapping) log(`  EN: /${enSrcRoot.join("/") || "*"}/ → /${enRoot.join("/")}/`);
+  if (frMapping) log(`  FR: /${frSrcRoot.join("/") || "*"}/ → /${frRoot.join("/")}/`);
+  if (enCrawlScope.length > enRoot.length) log(`  EN crawl scope: /${enCrawlScope.join("/")}/`);
+  if (frCrawlScope.length > frRoot.length) log(`  FR crawl scope: /${frCrawlScope.join("/")}/`);
+  const enSeg = segmentMap.get("en")?.size || 0;
+  const frSeg = segmentMap.get("fr")?.size || 0;
+  log(`  Segment translations: ${enSeg} EN, ${frSeg} FR`);
+
+  return {
+    enRoot, frRoot,
+    enSrcRoot: enSrcRoot,
+    frSrcRoot: frSrcRoot,
+    enCrawlScope,
+    frCrawlScope,
+    segmentMap,
+    patternValidated: { en: false, fr: false },
+  };
 }
 
 function normalizeSegment(seg: string): string {
@@ -62,65 +177,18 @@ function stripSuffix(parts: string[]): string[] {
   return parts;
 }
 
-function getDirectoryPath(urlStr: string): string {
-  try {
-    const parsed = new URL(urlStr);
-    const parts = parsed.pathname.split("/").filter(Boolean);
-    const clean = stripSuffix(parts);
-    if (clean.length <= 1) return "/" + clean.join("/");
-    return "/" + clean.slice(0, -1).join("/");
-  } catch {
-    return "/";
-  }
-}
-
-function getRelativePath(urlStr: string, rootDir: string): string {
-  try {
-    const parsed = new URL(urlStr);
-    const parts = parsed.pathname.split("/").filter(Boolean);
-    const clean = stripSuffix(parts);
-    const rootParts = rootDir.split("/").filter(Boolean);
-    let matchLen = 0;
-    for (let i = 0; i < rootParts.length && i < clean.length; i++) {
-      if (normalizeSegment(clean[i]) === normalizeSegment(rootParts[i])) {
-        matchLen++;
-      } else {
-        break;
-      }
-    }
-    return clean.slice(matchLen).map(p => normalizeSegment(p)).join("/");
-  } catch {
-    return "";
-  }
-}
-
-function findCommonPrefix(arrays: string[][]): string[] {
-  if (arrays.length === 0) return [];
-  if (arrays.length === 1) return arrays[0].slice();
-  const prefix: string[] = [];
-  const minLen = Math.min(...arrays.map((a) => a.length));
-  for (let i = 0; i < minLen; i++) {
-    const first = normalizeSegment(arrays[0][i]);
-    const allSame = arrays.every((arr) => normalizeSegment(arr[i]) === first);
-    if (allSame) {
-      prefix.push(arrays[0][i]);
-    } else {
-      break;
-    }
-  }
-  return prefix;
-}
-
 function computeRootMapping(
   pairs: { src: string[]; tgt: string[] }[],
   segMap: Map<string, string>
-): { sourceRoot: string[]; targetRoot: string[] } | null {
+): RootMapping | null {
   if (pairs.length === 0) return null;
+
   const srcRoots: string[][] = [];
   const tgtRoots: string[][] = [];
 
   for (const pair of pairs) {
     const { src, tgt } = pair;
+
     let tailMatches = 0;
     const minLen = Math.min(src.length, tgt.length);
     for (let i = 0; i < minLen; i++) {
@@ -132,8 +200,10 @@ function computeRootMapping(
         break;
       }
     }
+
     const srcRootLen = src.length - tailMatches;
     const tgtRootLen = tgt.length - tailMatches;
+
     srcRoots.push(src.slice(0, srcRootLen));
     tgtRoots.push(tgt.slice(0, tgtRootLen));
 
@@ -144,6 +214,7 @@ function computeRootMapping(
         segMap.set(sNorm, tgt[i]);
       }
     }
+
     for (let i = 0; i < tailMatches; i++) {
       const sIdx = src.length - tailMatches + i;
       const tIdx = tgt.length - tailMatches + i;
@@ -159,383 +230,171 @@ function computeRootMapping(
 
   const commonSrcRoot = findCommonPrefix(srcRoots);
   const commonTgtRoot = findCommonPrefix(tgtRoots);
+
   if (commonTgtRoot.length === 0 && commonSrcRoot.length === 0) return null;
-  return { sourceRoot: commonSrcRoot, targetRoot: commonTgtRoot };
-}
-
-export function validateReferenceRows(
-  rows: { sourceUrl: string; enUrl?: string; frUrl?: string }[]
-): ValidatedReferences {
-  const conflicts: ReferenceConflict[] = [];
-
-  type RefPair = { sourceUrl: string; targetUrl: string; sourceDir: string; targetDir: string; lang: "en" | "fr" };
-  const allPairs: RefPair[] = [];
-
-  for (const row of rows) {
-    try {
-      const sourceParsed = new URL(row.sourceUrl);
-      if (row.enUrl) {
-        try {
-          const enParsed = new URL(row.enUrl);
-          if (enParsed.origin === sourceParsed.origin) {
-            allPairs.push({
-              sourceUrl: row.sourceUrl,
-              targetUrl: row.enUrl,
-              sourceDir: getDirectoryPath(row.sourceUrl),
-              targetDir: getDirectoryPath(row.enUrl),
-              lang: "en",
-            });
-          }
-        } catch {}
-      }
-      if (row.frUrl) {
-        try {
-          const frParsed = new URL(row.frUrl);
-          if (frParsed.origin === sourceParsed.origin) {
-            allPairs.push({
-              sourceUrl: row.sourceUrl,
-              targetUrl: row.frUrl,
-              sourceDir: getDirectoryPath(row.sourceUrl),
-              targetDir: getDirectoryPath(row.frUrl),
-              lang: "fr",
-            });
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-
-  if (allPairs.length <= 1) {
-    return { cleanedRows: rows.slice(), conflicts };
-  }
-
-  function normalizeDirForComparison(dir: string): string[] {
-    const segs = dir.split("/").filter(Boolean);
-    if (segs.length > 0 && segs[segs.length - 1].toLowerCase() === "pages") {
-      segs.pop();
-    }
-    return segs;
-  }
-
-  function isAncestorOrEqual(parentSegs: string[], childSegs: string[]): boolean {
-    if (parentSegs.length > childSegs.length) return false;
-    return parentSegs.every((seg, i) => seg.toLowerCase() === childSegs[i]?.toLowerCase());
-  }
-
-  function dirsAreRelated(dirA: string, dirB: string): boolean {
-    const segsA = normalizeDirForComparison(dirA);
-    const segsB = normalizeDirForComparison(dirB);
-    return isAncestorOrEqual(segsA, segsB) || isAncestorOrEqual(segsB, segsA);
-  }
-
-  const consensusMap = new Map<string, Map<string, number>>();
-
-  for (const pair of allPairs) {
-    const key = `${pair.lang}:${pair.sourceDir}`;
-    if (!consensusMap.has(key)) consensusMap.set(key, new Map());
-    const votes = consensusMap.get(key)!;
-    votes.set(pair.targetDir, (votes.get(pair.targetDir) || 0) + 1);
-  }
-
-  function getConsensusTargetDir(lang: "en" | "fr", sourceDir: string): string | null {
-    const key = `${lang}:${sourceDir}`;
-    const votes = consensusMap.get(key);
-    if (!votes || votes.size === 0) return null;
-    if (votes.size === 1) {
-      const [dir] = votes.keys();
-      return dir;
-    }
-    let best = "";
-    let bestCount = 0;
-    let tieCount = 0;
-    for (const [dir, count] of votes) {
-      if (count > bestCount) {
-        bestCount = count;
-        best = dir;
-        tieCount = 1;
-      } else if (count === bestCount) {
-        tieCount++;
-      }
-    }
-    if (tieCount === 1 && bestCount >= 2) return best;
-    return null;
-  }
-
-  function getParentDir(dir: string): string | null {
-    const parts = dir.split("/").filter(Boolean);
-    if (parts.length <= 1) return null;
-    return "/" + parts.slice(0, -1).join("/");
-  }
-
-  function findAncestorConsensus(lang: "en" | "fr", sourceDir: string): { parentSourceDir: string; parentTargetDir: string } | null {
-    let current = getParentDir(sourceDir);
-    while (current && current !== "/") {
-      const consensus = getConsensusTargetDir(lang, current);
-      if (consensus) {
-        return { parentSourceDir: current, parentTargetDir: consensus };
-      }
-      current = getParentDir(current);
-    }
-    return null;
-  }
-
-  const flaggedPairs = new Set<string>();
-
-  for (const pair of allPairs) {
-    const pairKey = `${pair.lang}:${pair.sourceUrl}:${pair.targetUrl}`;
-
-    const directConsensus = getConsensusTargetDir(pair.lang, pair.sourceDir);
-    if (directConsensus && directConsensus !== pair.targetDir) {
-      if (dirsAreRelated(directConsensus, pair.targetDir)) {
-        continue;
-      }
-
-      const key = `${pair.lang}:${pair.sourceDir}`;
-      const votes = consensusMap.get(key)!;
-      const consensusVotes = votes.get(directConsensus) || 0;
-      const pairVotes = votes.get(pair.targetDir) || 0;
-
-      if (consensusVotes > pairVotes) {
-        conflicts.push({
-          sourceUrl: pair.sourceUrl,
-          targetUrl: pair.targetUrl,
-          lang: pair.lang,
-          reason: `Directory mapping conflicts with majority: ${pair.sourceDir} → ${pair.targetDir} (${pairVotes} vote${pairVotes !== 1 ? "s" : ""}) vs consensus ${pair.sourceDir} → ${directConsensus} (${consensusVotes} vote${consensusVotes !== 1 ? "s" : ""})`,
-          expectedTargetDir: directConsensus,
-          actualTargetDir: pair.targetDir,
-        });
-        flaggedPairs.add(pairKey);
-        continue;
-      }
-    }
-
-    const ancestor = findAncestorConsensus(pair.lang, pair.sourceDir);
-    if (ancestor) {
-      const targetSegments = normalizeDirForComparison(pair.targetDir);
-      const parentTargetSegments = normalizeDirForComparison(ancestor.parentTargetDir);
-
-      if (!isAncestorOrEqual(parentTargetSegments, targetSegments)) {
-        const sourceDirParts = pair.sourceDir.split("/").filter(Boolean);
-        const parentSourceParts = ancestor.parentSourceDir.split("/").filter(Boolean);
-        const childSegments = sourceDirParts.slice(parentSourceParts.length);
-
-        const parentTargetNorm = ancestor.parentTargetDir.replace(/\/+$/, "");
-        const expectedChildTarget = childSegments.length > 0
-          ? parentTargetNorm + "/" + childSegments.join("/")
-          : parentTargetNorm;
-
-        conflicts.push({
-          sourceUrl: pair.sourceUrl,
-          targetUrl: pair.targetUrl,
-          lang: pair.lang,
-          reason: `Target directory "${pair.targetDir}" is not under parent mapping "${ancestor.parentSourceDir}" → "${ancestor.parentTargetDir}". Expected target under "${ancestor.parentTargetDir}/"`,
-          expectedTargetDir: expectedChildTarget,
-          actualTargetDir: pair.targetDir,
-        });
-        flaggedPairs.add(pairKey);
-      }
-    }
-  }
-
-  if (conflicts.length === 0) {
-    return { cleanedRows: rows.slice(), conflicts };
-  }
-
-  log(`  Reference validation: ${conflicts.length} conflict(s) detected`);
-  for (const c of conflicts) {
-    log(`    CONFLICT [${c.lang.toUpperCase()}]: ${c.sourceUrl} → ${c.targetUrl}`);
-    log(`      ${c.reason}`);
-  }
-
-  const flaggedSourceTargetPairs = new Map<string, Set<string>>();
-  for (const c of conflicts) {
-    const key = c.sourceUrl;
-    if (!flaggedSourceTargetPairs.has(key)) flaggedSourceTargetPairs.set(key, new Set());
-    if (c.lang === "en") {
-      flaggedSourceTargetPairs.get(key)!.add(`en:${c.targetUrl}`);
-    } else {
-      flaggedSourceTargetPairs.get(key)!.add(`fr:${c.targetUrl}`);
-    }
-  }
-
-  const cleanedRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[] = [];
-  for (const row of rows) {
-    const flagged = flaggedSourceTargetPairs.get(row.sourceUrl);
-    if (!flagged) {
-      cleanedRows.push({ ...row });
-      continue;
-    }
-
-    const cleaned: { sourceUrl: string; enUrl?: string; frUrl?: string } = { sourceUrl: row.sourceUrl };
-    if (row.enUrl && !flagged.has(`en:${row.enUrl}`)) {
-      cleaned.enUrl = row.enUrl;
-    }
-    if (row.frUrl && !flagged.has(`fr:${row.frUrl}`)) {
-      cleaned.frUrl = row.frUrl;
-    }
-    if (cleaned.enUrl || cleaned.frUrl) {
-      cleanedRows.push(cleaned);
-    }
-  }
-
-  log(`  Reference validation: ${rows.length} input rows → ${cleanedRows.length} clean rows (${rows.length - cleanedRows.length} fully removed, ${conflicts.length} individual mappings flagged)`);
-
-  return { cleanedRows, conflicts };
-}
-
-export function learnTabPatterns(
-  rows: { sourceUrl: string; enUrl?: string; frUrl?: string }[]
-): TabPatterns {
-  const segmentMap = new Map<string, Map<string, string>>();
-  segmentMap.set("en", new Map());
-  segmentMap.set("fr", new Map());
-
-  const enPairs: { src: string[]; tgt: string[] }[] = [];
-  const frPairs: { src: string[]; tgt: string[] }[] = [];
-
-  const directoryMappings: DirectoryMapping[] = [];
-  const seenDirMappings = new Set<string>();
-
-  for (const row of rows) {
-    try {
-      const sourceParsed = new URL(row.sourceUrl);
-      const sourceParts = sourceParsed.pathname.split("/").filter(Boolean);
-      if (sourceParts.length === 0) continue;
-
-      if (row.enUrl) {
-        try {
-          const enParsed = new URL(row.enUrl);
-          if (enParsed.origin === sourceParsed.origin) {
-            const enParts = enParsed.pathname.split("/").filter(Boolean);
-            enPairs.push({ src: stripSuffix(sourceParts), tgt: stripSuffix(enParts) });
-
-            const srcDir = getDirectoryPath(row.sourceUrl);
-            const tgtDir = getDirectoryPath(row.enUrl);
-            const key = `en:${srcDir}:${tgtDir}`;
-            if (!seenDirMappings.has(key)) {
-              seenDirMappings.add(key);
-              directoryMappings.push({ sourceDir: srcDir, targetDir: tgtDir, lang: "en" });
-            }
-          }
-        } catch {}
-      }
-
-      if (row.frUrl) {
-        try {
-          const frParsed = new URL(row.frUrl);
-          if (frParsed.origin === sourceParsed.origin) {
-            const frParts = frParsed.pathname.split("/").filter(Boolean);
-            frPairs.push({ src: stripSuffix(sourceParts), tgt: stripSuffix(frParts) });
-
-            const srcDir = getDirectoryPath(row.sourceUrl);
-            const tgtDir = getDirectoryPath(row.frUrl);
-            const key = `fr:${srcDir}:${tgtDir}`;
-            if (!seenDirMappings.has(key)) {
-              seenDirMappings.add(key);
-              directoryMappings.push({ sourceDir: srcDir, targetDir: tgtDir, lang: "fr" });
-            }
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-
-  const enMapping = computeRootMapping(enPairs, segmentMap.get("en")!);
-  const frMapping = computeRootMapping(frPairs, segmentMap.get("fr")!);
-
-  const enRoot = enMapping ? enMapping.targetRoot : [];
-  const frRoot = frMapping ? frMapping.targetRoot : [];
-  const enSrcRoot = enMapping ? enMapping.sourceRoot : [];
-  const frSrcRoot = frMapping ? frMapping.sourceRoot : [];
-
-  log(`Tab patterns learned:`);
-  if (enMapping) log(`  EN: /${enSrcRoot.join("/") || "*"}/ → /${enRoot.join("/")}/`);
-  if (frMapping) log(`  FR: /${frSrcRoot.join("/") || "*"}/ → /${frRoot.join("/")}/`);
-  log(`  Directory mappings: ${directoryMappings.length} (${directoryMappings.filter(d => d.lang === "en").length} EN, ${directoryMappings.filter(d => d.lang === "fr").length} FR)`);
-  const enSeg = segmentMap.get("en")?.size || 0;
-  const frSeg = segmentMap.get("fr")?.size || 0;
-  log(`  Segment translations: ${enSeg} EN, ${frSeg} FR`);
 
   return {
-    directoryMappings,
-    segmentMap,
-    enRoot, frRoot,
-    enSrcRoot, frSrcRoot,
+    sourceRoot: commonSrcRoot,
+    targetRoot: commonTgtRoot,
   };
 }
 
-export function findTargetDirectory(
-  sourceUrl: string,
-  lang: "en" | "fr",
-  tabPatterns: TabPatterns
-): string | null {
-  const sourceDir = getDirectoryPath(sourceUrl);
-  const langMappings = tabPatterns.directoryMappings.filter(m => m.lang === lang);
+function findCommonPrefix(arrays: string[][]): string[] {
+  if (arrays.length === 0) return [];
+  if (arrays.length === 1) return arrays[0].slice();
 
-  let bestMatch: DirectoryMapping | null = null;
-  let bestMatchLen = 0;
+  const prefix: string[] = [];
+  const minLen = Math.min(...arrays.map((a) => a.length));
 
-  for (const mapping of langMappings) {
-    const srcNorm = mapping.sourceDir.toLowerCase();
-    const sourceDirNorm = sourceDir.toLowerCase();
-    if (sourceDirNorm.startsWith(srcNorm) || sourceDirNorm === srcNorm) {
-      if (srcNorm.length > bestMatchLen) {
-        bestMatchLen = srcNorm.length;
-        bestMatch = mapping;
-      }
-    }
-  }
-
-  if (bestMatch) {
-    const sourceDir_lower = sourceDir.toLowerCase();
-    const bestSrcNorm = bestMatch.sourceDir.toLowerCase();
-    if (sourceDir_lower === bestSrcNorm) {
-      return bestMatch.targetDir;
-    }
-    const remainder = sourceDir.substring(bestMatch.sourceDir.length);
-    if (remainder) {
-      const remainderParts = remainder.split("/").filter(Boolean);
-      const segments = tabPatterns.segmentMap.get(lang);
-      const translatedParts = remainderParts.map(part => {
-        const norm = normalizeSegment(part);
-        if (segments && segments.has(norm)) return segments.get(norm)!;
-        return part;
-      });
-      return bestMatch.targetDir + "/" + translatedParts.join("/");
-    }
-    return bestMatch.targetDir;
-  }
-
-  const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
-  const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
-  if (targetRoot.length === 0) return null;
-
-  const sourceParts = sourceDir.split("/").filter(Boolean);
-  const segments = tabPatterns.segmentMap.get(lang);
-
-  let matchLen = 0;
-  for (let i = 0; i < sourceRoot.length && i < sourceParts.length; i++) {
-    if (normalizeSegment(sourceParts[i]) === normalizeSegment(sourceRoot[i])) {
-      matchLen++;
+  for (let i = 0; i < minLen; i++) {
+    const first = normalizeSegment(arrays[0][i]);
+    const allSame = arrays.every((arr) => normalizeSegment(arr[i]) === first);
+    if (allSame) {
+      prefix.push(arrays[0][i]);
     } else {
       break;
     }
   }
+  return prefix;
+}
 
-  const remaining = sourceParts.slice(matchLen);
-  const translatedRemaining = remaining.map(part => {
-    const norm = normalizeSegment(part);
-    if (segments && segments.has(norm)) return segments.get(norm)!;
-    return part;
-  });
+export function constructTargetUrl(
+  sourceUrl: string,
+  lang: "en" | "fr",
+  tabPatterns: TabPatterns
+): string | null {
+  try {
+    const parsed = new URL(sourceUrl);
+    const pathParts = parsed.pathname.split("/").filter(Boolean);
+    if (pathParts.length === 0) return null;
 
-  return "/" + [...targetRoot, ...translatedRemaining].join("/");
+    const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
+    const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
+    if (targetRoot.length === 0) return null;
+
+    const segments = tabPatterns.segmentMap.get(lang);
+
+    const cleanParts = stripSuffix(pathParts);
+
+    let remaining: string[];
+    if (sourceRoot.length > 0) {
+      let matchLen = 0;
+      for (let i = 0; i < sourceRoot.length && i < cleanParts.length; i++) {
+        if (normalizeSegment(cleanParts[i]) === normalizeSegment(sourceRoot[i])) {
+          matchLen++;
+        } else {
+          break;
+        }
+      }
+      remaining = cleanParts.slice(matchLen);
+    } else {
+      remaining = cleanParts;
+    }
+
+    const translatedParts = remaining.map((part) => {
+      if (!segments) return part;
+      const norm = normalizeSegment(part);
+      return segments.has(norm) ? segments.get(norm)! : part;
+    });
+
+    return parsed.origin + "/" + [...targetRoot, ...translatedParts].join("/");
+  } catch {}
+
+  return null;
+}
+
+export async function validatePatterns(
+  tabPatterns: TabPatterns,
+  sampleUrls: { sourceUrl: string; lang: "en" | "fr" }[]
+): Promise<{ en: number; fr: number }> {
+  const enSamples: string[] = [];
+  const frSamples: string[] = [];
+
+  for (const sample of sampleUrls) {
+    const candidate = constructTargetUrl(sample.sourceUrl, sample.lang, tabPatterns);
+    if (candidate) {
+      if (sample.lang === "en") enSamples.push(candidate);
+      else frSamples.push(candidate);
+    }
+  }
+
+  const allUrls = [...enSamples, ...frSamples];
+  if (allUrls.length === 0) return { en: 0, fr: 0 };
+
+  const existence = await batchHeadCheck(allUrls);
+
+  let enValid = 0;
+  for (const url of enSamples) {
+    if (existence.get(url)) enValid++;
+  }
+  let frValid = 0;
+  for (const url of frSamples) {
+    if (existence.get(url)) frValid++;
+  }
+
+  const enRate = enSamples.length > 0 ? enValid / enSamples.length : 0;
+  const frRate = frSamples.length > 0 ? frValid / frSamples.length : 0;
+
+  log(`  Pattern validation: EN ${enValid}/${enSamples.length} (${(enRate * 100).toFixed(0)}%), FR ${frValid}/${frSamples.length} (${(frRate * 100).toFixed(0)}%)`);
+
+  tabPatterns.patternValidated.en = enRate >= 0.3;
+  tabPatterns.patternValidated.fr = frRate >= 0.3;
+
+  return { en: enValid, fr: frValid };
+}
+
+export interface BatchMatchResult {
+  enUrl: string | null;
+  frUrl: string | null;
+  confidenceEn: number | null;
+  confidenceFr: number | null;
+  matchMethodEn: string | null;
+  matchMethodFr: string | null;
+}
+
+export function batchConstructUrls(
+  sourceUrls: { sourceUrl: string; needsEn: boolean; needsFr: boolean; index: number }[],
+  tabPatterns: TabPatterns
+): Map<number, BatchMatchResult> {
+  const results = new Map<number, BatchMatchResult>();
+
+  for (const item of sourceUrls) {
+    const result: BatchMatchResult = {
+      enUrl: null,
+      frUrl: null,
+      confidenceEn: null,
+      confidenceFr: null,
+      matchMethodEn: null,
+      matchMethodFr: null,
+    };
+
+    if (item.needsEn && tabPatterns.patternValidated.en) {
+      const enUrl = constructTargetUrl(item.sourceUrl, "en", tabPatterns);
+      if (enUrl) {
+        result.enUrl = enUrl;
+        result.confidenceEn = 90;
+        result.matchMethodEn = "pattern";
+      }
+    }
+
+    if (item.needsFr && tabPatterns.patternValidated.fr) {
+      const frUrl = constructTargetUrl(item.sourceUrl, "fr", tabPatterns);
+      if (frUrl) {
+        result.frUrl = frUrl;
+        result.confidenceFr = 90;
+        result.matchMethodFr = "pattern";
+      }
+    }
+
+    results.set(item.index, result);
+  }
+
+  return results;
 }
 
 const CRAWL_CONCURRENCY = 30;
 const CRAWL_TIMEOUT = 8000;
-const CRAWL_MAX_PAGES = 2000;
-const CRAWL_MAX_DEPTH = 6;
+const CRAWL_MAX_PAGES = 500;
 
 export interface CrawlInventory {
   urls: Set<string>;
@@ -606,6 +465,7 @@ function extractLinks(html: string, baseUrl: string, scopePrefix: string): strin
       resolved.hash = "";
       resolved.search = "";
       const cleanUrl = resolved.toString();
+
       if (resolved.pathname.toLowerCase().startsWith(scopeLower)) {
         links.add(cleanUrl);
       }
@@ -615,34 +475,82 @@ function extractLinks(html: string, baseUrl: string, scopePrefix: string): strin
   return Array.from(links);
 }
 
-function addToInventory(inventory: CrawlInventory, url: string) {
-  if (inventory.urls.has(url)) return;
-  inventory.urls.add(url);
+export async function crawlDirectory(
+  origin: string,
+  rootPath: string[],
+  onProgress?: (crawled: number, queued: number) => void
+): Promise<CrawlInventory> {
+  const inventory: CrawlInventory = {
+    urls: new Set(),
+    normalizedIndex: new Map(),
+    tailIndex: new Map(),
+    titleIndex: new Map(),
+    lastSegWordIndex: new Map(),
+  };
 
-  const normalized = normalizeUrlPath(url);
-  inventory.normalizedIndex.set(normalized, url);
+  const scopePrefix = "/" + rootPath.join("/");
+  const startUrl = origin + scopePrefix + "/";
 
-  for (let tailLen = 1; tailLen <= 3; tailLen++) {
-    const tail = getUrlTail(url, tailLen);
-    if (tail) {
-      if (!inventory.tailIndex.has(tail)) {
-        inventory.tailIndex.set(tail, []);
+  const visited = new Set<string>();
+  const queue: string[] = [startUrl];
+
+  if (rootPath.length > 0) {
+    const defaultUrl = origin + scopePrefix + "/Pages/default.aspx";
+    queue.push(defaultUrl);
+  }
+
+  let crawled = 0;
+
+  while (queue.length > 0 && crawled < CRAWL_MAX_PAGES) {
+    const batch = queue.splice(0, CRAWL_CONCURRENCY);
+    const toFetch = batch.filter((url) => !visited.has(url));
+    for (const url of toFetch) visited.add(url);
+
+    if (toFetch.length === 0) continue;
+
+    const results = await Promise.all(
+      toFetch.map(async (url) => {
+        const html = await fetchPage(url);
+        return { url, html };
+      })
+    );
+
+    for (const { url, html } of results) {
+      crawled++;
+
+      if (html) {
+        addToInventory(inventory, url);
+
+        const $ = cheerio.load(html);
+        const pageTitle = $("title").first().text().trim();
+        if (pageTitle) {
+          const lowerTitle = pageTitle.toLowerCase();
+          const isErrorPage = lowerTitle.includes("page not found") ||
+            lowerTitle.includes("404 -") ||
+            lowerTitle.includes("שגיאה") ||
+            lowerTitle.includes("הדף לא נמצא");
+          if (isErrorPage) {
+            removeFromInventory(inventory, url);
+          } else {
+            inventory.titleIndex.set(url, pageTitle);
+          }
+        }
+
+        const links = extractLinks(html, url, scopePrefix);
+        for (const link of links) {
+          if (!visited.has(link)) {
+            queue.push(link);
+          }
+        }
       }
-      inventory.tailIndex.get(tail)!.push(url);
+    }
+
+    if (onProgress) {
+      onProgress(crawled, queue.length);
     }
   }
 
-  const normParts = normalized.split("/");
-  const lastSeg = normParts[normParts.length - 1];
-  if (lastSeg && lastSeg.length > 2) {
-    const words = lastSeg.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2);
-    for (const word of words) {
-      if (!inventory.lastSegWordIndex.has(word)) {
-        inventory.lastSegWordIndex.set(word, new Set());
-      }
-      inventory.lastSegWordIndex.get(word)!.add(normalized);
-    }
-  }
+  return inventory;
 }
 
 function removeFromInventory(inventory: CrawlInventory, url: string) {
@@ -675,235 +583,34 @@ function removeFromInventory(inventory: CrawlInventory, url: string) {
   }
 }
 
-export async function crawlDirectory(
-  origin: string,
-  rootPath: string[],
-  onProgress?: (crawled: number, queued: number) => void,
-  options?: { maxPages?: number; maxDepth?: number }
-): Promise<CrawlInventory> {
-  const inventory: CrawlInventory = {
-    urls: new Set(),
-    normalizedIndex: new Map(),
-    tailIndex: new Map(),
-    titleIndex: new Map(),
-    lastSegWordIndex: new Map(),
-  };
+function addToInventory(inventory: CrawlInventory, url: string) {
+  if (inventory.urls.has(url)) return;
+  inventory.urls.add(url);
 
-  const maxPages = options?.maxPages ?? CRAWL_MAX_PAGES;
-  const maxDepth = options?.maxDepth ?? CRAWL_MAX_DEPTH;
+  const normalized = normalizeUrlPath(url);
+  inventory.normalizedIndex.set(normalized, url);
 
-  const scopePrefix = "/" + rootPath.join("/");
-  const startUrl = origin + scopePrefix + "/";
-
-  const visited = new Set<string>();
-  const queue: { url: string; depth: number }[] = [{ url: startUrl, depth: 0 }];
-
-  if (rootPath.length > 0) {
-    const defaultUrl = origin + scopePrefix + "/Pages/default.aspx";
-    queue.push({ url: defaultUrl, depth: 0 });
-  }
-
-  let crawled = 0;
-
-  while (queue.length > 0 && crawled < maxPages) {
-    const batch = queue.splice(0, CRAWL_CONCURRENCY);
-    const toFetch = batch.filter((item) => !visited.has(item.url));
-    for (const item of toFetch) visited.add(item.url);
-
-    if (toFetch.length === 0) continue;
-
-    const results = await Promise.all(
-      toFetch.map(async (item) => {
-        const html = await fetchPage(item.url);
-        return { url: item.url, depth: item.depth, html };
-      })
-    );
-
-    for (const { url, depth, html } of results) {
-      crawled++;
-
-      if (html) {
-        addToInventory(inventory, url);
-
-        const $ = cheerio.load(html);
-        const pageTitle = $("title").first().text().trim();
-        if (pageTitle) {
-          const lowerTitle = pageTitle.toLowerCase();
-          const isErrorPage = lowerTitle.includes("page not found") ||
-            lowerTitle.includes("404 -") ||
-            lowerTitle.includes("שגיאה") ||
-            lowerTitle.includes("הדף לא נמצא");
-          if (isErrorPage) {
-            removeFromInventory(inventory, url);
-          } else {
-            inventory.titleIndex.set(url, pageTitle);
-          }
-        }
-
-        if (depth < maxDepth) {
-          const links = extractLinks(html, url, scopePrefix);
-          for (const link of links) {
-            if (!visited.has(link)) {
-              queue.push({ url: link, depth: depth + 1 });
-            }
-          }
-        }
+  for (let tailLen = 1; tailLen <= 3; tailLen++) {
+    const tail = getUrlTail(url, tailLen);
+    if (tail) {
+      if (!inventory.tailIndex.has(tail)) {
+        inventory.tailIndex.set(tail, []);
       }
-    }
-
-    if (onProgress) {
-      onProgress(crawled, queue.length);
+      inventory.tailIndex.get(tail)!.push(url);
     }
   }
 
-  return inventory;
-}
-
-export function buildInventoryFromDbRows(rows: { url: string; title: string | null }[]): CrawlInventory {
-  const inventory: CrawlInventory = {
-    urls: new Set(),
-    normalizedIndex: new Map(),
-    tailIndex: new Map(),
-    titleIndex: new Map(),
-    lastSegWordIndex: new Map(),
-  };
-  for (const row of rows) {
-    addToInventory(inventory, row.url);
-    if (row.title) {
-      inventory.titleIndex.set(row.url, row.title);
+  const normParts = normalized.split("/");
+  const lastSeg = normParts[normParts.length - 1];
+  if (lastSeg && lastSeg.length > 2) {
+    const words = lastSeg.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2);
+    for (const word of words) {
+      if (!inventory.lastSegWordIndex.has(word)) {
+        inventory.lastSegWordIndex.set(word, new Set());
+      }
+      inventory.lastSegWordIndex.get(word)!.add(normalized);
     }
   }
-  return inventory;
-}
-
-export function getScopedInventory(
-  inventory: CrawlInventory,
-  directoryPath: string,
-  origin: string
-): CrawlInventory {
-  const scoped: CrawlInventory = {
-    urls: new Set(),
-    normalizedIndex: new Map(),
-    tailIndex: new Map(),
-    titleIndex: new Map(),
-    lastSegWordIndex: new Map(),
-  };
-
-  const dirLower = directoryPath.toLowerCase();
-
-  for (const url of inventory.urls) {
-    try {
-      const parsed = new URL(url);
-      if (parsed.pathname.toLowerCase().startsWith(dirLower)) {
-        addToInventory(scoped, url);
-        const title = inventory.titleIndex.get(url);
-        if (title) {
-          scoped.titleIndex.set(url, title);
-        }
-      }
-    } catch {}
-  }
-
-  return scoped;
-}
-
-export function matchInDirectory(
-  sourceUrl: string,
-  lang: "en" | "fr",
-  tabPatterns: TabPatterns,
-  scopedInventory: CrawlInventory,
-): { url: string; confidence: number; method: string } | null {
-  const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
-  const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
-  const segments = tabPatterns.segmentMap.get(lang);
-
-  try {
-    const parsed = new URL(sourceUrl);
-    const srcParts = parsed.pathname.split("/").filter(Boolean);
-    const cleanSrc = stripSuffix(srcParts);
-
-    let srcTailParts: string[];
-    if (sourceRoot.length > 0) {
-      let matchLen = 0;
-      for (let i = 0; i < sourceRoot.length && i < cleanSrc.length; i++) {
-        if (normalizeSegment(cleanSrc[i]) === normalizeSegment(sourceRoot[i])) {
-          matchLen++;
-        } else break;
-      }
-      srcTailParts = cleanSrc.slice(matchLen);
-    } else {
-      srcTailParts = cleanSrc;
-    }
-
-    if (segments && srcTailParts.length > 0) {
-      const translatedParts = srcTailParts.map(part => {
-        const norm = normalizeSegment(part);
-        return segments.has(norm) ? segments.get(norm)! : part;
-      });
-      const candidatePath = [...targetRoot, ...translatedParts].map(p => normalizeSegment(p)).join("/");
-      const inventoryUrl = scopedInventory.normalizedIndex.get(candidatePath);
-      if (inventoryUrl) {
-        return { url: inventoryUrl, confidence: 95, method: "dir-pattern" };
-      }
-    }
-
-    const srcNormPath = cleanSrc.map(p => normalizeSegment(p)).join("/");
-    for (const [normPath, realUrl] of scopedInventory.normalizedIndex) {
-      const tgtParts = normPath.split("/");
-      const srcLast = srcTailParts.map(p => normalizeSegment(p));
-      const tgtLast = tgtParts.slice(-srcLast.length);
-      if (srcLast.length > 0 && tgtLast.length === srcLast.length) {
-        let allMatch = true;
-        for (let i = 0; i < srcLast.length; i++) {
-          if (srcLast[i] !== tgtLast[i]) { allMatch = false; break; }
-        }
-        if (allMatch) {
-          return { url: realUrl, confidence: 93, method: "dir-path" };
-        }
-      }
-    }
-
-    if (srcTailParts.length >= 1) {
-      const lastSeg = normalizeSegment(srcTailParts[srcTailParts.length - 1]);
-      if (lastSeg && lastSeg !== "pages") {
-        const candidates = scopedInventory.tailIndex.get(lastSeg) || [];
-        if (candidates.length === 1) {
-          return { url: candidates[0], confidence: 88, method: "dir-tail" };
-        }
-
-        if (srcTailParts.length >= 2 && candidates.length !== 1) {
-          const tail2 = srcTailParts.slice(-2).map(p => normalizeSegment(p)).join("/");
-          const candidates2 = scopedInventory.tailIndex.get(tail2) || [];
-          if (candidates2.length === 1) {
-            return { url: candidates2[0], confidence: 90, method: "dir-tail2" };
-          }
-        }
-      }
-    }
-
-    if (srcTailParts.length >= 1 && segments) {
-      const translatedTail = srcTailParts.map(p => {
-        const norm = normalizeSegment(p);
-        if (segments.has(norm)) return normalizeSegment(segments.get(norm)!);
-        return norm;
-      });
-
-      for (let tailLen = Math.min(translatedTail.length, 3); tailLen >= 1; tailLen--) {
-        const tailKey = translatedTail.slice(-tailLen).join("/");
-        const candidates = scopedInventory.tailIndex.get(tailKey) || [];
-        if (candidates.length === 1) {
-          return { url: candidates[0], confidence: 86, method: "dir-translated-tail" };
-        }
-      }
-    }
-
-    if (srcTailParts.length >= 1) {
-      const result = fuzzySegmentMatch(srcTailParts, lang, tabPatterns, scopedInventory);
-      if (result) return result;
-    }
-  } catch {}
-
-  return null;
 }
 
 function fuzzySegmentMatch(
@@ -929,7 +636,7 @@ function fuzzySegmentMatch(
 
   if (candidateNorms.size > 0) {
     const result = bestJaccardMatch(srcWords, candidateNorms, inventory);
-    if (result) return { url: result.url, confidence: Math.round(80 + result.score * 10), method: "dir-fuzzy" };
+    if (result) return { url: result.url, confidence: Math.round(80 + result.score * 10), method: "segment-fuzzy" };
   }
 
   if (segments) {
@@ -944,9 +651,10 @@ function fuzzySegmentMatch(
             Array.from(urls).forEach(u => transCandidates.add(u));
           }
         }
+
         if (transCandidates.size > 0) {
           const result = bestJaccardMatch(transWords, transCandidates, inventory);
-          if (result) return { url: result.url, confidence: Math.round(80 + result.score * 10), method: "dir-fuzzy-translated" };
+          if (result) return { url: result.url, confidence: Math.round(80 + result.score * 10), method: "segment-fuzzy-translated" };
         }
       }
     }
@@ -985,6 +693,200 @@ function bestJaccardMatch(
   }
 
   return best;
+}
+
+function getSourceSectionSegment(sourceUrl: string, sourceRoot: string[]): string | null {
+  try {
+    const parsed = new URL(sourceUrl);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const cleanParts = stripSuffix(parts);
+    const afterRoot = sourceRoot.length > 0 ? cleanParts.slice(sourceRoot.length) : cleanParts;
+    if (afterRoot.length > 0) {
+      const seg = normalizeSegment(afterRoot[0]);
+      if (seg && seg !== "pages" && seg !== "default.aspx" && seg.length > 2) {
+        return seg;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function validateSectionContext(
+  candidateUrl: string,
+  sourceUrl: string,
+  lang: "en" | "fr",
+  tabPatterns: TabPatterns
+): boolean {
+  const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
+  const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
+  const segments = tabPatterns.segmentMap.get(lang);
+
+  const srcSection = getSourceSectionSegment(sourceUrl, sourceRoot);
+  if (!srcSection) return true;
+
+  try {
+    const candidateParts = new URL(candidateUrl).pathname.split("/").filter(Boolean);
+    const afterRoot = candidateParts.slice(targetRoot.length);
+    if (afterRoot.length === 0) return true;
+
+    const candidateSection = normalizeSegment(afterRoot[0]);
+
+    if (candidateSection === srcSection) return true;
+
+    if (segments) {
+      const translatedSection = segments.has(srcSection) ? normalizeSegment(segments.get(srcSection)!) : null;
+      if (translatedSection && candidateSection === translatedSection) return true;
+    }
+
+    const srcWords = srcSection.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2);
+    const candWords = candidateSection.replace(/[_\-%20]+/g, " ").split(" ").filter(w => w.length > 2);
+    if (srcWords.length > 0 && candWords.length > 0) {
+      let overlap = 0;
+      for (const w of srcWords) {
+        if (candWords.some(cw => cw === w || (w.length > 4 && cw.includes(w)) || (cw.length > 4 && w.includes(cw)))) {
+          overlap++;
+        }
+      }
+      if (overlap > 0) return true;
+    }
+
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+export function validateDepthMatch(
+  sourceUrl: string,
+  candidateUrl: string,
+  sourceRoot: string[],
+  targetRoot: string[]
+): boolean {
+  try {
+    const srcParts = new URL(sourceUrl).pathname.split("/").filter(Boolean);
+    const srcClean = stripSuffix(srcParts);
+    const srcDepthAfterRoot = srcClean.length - sourceRoot.length;
+
+    const tgtParts = new URL(candidateUrl).pathname.split("/").filter(Boolean);
+    const tgtClean = stripSuffix(tgtParts);
+    const tgtDepthAfterRoot = tgtClean.length - targetRoot.length;
+
+    if (srcDepthAfterRoot >= 2 && tgtDepthAfterRoot <= 0) {
+      return false;
+    }
+
+    if (srcDepthAfterRoot >= 3 && tgtDepthAfterRoot <= 1) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+export function matchAgainstInventory(
+  sourceUrl: string,
+  lang: "en" | "fr",
+  tabPatterns: TabPatterns,
+  inventory: CrawlInventory
+): { url: string; confidence: number; method: string } | null {
+  const constructedUrl = constructTargetUrl(sourceUrl, lang, tabPatterns);
+  const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
+  const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
+
+  if (constructedUrl) {
+    if (!validateDepthMatch(sourceUrl, constructedUrl, sourceRoot, targetRoot)) {
+      log(`    REJECTED (parent-only, depth mismatch): ${sourceUrl} -> ${constructedUrl}`);
+    } else if (inventory.urls.has(constructedUrl)) {
+      return { url: constructedUrl, confidence: 95, method: "pattern+crawl" };
+    } else {
+      const constructedNorm = normalizeUrlPath(constructedUrl);
+      const inventoryUrl = inventory.normalizedIndex.get(constructedNorm);
+      if (inventoryUrl) {
+        return { url: inventoryUrl, confidence: 93, method: "pattern+crawl-norm" };
+      }
+    }
+  }
+
+  try {
+    const parsed = new URL(sourceUrl);
+    const srcParts = parsed.pathname.split("/").filter(Boolean);
+    const cleanSrc = stripSuffix(srcParts);
+
+    let srcTailParts: string[];
+    if (sourceRoot.length > 0) {
+      let matchLen = 0;
+      for (let i = 0; i < sourceRoot.length && i < cleanSrc.length; i++) {
+        if (normalizeSegment(cleanSrc[i]) === normalizeSegment(sourceRoot[i])) {
+          matchLen++;
+        } else break;
+      }
+      srcTailParts = cleanSrc.slice(matchLen);
+    } else {
+      srcTailParts = cleanSrc;
+    }
+
+    if (srcTailParts.length >= 1) {
+      const lastSeg = normalizeSegment(srcTailParts[srcTailParts.length - 1]);
+      if (lastSeg && lastSeg !== "pages") {
+        const tail1 = lastSeg;
+        const candidates = inventory.tailIndex.get(tail1) || [];
+
+        const sectionFiltered = candidates.filter(c => validateSectionContext(c, sourceUrl, lang, tabPatterns));
+
+        if (sectionFiltered.length === 1) {
+          if (validateDepthMatch(sourceUrl, sectionFiltered[0], sourceRoot, targetRoot)) {
+            return { url: sectionFiltered[0], confidence: 85, method: "crawl-tail" };
+          }
+        }
+
+        if (srcTailParts.length >= 2 && (sectionFiltered.length > 1 || sectionFiltered.length === 0)) {
+          const tail2 = srcTailParts.slice(-2).map((p) => normalizeSegment(p)).join("/");
+          const candidates2 = inventory.tailIndex.get(tail2) || [];
+          const sectionFiltered2 = candidates2.filter(c => validateSectionContext(c, sourceUrl, lang, tabPatterns));
+          if (sectionFiltered2.length === 1) {
+            if (validateDepthMatch(sourceUrl, sectionFiltered2[0], sourceRoot, targetRoot)) {
+              return { url: sectionFiltered2[0], confidence: 88, method: "crawl-tail2" };
+            }
+          }
+        }
+      }
+    }
+
+    if (srcTailParts.length >= 2) {
+      const segments = tabPatterns.segmentMap.get(lang);
+      const translatedTail = srcTailParts.map((p) => {
+        const norm = normalizeSegment(p);
+        if (segments && segments.has(norm)) return normalizeSegment(segments.get(norm)!);
+        return norm;
+      });
+
+      for (let tailLen = Math.min(translatedTail.length, 3); tailLen >= 1; tailLen--) {
+        const tailKey = translatedTail.slice(-tailLen).join("/");
+        const candidates = inventory.tailIndex.get(tailKey) || [];
+        const sectionFiltered = candidates.filter(c => validateSectionContext(c, sourceUrl, lang, tabPatterns));
+        if (sectionFiltered.length === 1) {
+          if (validateDepthMatch(sourceUrl, sectionFiltered[0], sourceRoot, targetRoot)) {
+            return { url: sectionFiltered[0], confidence: 86, method: "crawl-translated-tail" };
+          }
+        }
+      }
+    }
+
+    if (srcTailParts.length >= 1) {
+      const result = fuzzySegmentMatch(srcTailParts, lang, tabPatterns, inventory);
+      if (result && validateSectionContext(result.url, sourceUrl, lang, tabPatterns) && validateDepthMatch(sourceUrl, result.url, sourceRoot, targetRoot)) {
+        return result;
+      }
+    }
+  } catch {}
+
+  if (constructedUrl) {
+    urlExistenceCache.set(constructedUrl, false);
+  }
+
+  return null;
 }
 
 function normalizeTitle(title: string): string {
@@ -1064,95 +966,12 @@ function titleSimilarity(a: string, b: string): number {
   }
 
   const jaccard = intersection / (aWords.length + bWordsSet.size - intersection);
+
   const containsBonus = (aNorm.includes(bNorm) || bNorm.includes(aNorm)) ? 0.15 : 0;
 
   return Math.min(jaccard + containsBonus, 1.0);
 }
 
-export interface TitleMatchResult {
-  url: string;
-  confidence: number;
-  method: string;
-  similarity: number;
-}
-
-export function matchByTitle(
-  translatedTitle: string,
-  inventory: CrawlInventory,
-  minSimilarity: number = 0.85,
-  sourceSegments?: Set<string>,
-): TitleMatchResult | null {
-  let bestMatch: TitleMatchResult | null = null;
-  let bestSimilarity = minSimilarity;
-  let secondBestSimilarity = 0;
-
-  const translatedParts = splitTitleParts(translatedTitle);
-  const translatedSection = translatedParts.section ? normalizeTitle(translatedParts.section) : "";
-  const hasSection = translatedSection.length > 0;
-
-  inventory.titleIndex.forEach((pageTitle, url) => {
-    const baseSim = titleSimilarity(translatedTitle, pageTitle);
-
-    let sectionBonus = 0;
-    let usedSection = false;
-
-    if (hasSection) {
-      const targetParts = splitTitleParts(pageTitle);
-      if (targetParts.section) {
-        const sectionSim = wordSetSimilarity(translatedParts.section, targetParts.section);
-        if (sectionSim >= 0.4) {
-          const pageSim = wordSetSimilarity(translatedParts.pageName, targetParts.pageName);
-          sectionBonus = pageSim * 0.1 + sectionSim * 0.05;
-          usedSection = true;
-        }
-      }
-    }
-
-    const sim = Math.min(baseSim + sectionBonus, 1.0);
-
-    if (sim > bestSimilarity) {
-      secondBestSimilarity = bestSimilarity;
-      bestSimilarity = sim;
-      bestMatch = {
-        url,
-        confidence: Math.round(70 + sim * 20),
-        method: usedSection ? "dir-title-section" : "dir-title",
-        similarity: sim,
-      };
-    } else if (sim > secondBestSimilarity) {
-      secondBestSimilarity = sim;
-    }
-  });
-
-  const finalMatch = bestMatch as TitleMatchResult | null;
-  if (finalMatch) {
-    const gap = bestSimilarity - secondBestSimilarity;
-    if (gap < 0.05 && bestSimilarity < 0.95) {
-      log(`    Title match REJECTED (ambiguous): "${translatedTitle}" best=${bestSimilarity.toFixed(3)} second=${secondBestSimilarity.toFixed(3)} gap=${gap.toFixed(3)}`);
-      return null;
-    }
-
-    if (sourceSegments && sourceSegments.size > 0) {
-      try {
-        const matchParts = new URL(finalMatch.url).pathname.split("/").filter(Boolean);
-        const matchNorms = matchParts.map(p => normalizeSegment(p));
-        let sharedSegments = 0;
-        for (const seg of matchNorms) {
-          if (sourceSegments.has(seg)) sharedSegments++;
-        }
-        if (sharedSegments === 0 && matchNorms.length > 2) {
-          log(`    Title match REJECTED (no shared segments): "${translatedTitle}" -> ${finalMatch.url}`);
-          return null;
-        }
-      } catch {
-        log(`    Title match REJECTED (URL parse error): "${translatedTitle}" -> ${finalMatch.url}`);
-        return null;
-      }
-    }
-  }
-
-  return finalMatch;
-}
 
 async function translateWithGTX(text: string, source: string, target: string): Promise<string | null> {
   try {
@@ -1284,11 +1103,123 @@ export async function batchTranslate(
   return results;
 }
 
+export interface TitleMatchResult {
+  url: string;
+  confidence: number;
+  method: string;
+  similarity: number;
+}
+
+export function matchByTitle(
+  translatedTitle: string,
+  inventory: CrawlInventory,
+  minSimilarity: number = 0.85,
+  allowedRoots?: string[],
+  refDepths?: number[],
+  sourceSegments?: Set<string>,
+): TitleMatchResult | null {
+  let bestMatch: TitleMatchResult | null = null;
+  let bestSimilarity = minSimilarity;
+  let secondBestSimilarity = 0;
+
+  const minDepth = refDepths && refDepths.length > 0 ? Math.min(...refDepths) - 2 : 0;
+  const maxDepth = refDepths && refDepths.length > 0 ? Math.max(...refDepths) + 2 : Infinity;
+
+  const translatedParts = splitTitleParts(translatedTitle);
+  const translatedSection = translatedParts.section ? normalizeTitle(translatedParts.section) : "";
+  const hasSection = translatedSection.length > 0;
+
+  inventory.titleIndex.forEach((pageTitle, url) => {
+    if (allowedRoots && allowedRoots.length > 0) {
+      try {
+        const urlPath = new URL(url).pathname.toLowerCase();
+        const matchesRoot = allowedRoots.some(root => urlPath.startsWith(root.toLowerCase()));
+        if (!matchesRoot) return;
+      } catch { return; }
+    }
+
+    if (refDepths && refDepths.length > 0) {
+      try {
+        const urlParts = new URL(url).pathname.split("/").filter(Boolean);
+        if (urlParts.length < minDepth || urlParts.length > maxDepth) return;
+      } catch { return; }
+    }
+
+    const baseSim = titleSimilarity(translatedTitle, pageTitle);
+
+    let sectionBonus = 0;
+    let usedSection = false;
+
+    if (hasSection) {
+      const targetParts = splitTitleParts(pageTitle);
+      if (targetParts.section) {
+        const sectionSim = wordSetSimilarity(translatedParts.section, targetParts.section);
+        if (sectionSim >= 0.4) {
+          const pageSim = wordSetSimilarity(translatedParts.pageName, targetParts.pageName);
+          sectionBonus = pageSim * 0.1 + sectionSim * 0.05;
+          usedSection = true;
+        }
+      }
+    }
+
+    const sim = Math.min(baseSim + sectionBonus, 1.0);
+
+    if (sim > bestSimilarity) {
+      secondBestSimilarity = bestSimilarity;
+      bestSimilarity = sim;
+      bestMatch = {
+        url,
+        confidence: Math.round(70 + sim * 20),
+        method: usedSection ? "title-section-match" : "title-match",
+        similarity: sim,
+      };
+    } else if (sim > secondBestSimilarity) {
+      secondBestSimilarity = sim;
+    }
+  });
+
+  const finalMatch = bestMatch as TitleMatchResult | null;
+  if (finalMatch) {
+    const gap = bestSimilarity - secondBestSimilarity;
+    if (gap < 0.05 && bestSimilarity < 0.95) {
+      log(`    Title match REJECTED (ambiguous): "${translatedTitle}" best=${bestSimilarity.toFixed(3)} second=${secondBestSimilarity.toFixed(3)} gap=${gap.toFixed(3)}`);
+      return null;
+    }
+
+    if (!sourceSegments || sourceSegments.size === 0) {
+      log(`    Title match REJECTED (no source segments to validate): "${translatedTitle}" -> ${finalMatch.url}`);
+      return null;
+    }
+
+    try {
+      const matchParts = new URL(finalMatch.url).pathname.split("/").filter(Boolean);
+      const matchNorms = matchParts.map(p => normalizeSegment(p));
+      let sharedSegments = 0;
+      for (const seg of matchNorms) {
+        if (sourceSegments.has(seg)) sharedSegments++;
+      }
+      if (sharedSegments === 0 && matchNorms.length > 2) {
+        log(`    Title match REJECTED (no shared segments): "${translatedTitle}" -> ${finalMatch.url}`);
+        return null;
+      }
+    } catch {
+      log(`    Title match REJECTED (URL parse error): "${translatedTitle}" -> ${finalMatch.url}`);
+      return null;
+    }
+  }
+
+  return finalMatch;
+}
+
 export async function titleMatchUnmatched(
   unmatchedRows: { rowIndex: number; title: string; sourceUrl: string; needsEn: boolean; needsFr: boolean }[],
-  enScopedInventory: CrawlInventory | null,
-  frScopedInventory: CrawlInventory | null,
+  enInventory: CrawlInventory | null,
+  frInventory: CrawlInventory | null,
   dbStorage?: IStorage,
+  enAllowedRoots?: string[],
+  frAllowedRoots?: string[],
+  enRefDepths?: number[],
+  frRefDepths?: number[],
   knownEnUrls?: Set<string>,
   knownFrUrls?: Set<string>,
 ): Promise<Map<number, BatchMatchResult>> {
@@ -1299,8 +1230,8 @@ export async function titleMatchUnmatched(
   const titles = unmatchedRows.map((r) => r.title).filter(Boolean);
   if (titles.length === 0) return results;
 
-  const enTitlesNeeded = unmatchedRows.filter(r => r.needsEn && enScopedInventory && enScopedInventory.titleIndex.size > 0).map(r => r.title).filter(Boolean);
-  const frTitlesNeeded = unmatchedRows.filter(r => r.needsFr && frScopedInventory && frScopedInventory.titleIndex.size > 0).map(r => r.title).filter(Boolean);
+  const enTitlesNeeded = unmatchedRows.filter(r => r.needsEn && enInventory && enInventory.titleIndex.size > 0 && enAllowedRoots && enAllowedRoots.length > 0).map(r => r.title).filter(Boolean);
+  const frTitlesNeeded = unmatchedRows.filter(r => r.needsFr && frInventory && frInventory.titleIndex.size > 0 && frAllowedRoots && frAllowedRoots.length > 0).map(r => r.title).filter(Boolean);
 
   let enTranslations = new Map<string, string>();
   let frTranslations = new Map<string, string>();
@@ -1317,7 +1248,7 @@ export async function titleMatchUnmatched(
   }
 
   let titleMatches = 0;
-  let rejected = { ambiguous: 0, noSegments: 0, crossValidation: 0, knownUrl: 0 };
+  let rejected = { ambiguous: 0, noSegments: 0, depth: 0, crossValidation: 0, knownUrl: 0 };
   const usedEnUrls = new Set<string>();
   const usedFrUrls = new Set<string>();
 
@@ -1340,17 +1271,17 @@ export async function titleMatchUnmatched(
     let enMatch: TitleMatchResult | null = null;
     let frMatch: TitleMatchResult | null = null;
 
-    if (row.needsEn && enScopedInventory && enScopedInventory.titleIndex.size > 0) {
+    if (row.needsEn && enInventory && enInventory.titleIndex.size > 0 && enAllowedRoots && enAllowedRoots.length > 0) {
       const enTitle = enTranslations.get(row.title);
       if (enTitle) {
-        enMatch = matchByTitle(enTitle, enScopedInventory, 0.85, sourceSegments);
+        enMatch = matchByTitle(enTitle, enInventory, 0.85, enAllowedRoots, enRefDepths, sourceSegments);
       }
     }
 
-    if (row.needsFr && frScopedInventory && frScopedInventory.titleIndex.size > 0) {
+    if (row.needsFr && frInventory && frInventory.titleIndex.size > 0 && frAllowedRoots && frAllowedRoots.length > 0) {
       const frTitle = frTranslations.get(row.title);
       if (frTitle) {
-        frMatch = matchByTitle(frTitle, frScopedInventory, 0.85, sourceSegments);
+        frMatch = matchByTitle(frTitle, frInventory, 0.85, frAllowedRoots, frRefDepths, sourceSegments);
       }
     }
 
@@ -1380,7 +1311,7 @@ export async function titleMatchUnmatched(
           }
         }
         if (tailOverlap === 0 && enTail.length > 0 && frTail.length > 0) {
-          log(`    Cross-validation REJECTED BOTH: EN "${enMatch.url}" vs FR "${frMatch.url}" (no tail overlap)`);
+          log(`    Cross-validation REJECTED BOTH: EN "${enMatch.url}" vs FR "${frMatch.url}" (no tail overlap, disagreement)`);
           enMatch = null;
           frMatch = null;
           rejected.crossValidation += 2;
@@ -1453,6 +1384,7 @@ export async function titleMatchUnmatched(
 }
 
 const AI_BATCH_SIZE = 15;
+const AI_CONCURRENCY = 2;
 
 interface AiMatchInput {
   rowIndex: number;
@@ -1460,8 +1392,6 @@ interface AiMatchInput {
   sourceUrl: string;
   needsEn: boolean;
   needsFr: boolean;
-  enDirectoryContext?: string;
-  frDirectoryContext?: string;
 }
 
 interface AiSuggestion {
@@ -1469,163 +1399,6 @@ interface AiSuggestion {
   englishUrl: string | null;
   frenchUrl: string | null;
   reasoning: string;
-}
-
-export const AI_MODEL = "claude-opus-4-6";
-export const AI_CONFIDENCE_SCORE = 82;
-export const AI_METHOD_LABEL = "dir-ai";
-
-export const AI_SYSTEM_PROMPT_TEMPLATE = `You are a URL matching expert for a multilingual government website. Your task is to find the correct English and/or French equivalent pages for Hebrew source URLs.
-
-CRITICAL RULES:
-1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs.
-2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
-3. Each target URL should only be used ONCE across all matches. Do not assign the same target URL to multiple source URLs.
-4. URLs that are already matched should not appear again. Check the "already used" lists.
-5. Focus on matching the page PURPOSE and CONTENT, not just superficial URL similarity.
-6. Pay attention to the DIRECTORY CONTEXT - each source URL belongs to a specific directory, and its match should be found within the corresponding target directory.
-
-WEBSITE STRUCTURE:
-{{patternContext}}
-
-DIRECTORY CONTEXT:
-{{directoryContext}}
-
-EXAMPLES OF CORRECTLY MATCHED PAIRS:
-{{exampleLines}}
-
-ALREADY USED ENGLISH URLs (do NOT reuse these):
-{{usedEnUrls}}
-
-ALREADY USED FRENCH URLs (do NOT reuse these):
-{{usedFrUrls}}`;
-
-export const AI_USER_PROMPT_TEMPLATE = `Find the matching English and/or French URLs for each of these Hebrew source URLs. Each URL includes its directory context - focus your search within the indicated target directories.
-
-UNMATCHED SOURCE URLs:
-{{urlsBlock}}
-
-AVAILABLE ENGLISH URLs (pick ONLY from this list):
-{{enInventoryList}}
-
-AVAILABLE FRENCH URLs (pick ONLY from this list):
-{{frInventoryList}}
-
-For each source URL, respond with a JSON array of objects. Each object must have:
-- "sourceUrl": the original Hebrew source URL
-- "englishUrl": the matching English URL from the inventory, or null if no confident match
-- "frenchUrl": the matching French URL from the inventory, or null if no confident match
-- "reasoning": a brief explanation of why you matched these URLs (or why no match was found)
-
-Return ONLY the JSON array, no markdown formatting, no code fences, no other text.`;
-
-export const AI_VALIDATION_PIPELINE = [
-  { step: 1, name: "Inventory membership check", description: "Every URL suggested by the AI must exist in the crawl inventory. URLs not in inventory are rejected." },
-  { step: 2, name: "Duplicate check", description: "Each target URL can only be assigned to one source URL. Duplicates are rejected." },
-  { step: 3, name: "Directory context check", description: "AI-suggested URLs are validated against the expected target directory scope." },
-];
-
-export function getAiConfig() {
-  return {
-    model: AI_MODEL,
-    provider: "Anthropic (via Replit AI Integrations)",
-    confidenceScore: AI_CONFIDENCE_SCORE,
-    methodLabel: AI_METHOD_LABEL,
-    batchSize: AI_BATCH_SIZE,
-    systemPromptTemplate: AI_SYSTEM_PROMPT_TEMPLATE,
-    userPromptTemplate: AI_USER_PROMPT_TEMPLATE,
-    validationPipeline: AI_VALIDATION_PIPELINE,
-    matchingRules: [
-      "AI matching is the FINAL fallback — only runs on URLs unmatched after directory-scoped pattern matching, tail matching, fuzzy matching, and title-based matching",
-      "AI is constrained to ONLY select from the crawl inventory — it can never invent URLs",
-      "AI receives directory context: which source directory the URL belongs to and the corresponding target directory to search in",
-      "Batches of ~15 unmatched URLs are processed per API call",
-      "Accuracy over completeness: returning null is always preferred over a wrong match",
-      "AI matches get confidence score of 82 and method label 'dir-ai'",
-    ],
-  };
-}
-
-function rankInventoryByTitleSimilarity(
-  inventory: CrawlInventory,
-  translatedTitles: string[],
-  usedUrls: Set<string>,
-  maxResults: number = 200,
-): string[] {
-  const scored: { url: string; score: number }[] = [];
-
-  for (const [url, pageTitle] of inventory.titleIndex.entries()) {
-    if (usedUrls.has(url)) continue;
-    let bestSim = 0;
-    for (const title of translatedTitles) {
-      const sim = titleSimilarity(title, pageTitle);
-      if (sim > bestSim) bestSim = sim;
-    }
-    if (bestSim > 0.15) {
-      scored.push({ url, score: bestSim });
-    }
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, maxResults).map(s => s.url);
-}
-
-export function crossLanguageDerive(
-  matchedUrl: string,
-  fromLang: "en" | "fr",
-  toLang: "en" | "fr",
-  tabPatterns: TabPatterns,
-  targetInventory: CrawlInventory,
-  usedUrls: Set<string>,
-): { url: string; confidence: number; method: string } | null {
-  const fromRoot = fromLang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
-  const toRoot = toLang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
-
-  if (fromRoot.length === 0 || toRoot.length === 0) return null;
-
-  try {
-    const parsed = new URL(matchedUrl);
-    const parts = parsed.pathname.split("/").filter(Boolean);
-
-    let rootMatchLen = 0;
-    for (let i = 0; i < fromRoot.length && i < parts.length; i++) {
-      if (normalizeSegment(parts[i]) === normalizeSegment(fromRoot[i])) {
-        rootMatchLen++;
-      } else {
-        break;
-      }
-    }
-
-    if (rootMatchLen === 0) return null;
-
-    const remainder = parts.slice(rootMatchLen);
-    const candidatePath = "/" + [...toRoot, ...remainder].join("/");
-    const candidateNorm = candidatePath.toLowerCase();
-
-    for (const url of targetInventory.urls) {
-      if (usedUrls.has(url)) continue;
-      const p = new URL(url);
-      if (p.pathname.toLowerCase() === candidateNorm ||
-          p.pathname.toLowerCase() === candidateNorm + "/pages/default.aspx" ||
-          p.pathname.toLowerCase().replace(/\/pages\/[^/]+$/i, "") === candidateNorm) {
-        return { url, confidence: 85, method: "dir-cross-lang" };
-      }
-    }
-
-    const matchedTail = getUrlTail(matchedUrl, 2);
-    if (matchedTail) {
-      const tailMatches = targetInventory.tailIndex.get(matchedTail);
-      if (tailMatches) {
-        for (const url of tailMatches) {
-          if (!usedUrls.has(url)) {
-            return { url, confidence: 80, method: "dir-cross-lang-tail" };
-          }
-        }
-      }
-    }
-  } catch {}
-
-  return null;
 }
 
 export async function aiMatchUnmatched(
@@ -1638,16 +1411,18 @@ export async function aiMatchUnmatched(
   frTranslations: Map<string, string>,
   knownEnUrls: Set<string>,
   knownFrUrls: Set<string>,
-  origin: string,
 ): Promise<Map<number, BatchMatchResult>> {
   const results = new Map<number, BatchMatchResult>();
 
   if (unmatchedRows.length === 0) return results;
 
-  const anthropic = new Anthropic({
-    apiKey: process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY,
-    baseURL: process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL,
+  const openai = new OpenAI({
+    apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
+    baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
   });
+
+  const enInventoryUrls = enInventory ? Array.from(enInventory.urls) : [];
+  const frInventoryUrls = frInventory ? Array.from(frInventory.urls) : [];
 
   const exampleLines = matchedExamples.slice(0, 8).map(ex => {
     const parts = [`  Source: ${ex.sourceUrl}`];
@@ -1674,15 +1449,12 @@ export async function aiMatchUnmatched(
     patternContext.push(`Known Hebrew→French segment translations: ${segs.map(([k,v]) => `${k}→${v}`).join(", ")}`);
   }
 
-  const dirContextLines: string[] = [];
-  for (const mapping of tabPatterns.directoryMappings.slice(0, 20)) {
-    dirContextLines.push(`  ${mapping.lang.toUpperCase()}: ${mapping.sourceDir} → ${mapping.targetDir}`);
-  }
-
   const batches: AiMatchInput[][] = [];
   for (let i = 0; i < unmatchedRows.length; i += AI_BATCH_SIZE) {
     batches.push(unmatchedRows.slice(i, i + AI_BATCH_SIZE));
   }
+
+  log(`  AI matching: ${unmatchedRows.length} unmatched URLs in ${batches.length} batches (inventory: ${enInventoryUrls.length} EN, ${frInventoryUrls.length} FR)`);
 
   const usedEnUrls = new Set<string>(knownEnUrls);
   const usedFrUrls = new Set<string>(knownFrUrls);
@@ -1690,61 +1462,6 @@ export async function aiMatchUnmatched(
 
   for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
     const batch = batches[batchIdx];
-
-    const batchEnUrls = new Set<string>();
-    const batchFrUrls = new Set<string>();
-
-    for (const row of batch) {
-      if (row.needsEn && row.enDirectoryContext && enInventory) {
-        const scoped = getScopedInventory(enInventory, row.enDirectoryContext, origin);
-        for (const url of scoped.urls) {
-          if (!usedEnUrls.has(url)) batchEnUrls.add(url);
-        }
-      }
-      if (row.needsFr && row.frDirectoryContext && frInventory) {
-        const scoped = getScopedInventory(frInventory, row.frDirectoryContext, origin);
-        for (const url of scoped.urls) {
-          if (!usedFrUrls.has(url)) batchFrUrls.add(url);
-        }
-      }
-    }
-
-    const needsEnFallback = batch.some(r => r.needsEn) && batchEnUrls.size === 0;
-    const needsFrFallback = batch.some(r => r.needsFr) && batchFrUrls.size === 0;
-
-    if (needsEnFallback || needsFrFallback) {
-      const batchTitles = batch
-        .map(r => enTranslations.get(r.title) || frTranslations.get(r.title))
-        .filter(Boolean) as string[];
-
-      if (batchTitles.length > 0) {
-        if (needsEnFallback && enInventory) {
-          const ranked = rankInventoryByTitleSimilarity(enInventory, batchTitles, usedEnUrls);
-          for (const url of ranked) batchEnUrls.add(url);
-          if (ranked.length > 0) {
-            log(`    Fallback scoping (EN): title-ranked ${ranked.length} candidates (from ${enInventory.urls.size} total)`);
-          }
-        }
-        if (needsFrFallback && frInventory) {
-          const ranked = rankInventoryByTitleSimilarity(frInventory, batchTitles, usedFrUrls);
-          for (const url of ranked) batchFrUrls.add(url);
-          if (ranked.length > 0) {
-            log(`    Fallback scoping (FR): title-ranked ${ranked.length} candidates (from ${frInventory.urls.size} total)`);
-          }
-        }
-      }
-
-      if (batchEnUrls.size === 0 && needsEnFallback && enInventory) {
-        for (const url of enInventory.urls) {
-          if (!usedEnUrls.has(url)) batchEnUrls.add(url);
-        }
-      }
-      if (batchFrUrls.size === 0 && needsFrFallback && frInventory) {
-        for (const url of frInventory.urls) {
-          if (!usedFrUrls.has(url)) batchFrUrls.add(url);
-        }
-      }
-    }
 
     const urlsBlock = batch.map(row => {
       const parts = [`- Source URL: ${row.sourceUrl}`];
@@ -1755,48 +1472,70 @@ export async function aiMatchUnmatched(
       if (frTitle) parts.push(`  Title (French translation): ${frTitle}`);
       if (row.needsEn) parts.push(`  Needs: English URL`);
       if (row.needsFr) parts.push(`  Needs: French URL`);
-      if (row.enDirectoryContext) parts.push(`  EN directory context: ${row.enDirectoryContext}`);
-      if (row.frDirectoryContext) parts.push(`  FR directory context: ${row.frDirectoryContext}`);
       return parts.join("\n");
     }).join("\n\n");
 
-    const enList = Array.from(batchEnUrls);
-    const frList = Array.from(batchFrUrls);
+    const enListForBatch = enInventoryUrls.length <= 500
+      ? enInventoryUrls.join("\n")
+      : enInventoryUrls.slice(0, 500).join("\n") + `\n... (${enInventoryUrls.length - 500} more)`;
 
-    const enListStr = enList.length <= 500
-      ? enList.join("\n")
-      : enList.slice(0, 500).join("\n") + `\n... (${enList.length - 500} more)`;
+    const frListForBatch = frInventoryUrls.length <= 500
+      ? frInventoryUrls.join("\n")
+      : frInventoryUrls.slice(0, 500).join("\n") + `\n... (${frInventoryUrls.length - 500} more)`;
 
-    const frListStr = frList.length <= 500
-      ? frList.join("\n")
-      : frList.slice(0, 500).join("\n") + `\n... (${frList.length - 500} more)`;
+    const systemPrompt = `You are a URL matching expert for a multilingual government website. Your task is to find the correct English and/or French equivalent pages for Hebrew source URLs.
 
-    const systemPrompt = AI_SYSTEM_PROMPT_TEMPLATE
-      .replace("{{patternContext}}", patternContext.join("\n"))
-      .replace("{{directoryContext}}", dirContextLines.join("\n") || "(no directory mappings available)")
-      .replace("{{exampleLines}}", exampleLines)
-      .replace("{{usedEnUrls}}", Array.from(usedEnUrls).slice(-50).join("\n") || "(none)")
-      .replace("{{usedFrUrls}}", Array.from(usedFrUrls).slice(-50).join("\n") || "(none)");
+CRITICAL RULES:
+1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs.
+2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
+3. Each target URL should only be used ONCE across all matches. Do not assign the same target URL to multiple source URLs.
+4. URLs that are already matched should not appear again. Check the "already used" lists.
+5. Focus on matching the page PURPOSE and CONTENT, not just superficial URL similarity.
+6. Pay attention to the URL path structure - pages in the same section should map to the corresponding section in the target language.
 
-    const userPrompt = AI_USER_PROMPT_TEMPLATE
-      .replace("{{urlsBlock}}", urlsBlock)
-      .replace("{{enInventoryList}}", enListStr || "(no English inventory available)")
-      .replace("{{frInventoryList}}", frListStr || "(no French inventory available)");
+WEBSITE STRUCTURE:
+${patternContext.join("\n")}
+
+EXAMPLES OF CORRECTLY MATCHED PAIRS:
+${exampleLines}
+
+ALREADY USED ENGLISH URLs (do NOT reuse these):
+${Array.from(usedEnUrls).slice(-50).join("\n") || "(none)"}
+
+ALREADY USED FRENCH URLs (do NOT reuse these):
+${Array.from(usedFrUrls).slice(-50).join("\n") || "(none)"}`;
+
+    const userPrompt = `Find the matching English and/or French URLs for each of these Hebrew source URLs.
+
+UNMATCHED SOURCE URLs:
+${urlsBlock}
+
+AVAILABLE ENGLISH URLs (pick ONLY from this list):
+${enListForBatch || "(no English inventory available)"}
+
+AVAILABLE FRENCH URLs (pick ONLY from this list):
+${frListForBatch || "(no French inventory available)"}
+
+For each source URL, respond with a JSON array of objects. Each object must have:
+- "sourceUrl": the original Hebrew source URL
+- "englishUrl": the matching English URL from the inventory, or null if no confident match
+- "frenchUrl": the matching French URL from the inventory, or null if no confident match  
+- "reasoning": a brief explanation of why you matched these URLs (or why no match was found)
+
+Return ONLY the JSON array, no other text.`;
 
     try {
-      log(`  AI batch ${batchIdx + 1}/${batches.length}: ${batch.length} URLs, inventory scope: ${enList.length} EN, ${frList.length} FR`);
-
-      const message = await anthropic.messages.create({
-        model: AI_MODEL,
-        max_tokens: 8192,
-        system: systemPrompt,
+      const response = await openai.chat.completions.create({
+        model: "gpt-5-mini",
         messages: [
+          { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
         ],
+        response_format: { type: "json_object" },
+        max_completion_tokens: 8192,
       });
 
-      const textBlock = message.content.find(b => b.type === "text");
-      const content = textBlock?.text;
+      const content = response.choices[0]?.message?.content;
       if (!content) {
         log(`    AI batch ${batchIdx + 1}/${batches.length}: empty response`);
         continue;
@@ -1804,8 +1543,7 @@ export async function aiMatchUnmatched(
 
       let suggestions: AiSuggestion[] = [];
       try {
-        const jsonStr = content.replace(/^```json?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
-        const parsed = JSON.parse(jsonStr);
+        const parsed = JSON.parse(content);
         suggestions = Array.isArray(parsed) ? parsed : (parsed.matches || parsed.results || parsed.urls || []);
       } catch {
         log(`    AI batch ${batchIdx + 1}/${batches.length}: failed to parse response`);
@@ -1832,8 +1570,8 @@ export async function aiMatchUnmatched(
             log(`    AI REJECTED (already used): EN ${suggestion.englishUrl}`);
           } else {
             result.enUrl = suggestion.englishUrl;
-            result.confidenceEn = AI_CONFIDENCE_SCORE;
-            result.matchMethodEn = AI_METHOD_LABEL;
+            result.confidenceEn = 82;
+            result.matchMethodEn = "ai-match";
             usedEnUrls.add(suggestion.englishUrl);
           }
         }
@@ -1845,8 +1583,8 @@ export async function aiMatchUnmatched(
             log(`    AI REJECTED (already used): FR ${suggestion.frenchUrl}`);
           } else {
             result.frUrl = suggestion.frenchUrl;
-            result.confidenceFr = AI_CONFIDENCE_SCORE;
-            result.matchMethodFr = AI_METHOD_LABEL;
+            result.confidenceFr = 82;
+            result.matchMethodFr = "ai-match";
             usedFrUrls.add(suggestion.frenchUrl);
           }
         }

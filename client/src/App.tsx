@@ -2,13 +2,12 @@ import { useState, useCallback } from "react";
 import { FileUpload } from "@/components/dashboard/file-upload";
 import { ProcessingView } from "@/components/dashboard/processing-view";
 import { ResultsView } from "@/components/dashboard/results-view";
-import { CrawlManager } from "@/pages/crawl-manager";
-import { Globe, Languages, Sparkles, Settings, Database } from "lucide-react";
+import { Globe, Languages, Sparkles, Settings } from "lucide-react";
 import { uploadFile, startJob } from "@/lib/api";
 import heroBg from "./assets/hero-bg.png";
 
 function App() {
-  const [appState, setAppState] = useState<"idle" | "uploading" | "processing" | "results" | "crawl-manager">("idle");
+  const [appState, setAppState] = useState<"idle" | "uploading" | "processing" | "results">("idle");
   const [file, setFile] = useState<File | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -64,14 +63,6 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-4">
-            <button
-              onClick={() => setAppState("crawl-manager")}
-              className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors px-3 py-1.5 rounded-lg hover:bg-muted/50"
-              data-testid="button-crawl-manager"
-            >
-              <Database className="w-4 h-4" />
-              <span>Inventory</span>
-            </button>
             <button className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors px-3 py-1.5 rounded-lg hover:bg-muted/50" data-testid="button-languages">
               <Languages className="w-4 h-4" />
               <span>Target: EN, FR</span>
@@ -131,12 +122,6 @@ function App() {
           {appState === "results" && jobId && (
             <div className="w-full animate-in fade-in slide-in-from-bottom-8 duration-700">
               <ResultsView jobId={jobId} onReset={resetApp} />
-            </div>
-          )}
-
-          {appState === "crawl-manager" && (
-            <div className="w-full animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <CrawlManager onBack={resetApp} />
             </div>
           )}
         </main>

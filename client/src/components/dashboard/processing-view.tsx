@@ -40,8 +40,8 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
   const prevMatchedRef = useRef<number>(0);
 
   const steps = [
-    { id: "learning", title: "Learning Patterns", icon: Search, desc: "Learning directory mappings from reference rows..." },
-    { id: "matching", title: "Directory Matching", icon: GitMerge, desc: "Matching URLs within mapped directories..." },
+    { id: "learning", title: "Learning Patterns", icon: Search, desc: "Extracting URL patterns from reference rows..." },
+    { id: "matching", title: "URL Matching", icon: GitMerge, desc: "Constructing & verifying target URLs..." },
     { id: "ai-matching", title: "AI Matching", icon: Brain, desc: "Using AI to match remaining URLs..." },
     { id: "saving", title: "Saving Results", icon: Save, desc: "Writing results to database..." },
   ];
