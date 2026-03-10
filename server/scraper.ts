@@ -1382,20 +1382,24 @@ export function matchByTitle(
       return null;
     }
 
-    try {
-      const matchParts = new URL(finalMatch.url).pathname.split("/").filter(Boolean);
-      const matchNorms = matchParts.map(p => normalizeSegment(p));
-      let sharedSegments = 0;
-      for (const seg of matchNorms) {
-        if (sourceSegments.has(seg)) sharedSegments++;
-      }
-      if (sharedSegments === 0 && matchNorms.length > 2) {
-        log(`    Title match REJECTED (no shared segments): "${translatedTitle}" -> ${finalMatch.url}`);
+    const allNonLatin = Array.from(sourceSegments).every(seg => /[^\x00-\x7F]/.test(seg));
+
+    if (!allNonLatin) {
+      try {
+        const matchParts = new URL(finalMatch.url).pathname.split("/").filter(Boolean);
+        const matchNorms = matchParts.map(p => normalizeSegment(p));
+        let sharedSegments = 0;
+        for (const seg of matchNorms) {
+          if (sourceSegments.has(seg)) sharedSegments++;
+        }
+        if (sharedSegments === 0 && matchNorms.length > 2) {
+          log(`    Title match REJECTED (no shared segments): "${translatedTitle}" -> ${finalMatch.url}`);
+          return null;
+        }
+      } catch {
+        log(`    Title match REJECTED (URL parse error): "${translatedTitle}" -> ${finalMatch.url}`);
         return null;
       }
-    } catch {
-      log(`    Title match REJECTED (URL parse error): "${translatedTitle}" -> ${finalMatch.url}`);
-      return null;
     }
   }
 
@@ -1716,19 +1720,34 @@ For each source URL, respond with a JSON array of objects. Each object must have
 Return ONLY the JSON array, no other text.`;
 
     try {
-      const response = await openai.chat.completions.create({
-        model: "gpt-5-mini",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        response_format: { type: "json_object" },
-        max_completion_tokens: 8192,
-      });
+      let content: string | null = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const response = await openai.chat.completions.create({
+            model: "gpt-5-mini",
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: userPrompt },
+            ],
+            response_format: { type: "json_object" },
+            max_completion_tokens: 8192,
+          });
+          content = response.choices[0]?.message?.content || null;
+          break;
+        } catch (retryErr: any) {
+          const status = retryErr?.status || retryErr?.response?.status;
+          if (status === 401 || status === 429) {
+            const delay = (attempt + 1) * 2000;
+            log(`    AI batch ${batchIdx + 1}/${batches.length}: ${status} error, retrying in ${delay}ms (attempt ${attempt + 1}/3)`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+          throw retryErr;
+        }
+      }
 
-      const content = response.choices[0]?.message?.content;
       if (!content) {
-        log(`    AI batch ${batchIdx + 1}/${batches.length}: empty response`);
+        log(`    AI batch ${batchIdx + 1}/${batches.length}: failed after 3 retries (likely auth/rate-limit issue)`);
         continue;
       }
 

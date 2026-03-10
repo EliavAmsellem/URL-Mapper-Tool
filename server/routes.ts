@@ -381,6 +381,8 @@ async function matchTab(
   }
 
   const unmatchedForHead: { index: number; lang: "en" | "fr"; constructedUrl: string; sourceUrl: string }[] = [];
+  let debugSamples = 0;
+  const MAX_DEBUG_SAMPLES = 5;
   for (const row of needsMatching) {
     if (control.cancel) break;
     const result: BatchMatchResult = {
@@ -398,6 +400,14 @@ async function matchTab(
         usedEnUrls.add(match.url);
       } else {
         const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
+        if (debugSamples < MAX_DEBUG_SAMPLES) {
+          const reason = match ? `dedup-blocked (${match.url})` : "not-in-inventory";
+          log(`    [DEBUG] EN miss: ${row.sourceUrl}`);
+          log(`      untranslated: ${untranslated || "null"} | inInventory: ${untranslated ? enInventory.urls.has(untranslated) : false}`);
+          log(`      translated: ${translated || "null"} | inInventory: ${translated ? enInventory.urls.has(translated) : false}`);
+          log(`      reason: ${reason}`);
+          debugSamples++;
+        }
         if (untranslated && !usedEnUrls.has(untranslated)) {
           unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: untranslated, sourceUrl: row.sourceUrl });
         }
@@ -428,9 +438,20 @@ async function matchTab(
     matchResults.set(row.rowIndex, result);
   }
 
-  if (unmatchedForHead.length > 0) {
-    log(`  Falling back to HEAD checks for ${unmatchedForHead.length} unmatched URLs...`);
-    const headUrls = unmatchedForHead.map((u) => u.constructedUrl);
+  const asciiOnly = unmatchedForHead.filter(u => {
+    try {
+      const decoded = decodeURIComponent(new URL(u.constructedUrl).pathname);
+      return !/[\u0590-\u05FF\u0600-\u06FF\uFB1D-\uFDFF\uFE70-\uFEFF]/.test(decoded);
+    } catch { return false; }
+  });
+  const skippedNonAscii = unmatchedForHead.length - asciiOnly.length;
+  if (skippedNonAscii > 0) {
+    log(`  Skipping ${skippedNonAscii} HEAD candidates with Hebrew/Arabic path segments`);
+  }
+
+  if (asciiOnly.length > 0) {
+    log(`  Falling back to HEAD checks for ${asciiOnly.length} URLs...`);
+    const headUrls = asciiOnly.map((u) => u.constructedUrl);
     const existence = await batchHeadCheck(headUrls);
     let headMatched = 0;
     let headDepthRejected = 0;
@@ -439,7 +460,7 @@ async function matchTab(
     const enTgtRoot = tabPatterns.enRoot;
     const frTgtRoot = tabPatterns.frRoot;
 
-    for (const item of unmatchedForHead) {
+    for (const item of asciiOnly) {
       if (existence.get(item.constructedUrl)) {
         const srcRoot = item.lang === "en" ? enSrcRoot : frSrcRoot;
         const tgtRoot = item.lang === "en" ? enTgtRoot : frTgtRoot;
@@ -481,7 +502,7 @@ async function matchTab(
         }
       }
     }
-    log(`  HEAD fallback: ${headMatched}/${unmatchedForHead.length} verified${headDepthRejected > 0 ? `, ${headDepthRejected} depth-rejected` : ''}`);
+    log(`  HEAD fallback: ${headMatched}/${asciiOnly.length} verified${headDepthRejected > 0 ? `, ${headDepthRejected} depth-rejected` : ''}`);
   }
 
   const unmatchedForTitle = needsMatching.filter(row => {

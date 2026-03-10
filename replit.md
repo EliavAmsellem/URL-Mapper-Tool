@@ -85,13 +85,15 @@ Matching strategies are tried in this order:
 8. **Segment fuzzy matching**: Word-overlap Jaccard similarity on last segment (confidence 80-90, requires score ≥ 0.6 and at least 2 overlapping words)
 
 #### Step 4: Batch HEAD Verification
-- All constructed URLs are verified with HTTP HEAD requests (50 concurrent, 3s timeout)
+- Constructed candidate URLs are verified with HTTP HEAD requests (50 concurrent, 3s timeout)
+- **Hebrew/Arabic path filtering**: Candidates with Hebrew or Arabic characters in the path are automatically skipped (these URLs never exist on the target language site and would waste verification time)
 - URLs returning non-200 status are discarded
 - Verified URLs get confidence score of 90
 
 #### Step 5: Title-Based Matching with Section Awareness
 - For URLs still unmatched after pattern/crawl matching, page titles are extracted and translated Hebrew→EN/FR using Google Translate GTX endpoint
 - Translated titles are fuzzy-matched against crawl inventory page titles using word-overlap similarity
+- **Cross-language segment validation**: When ALL source URL path segments are non-Latin (e.g., Hebrew), the shared-segment validation is skipped since Hebrew segments never match English segments. When source URLs contain Latin segments (like transliterated page names), shared-segment validation is enforced to prevent false positives
 - **Section-aware scoring**: Titles like "Unemployment - Conditions of entitlement" are split into section prefix ("Unemployment") and page name ("Conditions of entitlement"). When both source and target titles have section prefixes, matching sections provide a similarity boost (up to +0.15), helping disambiguate pages with similar names across different website sections
 - Section matching is purely additive (boost-only) — it never excludes or penalizes candidates, preserving recall
 - 5 concurrent translation requests with rate limiting (200ms between batches)
@@ -101,7 +103,7 @@ Matching strategies are tried in this order:
 - For URLs still unmatched after all deterministic steps, an AI agent (GPT-5-mini via Replit AI Integrations) attempts matching
 - The AI receives: unmatched source URLs with translated titles, the full crawl inventory of available target URLs, learned URL patterns and segment translations, and examples of already-matched pairs
 - AI is constrained to ONLY select from the crawl inventory — never invents URLs
-- Batches of ~15 unmatched URLs are processed per API call
+- Batches of ~15 unmatched URLs are processed per API call, with retry logic (3 attempts with exponential backoff) for 401/429 errors
 - All AI-suggested URLs are HEAD-verified before acceptance (same as pattern matches)
 - AI matches are labeled with method "ai-match" and confidence score 82
 - Duplicate prevention: AI cannot reuse URLs already assigned by earlier matching steps
