@@ -19,9 +19,9 @@ The backend is built with Node.js and Express, written in TypeScript. It provide
 ### Feature Specifications
 LinguaMap employs a sophisticated pattern-based URL construction engine. This engine learns URL transformation patterns from reference rows in uploaded files, enabling it to construct candidate target URLs. It uses a multi-step matching process:
 1.  **Pattern Learning**: Identifies source and target roots and segment-level translations from reference URLs.
-2.  **URL Construction**: Generates both "untranslated" and "translated" candidate URLs based on learned patterns.
+2.  **URL Construction**: Generates candidate URLs from ALL applicable per-pair root mappings (not just the longest match) via `constructAllTargetUrls`, handling cases where reference data has conflicting mappings for the same source subsection.
 3.  **Crawl Inventory Matching**: Prioritizes matching against an inventory of URLs discovered by crawling target language sections, including SharePoint-specific directory discovery. This also includes global deduplication to ensure each target URL is mapped only once.
-4.  **Batch HEAD Verification**: Validates constructed URLs using HTTP HEAD requests, filtering out non-existent or invalid URLs.
+4.  **Batch HEAD Verification**: Validates constructed URLs using HTTP HEAD requests (10 concurrent, 12s timeout, 200ms delay between batches), filtering out non-existent or invalid URLs. Source-derived crawl seeds are also generated from all constructed candidates for orphan page discovery.
 5.  **Title-Based Matching**: Extracts and translates page titles (Hebrew→EN/FR) to fuzzy-match against the crawl inventory, incorporating section awareness for improved accuracy.
 6.  **AI-Powered Matching**: As a final fallback, an AI agent (GPT-5-mini) suggests matches from the crawl inventory for URLs still unmatched, emphasizing accuracy over completeness.
 

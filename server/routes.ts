@@ -9,6 +9,7 @@ import {
   learnTabPatterns,
   batchConstructUrls,
   constructTargetUrl,
+  constructAllTargetUrls,
   validatePatterns,
   batchHeadCheck,
   crawlDirectory,
@@ -374,14 +375,14 @@ async function matchTab(
 
   for (const row of needsMatching) {
     if (row.needsEn && tabPatterns.enRoot.length > 0) {
-      const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
-      if (untranslated) enSeedUrls.push(untranslated);
-      if (translated && translated !== untranslated) enSeedUrls.push(translated);
+      for (const url of constructAllTargetUrls(row.sourceUrl, "en", tabPatterns)) {
+        enSeedUrls.push(url);
+      }
     }
     if (row.needsFr && tabPatterns.frRoot.length > 0) {
-      const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
-      if (untranslated) frSeedUrls.push(untranslated);
-      if (translated && translated !== untranslated) frSeedUrls.push(translated);
+      for (const url of constructAllTargetUrls(row.sourceUrl, "fr", tabPatterns)) {
+        frSeedUrls.push(url);
+      }
     }
   }
 
@@ -457,20 +458,20 @@ async function matchTab(
         inventoryMatchCount++;
       } else {
         if (match) dedupBlockedCount++; else inventoryMissCount++;
-        const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
+        const allCandidates = constructAllTargetUrls(row.sourceUrl, "en", tabPatterns);
         if (debugSamples < MAX_DEBUG_SAMPLES) {
           const reason = match ? `dedup-blocked (${match.url})` : "not-in-inventory";
           log(`    [DEBUG] EN miss: ${row.sourceUrl}`);
-          log(`      untranslated: ${untranslated || "null"} | inInventory: ${untranslated ? enInventory.urls.has(untranslated) : false}`);
-          log(`      translated: ${translated || "null"} | inInventory: ${translated ? enInventory.urls.has(translated) : false}`);
-          log(`      reason: ${reason}`);
+          log(`      candidates: ${allCandidates.length} URLs | reason: ${reason}`);
+          for (const c of allCandidates.slice(0, 3)) {
+            log(`        ${c} | inInventory: ${enInventory.urls.has(c)}`);
+          }
           debugSamples++;
         }
-        if (untranslated && !usedEnUrls.has(untranslated)) {
-          unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: untranslated, sourceUrl: row.sourceUrl });
-        }
-        if (translated && translated !== untranslated && !usedEnUrls.has(translated)) {
-          unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: translated, sourceUrl: row.sourceUrl });
+        for (const candidate of allCandidates) {
+          if (!usedEnUrls.has(candidate)) {
+            unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: candidate, sourceUrl: row.sourceUrl });
+          }
         }
       }
     }
@@ -486,12 +487,11 @@ async function matchTab(
         inventoryMatchCount++;
       } else {
         if (match) dedupBlockedCount++; else inventoryMissCount++;
-        const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
-        if (untranslated && !usedFrUrls.has(untranslated)) {
-          unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: untranslated, sourceUrl: row.sourceUrl });
-        }
-        if (translated && translated !== untranslated && !usedFrUrls.has(translated)) {
-          unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: translated, sourceUrl: row.sourceUrl });
+        const allFrCandidates = constructAllTargetUrls(row.sourceUrl, "fr", tabPatterns);
+        for (const candidate of allFrCandidates) {
+          if (!usedFrUrls.has(candidate)) {
+            unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: candidate, sourceUrl: row.sourceUrl });
+          }
         }
       }
     }

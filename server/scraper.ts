@@ -388,6 +388,78 @@ export function constructTargetUrl(
   return { translated: null, untranslated: null };
 }
 
+export function constructAllTargetUrls(
+  sourceUrl: string,
+  lang: "en" | "fr",
+  tabPatterns: TabPatterns
+): string[] {
+  const candidates = new Set<string>();
+  try {
+    const parsed = new URL(sourceUrl);
+    const pathParts = parsed.pathname.split("/").filter(Boolean);
+    if (pathParts.length === 0) return [];
+
+    const commonTargetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
+    const commonSourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
+    if (commonTargetRoot.length === 0) return [];
+
+    const segments = tabPatterns.segmentMap.get(lang);
+    const cleanParts = stripSuffix(pathParts);
+
+    const buildUrl = (tgtRoot: string[], rem: string[]) => {
+      let tr = tgtRoot;
+      let r = rem;
+      if (tr.length > 0 && tr[tr.length - 1].toLowerCase().endsWith(".aspx") && r.length > 0) {
+        tr = tr.slice(0, -1);
+      }
+      while (r.length > 0 && tr.length > 0 &&
+        normalizeSegment(r[0]) === normalizeSegment(tr[tr.length - 1])) {
+        r = r.slice(1);
+      }
+      const untranslated = parsed.origin + "/" + [...tr, ...r].join("/");
+      candidates.add(untranslated);
+      if (segments) {
+        const translatedParts = r.map((part) => {
+          const norm = normalizeSegment(part);
+          return segments.has(norm) ? segments.get(norm)! : part;
+        });
+        const translated = parsed.origin + "/" + [...tr, ...translatedParts].join("/");
+        if (translated !== untranslated) candidates.add(translated);
+      }
+    };
+
+    const pairMappings = tabPatterns.rootMappings.get(lang) || [];
+    for (const mapping of pairMappings) {
+      let matchLen = 0;
+      for (let i = 0; i < mapping.sourceRoot.length && i < cleanParts.length; i++) {
+        if (normalizeSegment(cleanParts[i]) === normalizeSegment(mapping.sourceRoot[i])) {
+          matchLen++;
+        } else {
+          break;
+        }
+      }
+      if (matchLen === mapping.sourceRoot.length && matchLen >= commonSourceRoot.length) {
+        buildUrl(mapping.targetRoot, cleanParts.slice(matchLen));
+      }
+    }
+
+    if (commonSourceRoot.length > 0) {
+      let matchLen = 0;
+      for (let i = 0; i < commonSourceRoot.length && i < cleanParts.length; i++) {
+        if (normalizeSegment(cleanParts[i]) === normalizeSegment(commonSourceRoot[i])) {
+          matchLen++;
+        } else {
+          break;
+        }
+      }
+      buildUrl(commonTargetRoot, cleanParts.slice(matchLen));
+    } else {
+      buildUrl(commonTargetRoot, cleanParts);
+    }
+  } catch {}
+  return Array.from(candidates);
+}
+
 export async function validatePatterns(
   tabPatterns: TabPatterns,
   sampleUrls: { sourceUrl: string; lang: "en" | "fr" }[]
@@ -991,35 +1063,20 @@ export function matchAgainstInventory(
   tabPatterns: TabPatterns,
   inventory: CrawlInventory
 ): { url: string; confidence: number; method: string } | null {
-  const { untranslated: untranslatedUrl, translated: translatedUrl } = constructTargetUrl(sourceUrl, lang, tabPatterns);
   const sourceRoot = lang === "en" ? tabPatterns.enSrcRoot : tabPatterns.frSrcRoot;
   const targetRoot = lang === "en" ? tabPatterns.enRoot : tabPatterns.frRoot;
 
-  if (untranslatedUrl) {
-    if (!validateDepthMatch(sourceUrl, untranslatedUrl, sourceRoot, targetRoot)) {
-      log(`    REJECTED (depth mismatch, untranslated): ${sourceUrl} -> ${untranslatedUrl}`);
-    } else if (inventory.urls.has(untranslatedUrl)) {
-      return { url: untranslatedUrl, confidence: 96, method: "pattern-direct+crawl" };
-    } else {
-      const norm = normalizeUrlPath(untranslatedUrl);
-      const inventoryUrl = inventory.normalizedIndex.get(norm);
-      if (inventoryUrl) {
-        return { url: inventoryUrl, confidence: 94, method: "pattern-direct+crawl-norm" };
-      }
-    }
-  }
+  const allCandidates = constructAllTargetUrls(sourceUrl, lang, tabPatterns);
 
-  if (translatedUrl) {
-    if (!validateDepthMatch(sourceUrl, translatedUrl, sourceRoot, targetRoot)) {
-      log(`    REJECTED (depth mismatch, translated): ${sourceUrl} -> ${translatedUrl}`);
-    } else if (inventory.urls.has(translatedUrl)) {
-      return { url: translatedUrl, confidence: 95, method: "pattern+crawl" };
-    } else {
-      const norm = normalizeUrlPath(translatedUrl);
-      const inventoryUrl = inventory.normalizedIndex.get(norm);
-      if (inventoryUrl) {
-        return { url: inventoryUrl, confidence: 93, method: "pattern+crawl-norm" };
-      }
+  for (const candidate of allCandidates) {
+    if (!validateDepthMatch(sourceUrl, candidate, sourceRoot, targetRoot)) continue;
+    if (inventory.urls.has(candidate)) {
+      return { url: candidate, confidence: 96, method: "pattern-direct+crawl" };
+    }
+    const norm = normalizeUrlPath(candidate);
+    const inventoryUrl = inventory.normalizedIndex.get(norm);
+    if (inventoryUrl) {
+      return { url: inventoryUrl, confidence: 94, method: "pattern-direct+crawl-norm" };
     }
   }
 
@@ -1192,11 +1249,8 @@ export function matchAgainstInventory(
     }
   } catch {}
 
-  if (translatedUrl) {
-    urlExistenceCache.set(translatedUrl, false);
-  }
-  if (untranslatedUrl) {
-    urlExistenceCache.set(untranslatedUrl, false);
+  for (const candidate of allCandidates) {
+    urlExistenceCache.set(candidate, false);
   }
 
   return null;
