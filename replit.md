@@ -82,8 +82,9 @@ Matching strategies are tried in this order:
 3. **Translated pattern+crawl**: Translated constructed URL found in inventory (confidence 95)
 4. **Translated pattern+crawl normalized**: Translated URL matches after normalization (confidence 93)
 5. **Root-anchored tail match**: Filter inventory to URLs sharing the target root prefix, then match by last 1-3 segments of the source URL (confidence 92) — disambiguates same-named pages across different site sections
+5b. **Root-anchored translated tail**: Same as above but translates source segments using learned segment map before matching (confidence 91)
 6. **Tail-segment matching**: Match by last 1-2 segments across full inventory, filtered by section context (confidence 85-88)
-7. **Translated segment matching**: Translate path segments then match tails (confidence 86)
+7. **Translated segment matching**: Translate path segments then match tails (confidence 86) — now works with single-segment tails too
 8. **Segment fuzzy matching**: Word-overlap Jaccard similarity on last segment (confidence 80-90, requires score ≥ 0.6 and at least 2 overlapping words)
 
 #### Step 4: Batch HEAD Verification

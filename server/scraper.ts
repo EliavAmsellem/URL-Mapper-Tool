@@ -344,6 +344,9 @@ export function constructTargetUrl(
     if (bestMapping && bestMatchLen > commonSourceRoot.length) {
       targetRoot = bestMapping.targetRoot;
       remaining = cleanParts.slice(bestMatchLen);
+      if (targetRoot.length > 0 && targetRoot[targetRoot.length - 1].toLowerCase().endsWith(".aspx") && remaining.length > 0) {
+        targetRoot = targetRoot.slice(0, -1);
+      }
     } else if (commonSourceRoot.length > 0) {
       let matchLen = 0;
       for (let i = 0; i < commonSourceRoot.length && i < cleanParts.length; i++) {
@@ -1010,21 +1013,45 @@ export function matchAgainstInventory(
       const lastSeg = normalizeSegment(srcTailParts[srcTailParts.length - 1]);
       if (lastSeg && lastSeg !== "pages") {
         const tgtRootNorm = effectiveTgtRoot.map(s => normalizeSegment(s)).join("/");
+        const rootFilter = (c: string) => {
+          try {
+            const cParts = new URL(c).pathname.split("/").filter(Boolean);
+            const cRootNorm = cParts.slice(0, effectiveTgtRoot.length).map(s => normalizeSegment(s)).join("/");
+            return cRootNorm === tgtRootNorm;
+          } catch { return false; }
+        };
 
         for (let tailLen = 1; tailLen <= Math.min(srcTailParts.length, 3); tailLen++) {
           const tailKey = srcTailParts.slice(-tailLen).map(s => normalizeSegment(s)).join("/");
           const candidates = inventory.tailIndex.get(tailKey) || [];
-          const rootFiltered = candidates.filter(c => {
-            try {
-              const cParts = new URL(c).pathname.split("/").filter(Boolean);
-              const cRootNorm = cParts.slice(0, effectiveTgtRoot.length).map(s => normalizeSegment(s)).join("/");
-              return cRootNorm === tgtRootNorm;
-            } catch { return false; }
-          });
+          const rootFiltered = candidates.filter(rootFilter);
 
           if (rootFiltered.length === 1) {
             if (validateDepthMatch(sourceUrl, rootFiltered[0], sourceRoot, targetRoot)) {
               return { url: rootFiltered[0], confidence: 92, method: "root-anchored-tail" };
+            }
+          }
+        }
+
+        const segments = tabPatterns.segmentMap.get(lang);
+        if (segments) {
+          const translatedTail = srcTailParts.map(p => {
+            const norm = normalizeSegment(p);
+            return segments.has(norm) ? normalizeSegment(segments.get(norm)!) : norm;
+          });
+          const srcTailNorm = srcTailParts.map(s => normalizeSegment(s)).join("/");
+          const transTailNorm = translatedTail.join("/");
+          if (transTailNorm !== srcTailNorm) {
+            for (let tailLen = 1; tailLen <= Math.min(translatedTail.length, 3); tailLen++) {
+              const tailKey = translatedTail.slice(-tailLen).join("/");
+              const candidates = inventory.tailIndex.get(tailKey) || [];
+              const rootFiltered = candidates.filter(rootFilter);
+
+              if (rootFiltered.length === 1) {
+                if (validateDepthMatch(sourceUrl, rootFiltered[0], sourceRoot, targetRoot)) {
+                  return { url: rootFiltered[0], confidence: 91, method: "root-anchored-translated-tail" };
+                }
+              }
             }
           }
         }
@@ -1058,21 +1085,25 @@ export function matchAgainstInventory(
       }
     }
 
-    if (srcTailParts.length >= 2) {
+    if (srcTailParts.length >= 1) {
       const segments = tabPatterns.segmentMap.get(lang);
       const translatedTail = srcTailParts.map((p) => {
         const norm = normalizeSegment(p);
         if (segments && segments.has(norm)) return normalizeSegment(segments.get(norm)!);
         return norm;
       });
+      const srcNorm = srcTailParts.map(s => normalizeSegment(s)).join("/");
+      const transNorm = translatedTail.join("/");
 
-      for (let tailLen = Math.min(translatedTail.length, 3); tailLen >= 1; tailLen--) {
-        const tailKey = translatedTail.slice(-tailLen).join("/");
-        const candidates = inventory.tailIndex.get(tailKey) || [];
-        const sectionFiltered = candidates.filter(c => validateSectionContext(c, sourceUrl, lang, tabPatterns));
-        if (sectionFiltered.length === 1) {
-          if (validateDepthMatch(sourceUrl, sectionFiltered[0], sourceRoot, targetRoot)) {
-            return { url: sectionFiltered[0], confidence: 86, method: "crawl-translated-tail" };
+      if (transNorm !== srcNorm) {
+        for (let tailLen = Math.min(translatedTail.length, 3); tailLen >= 1; tailLen--) {
+          const tailKey = translatedTail.slice(-tailLen).join("/");
+          const candidates = inventory.tailIndex.get(tailKey) || [];
+          const sectionFiltered = candidates.filter(c => validateSectionContext(c, sourceUrl, lang, tabPatterns));
+          if (sectionFiltered.length === 1) {
+            if (validateDepthMatch(sourceUrl, sectionFiltered[0], sourceRoot, targetRoot)) {
+              return { url: sectionFiltered[0], confidence: 86, method: "crawl-translated-tail" };
+            }
           }
         }
       }
@@ -1320,7 +1351,7 @@ export interface TitleMatchResult {
 export function matchByTitle(
   translatedTitle: string,
   inventory: CrawlInventory,
-  minSimilarity: number = 0.85,
+  minSimilarity: number = 0.60,
   allowedRoots?: string[],
   refDepths?: number[],
   sourceSegments?: Set<string>,
@@ -1485,14 +1516,14 @@ export async function titleMatchUnmatched(
     if (row.needsEn && enInventory && enInventory.titleIndex.size > 0 && enAllowedRoots && enAllowedRoots.length > 0) {
       const enTitle = enTranslations.get(row.title);
       if (enTitle) {
-        enMatch = matchByTitle(enTitle, enInventory, 0.85, enAllowedRoots, enRefDepths, sourceSegments);
+        enMatch = matchByTitle(enTitle, enInventory, 0.60, enAllowedRoots, enRefDepths, sourceSegments);
       }
     }
 
     if (row.needsFr && frInventory && frInventory.titleIndex.size > 0 && frAllowedRoots && frAllowedRoots.length > 0) {
       const frTitle = frTranslations.get(row.title);
       if (frTitle) {
-        frMatch = matchByTitle(frTitle, frInventory, 0.85, frAllowedRoots, frRefDepths, sourceSegments);
+        frMatch = matchByTitle(frTitle, frInventory, 0.60, frAllowedRoots, frRefDepths, sourceSegments);
       }
     }
 
@@ -1529,25 +1560,25 @@ export async function titleMatchUnmatched(
         }
       } catch {}
 
-      if (enMatch && enMatch.similarity < 0.90) {
-        log(`    Paired EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.90): "${enMatch.url}"`);
+      if (enMatch && enMatch.similarity < 0.75) {
+        log(`    Paired EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.75): "${enMatch.url}"`);
         enMatch = null;
         rejected.crossValidation++;
       }
-      if (frMatch && frMatch.similarity < 0.90) {
-        log(`    Paired FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.90): "${frMatch.url}"`);
+      if (frMatch && frMatch.similarity < 0.75) {
+        log(`    Paired FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.75): "${frMatch.url}"`);
         frMatch = null;
         rejected.crossValidation++;
       }
     } else if (enMatch && !frMatch) {
-      if (enMatch.similarity < 0.92) {
-        log(`    Single-lang EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.92): "${enMatch.url}"`);
+      if (enMatch.similarity < 0.80) {
+        log(`    Single-lang EN REJECTED (similarity ${enMatch.similarity.toFixed(3)} < 0.80): "${enMatch.url}"`);
         enMatch = null;
         rejected.crossValidation++;
       }
     } else if (frMatch && !enMatch) {
-      if (frMatch.similarity < 0.92) {
-        log(`    Single-lang FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.92): "${frMatch.url}"`);
+      if (frMatch.similarity < 0.80) {
+        log(`    Single-lang FR REJECTED (similarity ${frMatch.similarity.toFixed(3)} < 0.80): "${frMatch.url}"`);
         frMatch = null;
         rejected.crossValidation++;
       }
