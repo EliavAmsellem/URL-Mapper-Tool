@@ -33,6 +33,7 @@ Preferred communication style: Simple, everyday language.
 - `POST /api/upload` — Upload Excel/CSV file, creates a mapping job
 - `POST /api/jobs/:id/start` — Start processing a job with a confidence threshold
 - `GET /api/jobs/:id` — Poll job status (progress, step, counts)
+- `POST /api/jobs/:id/stop` — Stop a running job (sets cancel flag, updates status to "cancelled")
 - `GET /api/jobs/:id/results` — Fetch mapping results
 - `GET /api/jobs/:id/download` — Download results as Excel with mapped URLs filled in
 
@@ -82,6 +83,7 @@ Matching strategies are tried in this order:
 3. **Translated pattern+crawl**: Translated constructed URL found in inventory (confidence 95)
 4. **Translated pattern+crawl normalized**: Translated URL matches after normalization (confidence 93)
 5. **Root-anchored tail match**: Filter inventory to URLs sharing the target root prefix, then match by last 1-3 segments of the source URL (confidence 92) — disambiguates same-named pages across different site sections
+5a. **Root-anchored tail disambig**: When root-anchored tail finds 2-5 candidates, disambiguates by shared path segments and depth similarity (confidence 89)
 5b. **Root-anchored translated tail**: Same as above but translates source segments using learned segment map before matching (confidence 91)
 6. **Tail-segment matching**: Match by last 1-2 segments across full inventory, filtered by section context (confidence 85-88)
 7. **Translated segment matching**: Translate path segments then match tails (confidence 86) — now works with single-segment tails too
@@ -93,12 +95,17 @@ Matching strategies are tried in this order:
 - URLs returning non-200 status are discarded
 - Verified URLs get confidence score of 90
 
+#### Tail Matching Disambiguation
+When tail matching finds 2-5 candidates (previously returned nothing), a disambiguation function scores candidates by shared path segments with the source URL and depth similarity. Only picks a winner if there's a clear best candidate (no ties). Applied to root-anchored-tail, root-anchored-translated-tail, crawl-tail, and crawl-tail2 stages.
+
 #### Step 5: Title-Based Matching with Section Awareness
 - For URLs still unmatched after pattern/crawl matching, page titles are extracted and translated Hebrew→EN/FR using Google Translate GTX endpoint
 - Translated titles are fuzzy-matched against crawl inventory page titles using word-overlap similarity
 - **Cross-language segment validation**: When ALL source URL path segments are non-Latin (e.g., Hebrew), the shared-segment validation is skipped since Hebrew segments never match English segments. When source URLs contain Latin segments (like transliterated page names), shared-segment validation is enforced to prevent false positives
 - **Section-aware scoring**: Titles like "Unemployment - Conditions of entitlement" are split into section prefix ("Unemployment") and page name ("Conditions of entitlement"). When both source and target titles have section prefixes, matching sections provide a similarity boost (up to +0.15), helping disambiguate pages with similar names across different website sections
 - Section matching is purely additive (boost-only) — it never excludes or penalizes candidates, preserving recall
+- **Title matching thresholds**: Paired cross-validation threshold 0.60, single-lang threshold 0.65
+- **Ambiguous title disambiguation**: When gap < 0.05 between top candidates, attempts disambiguation using shared path segments between source URL and candidate URLs. Accepts if one candidate has clearly more shared segments (confidence 78, method "title-disambig")
 - 5 concurrent translation requests with rate limiting (200ms between batches)
 - Translation results are cached persistently in the database `translation_cache` table
 
@@ -107,6 +114,7 @@ Matching strategies are tried in this order:
 - The AI receives: unmatched source URLs with translated titles, the full crawl inventory of available target URLs, learned URL patterns and segment translations, and examples of already-matched pairs
 - AI is constrained to ONLY select from the crawl inventory — never invents URLs
 - Batches of ~15 unmatched URLs are processed per API call, with retry logic (3 attempts with exponential backoff) for 401/429 errors
+- **Early termination**: If 3 consecutive batches fail with auth errors, AI matching stops entirely instead of looping through all remaining batches
 - All AI-suggested URLs are HEAD-verified before acceptance (same as pattern matches)
 - AI matches are labeled with method "ai-match" and confidence score 82
 - Duplicate prevention: AI cannot reuse URLs already assigned by earlier matching steps
