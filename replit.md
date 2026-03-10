@@ -70,7 +70,11 @@ For each source URL needing a target, TWO candidate URLs are constructed:
 Segment translations in root mappings are aligned from the END of root arrays backward, ensuring correct alignment when source and target roots have different segment counts.
 
 #### Step 3: Crawl Inventory Matching (Priority Order)
-Directory crawling builds an inventory of all URLs in target language sections. Matching strategies are tried in this order:
+Directory crawling builds an inventory of all URLs in target language sections (up to 3000 pages per section). The crawler is seeded with URLs extracted from reference pairs (the reference URL itself, its parent directory, and its Pages/default.aspx) to discover deeply nested subsections that might not be reachable from the root alone. Only seeds matching the crawl scope origin and prefix are accepted.
+
+**Global Deduplication**: A `usedEnUrls`/`usedFrUrls` set tracks all assigned target URLs across all matching stages. Each target URL can only be assigned to one source URL — subsequent attempts to assign the same target are rejected. This prevents multiple source URLs from incorrectly mapping to the same target page.
+
+Matching strategies are tried in this order:
 1. **Direct pattern+crawl**: Untranslated constructed URL found in inventory (confidence 96)
 2. **Direct pattern+crawl normalized**: Untranslated URL matches after normalization (confidence 94)
 3. **Translated pattern+crawl**: Translated constructed URL found in inventory (confidence 95)
@@ -78,7 +82,7 @@ Directory crawling builds an inventory of all URLs in target language sections. 
 5. **Root-anchored tail match**: Filter inventory to URLs sharing the target root prefix, then match by last 1-3 segments of the source URL (confidence 92) — disambiguates same-named pages across different site sections
 6. **Tail-segment matching**: Match by last 1-2 segments across full inventory, filtered by section context (confidence 85-88)
 7. **Translated segment matching**: Translate path segments then match tails (confidence 86)
-8. **Segment fuzzy matching**: Word-overlap Jaccard similarity on last segment (confidence 80-90)
+8. **Segment fuzzy matching**: Word-overlap Jaccard similarity on last segment (confidence 80-90, requires score ≥ 0.6 and at least 2 overlapping words)
 
 #### Step 4: Batch HEAD Verification
 - All constructed URLs are verified with HTTP HEAD requests (50 concurrent, 3s timeout)

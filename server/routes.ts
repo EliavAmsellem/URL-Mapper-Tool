@@ -292,7 +292,7 @@ async function matchTab(
   let frInventory: CrawlInventory | null = null;
 
   if (needsMatching.length === 0 || (tabPatterns.enRoot.length === 0 && tabPatterns.frRoot.length === 0)) {
-    return { matchResults, enInventory, frInventory, tabPatterns };
+    return { matchResults, enInventory, frInventory, tabPatterns, usedEnUrls: new Set<string>(), usedFrUrls: new Set<string>() };
   }
 
   if (tabPatterns.enRoot.length > 0) tabPatterns.patternValidated.en = true;
@@ -308,6 +308,33 @@ async function matchTab(
     return "";
   })();
 
+  const enSeedUrls: string[] = [];
+  const frSeedUrls: string[] = [];
+  for (const ref of tabRefRows) {
+    if (ref.enUrl) {
+      try {
+        const enParsed = new URL(ref.enUrl);
+        const parentPath = enParsed.pathname.split("/").filter(Boolean).slice(0, -1);
+        const parentUrl = enParsed.origin + "/" + parentPath.join("/") + "/";
+        enSeedUrls.push(ref.enUrl);
+        enSeedUrls.push(parentUrl);
+        const defaultUrl = enParsed.origin + "/" + parentPath.join("/") + "/Pages/default.aspx";
+        enSeedUrls.push(defaultUrl);
+      } catch {}
+    }
+    if (ref.frUrl) {
+      try {
+        const frParsed = new URL(ref.frUrl);
+        const parentPath = frParsed.pathname.split("/").filter(Boolean).slice(0, -1);
+        const parentUrl = frParsed.origin + "/" + parentPath.join("/") + "/";
+        frSeedUrls.push(ref.frUrl);
+        frSeedUrls.push(parentUrl);
+        const defaultUrl = frParsed.origin + "/" + parentPath.join("/") + "/Pages/default.aspx";
+        frSeedUrls.push(defaultUrl);
+      } catch {}
+    }
+  }
+
   const crawlPromises: Promise<void>[] = [];
   if (origin && tabPatterns.enRoot.length > 0) {
     const enScope = tabPatterns.enCrawlScope.length > 0 ? tabPatterns.enCrawlScope : tabPatterns.enRoot;
@@ -316,11 +343,12 @@ async function matchTab(
       enInventory = crawlCache.get(enCacheKey)!;
       log(`  EN directory cached: ${enInventory.urls.size} URLs`);
     } else {
-      log(`  Crawling EN directory: /${enScope.join("/")}/`);
+      const uniqueSeeds = Array.from(new Set(enSeedUrls));
+      log(`  Crawling EN directory: /${enScope.join("/")}/  (${uniqueSeeds.length} seed URLs from reference pairs)`);
       crawlPromises.push(
         crawlDirectory(origin, enScope, (c, q) => {
-          if (c % 50 === 0) log(`    EN crawl progress: ${c} pages fetched, ${q} queued`);
-        }).then(inv => { enInventory = inv; crawlCache.set(enCacheKey, inv); log(`  EN crawl complete: ${inv.urls.size} URLs discovered`); })
+          if (c % 100 === 0) log(`    EN crawl progress: ${c} pages fetched, ${q} queued`);
+        }, uniqueSeeds).then(inv => { enInventory = inv; crawlCache.set(enCacheKey, inv); log(`  EN crawl complete: ${inv.urls.size} URLs discovered`); })
       );
     }
   }
@@ -332,16 +360,25 @@ async function matchTab(
       frInventory = crawlCache.get(frCacheKey)!;
       log(`  FR directory cached: ${frInventory.urls.size} URLs`);
     } else {
-      log(`  Crawling FR directory: /${frScope.join("/")}/`);
+      const uniqueSeeds = Array.from(new Set(frSeedUrls));
+      log(`  Crawling FR directory: /${frScope.join("/")}/  (${uniqueSeeds.length} seed URLs from reference pairs)`);
       crawlPromises.push(
         crawlDirectory(origin, frScope, (c, q) => {
-          if (c % 50 === 0) log(`    FR crawl progress: ${c} pages fetched, ${q} queued`);
-        }).then(inv => { frInventory = inv; crawlCache.set(frCacheKey, inv); log(`  FR crawl complete: ${inv.urls.size} URLs discovered`); })
+          if (c % 100 === 0) log(`    FR crawl progress: ${c} pages fetched, ${q} queued`);
+        }, uniqueSeeds).then(inv => { frInventory = inv; crawlCache.set(frCacheKey, inv); log(`  FR crawl complete: ${inv.urls.size} URLs discovered`); })
       );
     }
   }
 
   if (crawlPromises.length > 0) await Promise.all(crawlPromises);
+
+  const usedEnUrls = new Set<string>();
+  const usedFrUrls = new Set<string>();
+
+  for (const ref of tabRefRows) {
+    if (ref.enUrl) usedEnUrls.add(ref.enUrl);
+    if (ref.frUrl) usedFrUrls.add(ref.frUrl);
+  }
 
   const unmatchedForHead: { index: number; lang: "en" | "fr"; constructedUrl: string; sourceUrl: string }[] = [];
   for (const row of needsMatching) {
@@ -354,36 +391,36 @@ async function matchTab(
 
     if (row.needsEn && tabPatterns.patternValidated.en && enInventory) {
       const match = matchAgainstInventory(row.sourceUrl, "en", tabPatterns, enInventory);
-      if (match) {
+      if (match && !usedEnUrls.has(match.url)) {
         result.enUrl = match.url;
         result.confidenceEn = match.confidence;
         result.matchMethodEn = match.method;
+        usedEnUrls.add(match.url);
       } else {
         const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "en", tabPatterns);
-        const constructed = translated || untranslated;
-        if (constructed) {
-          unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: constructed, sourceUrl: row.sourceUrl });
-          if (untranslated && untranslated !== constructed) {
-            unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: untranslated, sourceUrl: row.sourceUrl });
-          }
+        if (untranslated && !usedEnUrls.has(untranslated)) {
+          unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: untranslated, sourceUrl: row.sourceUrl });
+        }
+        if (translated && translated !== untranslated && !usedEnUrls.has(translated)) {
+          unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: translated, sourceUrl: row.sourceUrl });
         }
       }
     }
 
     if (row.needsFr && tabPatterns.patternValidated.fr && frInventory) {
       const match = matchAgainstInventory(row.sourceUrl, "fr", tabPatterns, frInventory);
-      if (match) {
+      if (match && !usedFrUrls.has(match.url)) {
         result.frUrl = match.url;
         result.confidenceFr = match.confidence;
         result.matchMethodFr = match.method;
+        usedFrUrls.add(match.url);
       } else {
         const { translated, untranslated } = constructTargetUrl(row.sourceUrl, "fr", tabPatterns);
-        const constructed = translated || untranslated;
-        if (constructed) {
-          unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: constructed, sourceUrl: row.sourceUrl });
-          if (untranslated && untranslated !== constructed) {
-            unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: untranslated, sourceUrl: row.sourceUrl });
-          }
+        if (untranslated && !usedFrUrls.has(untranslated)) {
+          unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: untranslated, sourceUrl: row.sourceUrl });
+        }
+        if (translated && translated !== untranslated && !usedFrUrls.has(translated)) {
+          unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: translated, sourceUrl: row.sourceUrl });
         }
       }
     }
@@ -424,16 +461,21 @@ async function matchTab(
           }
         } catch {}
 
+        const usedSet = item.lang === "en" ? usedEnUrls : usedFrUrls;
+        if (usedSet.has(item.constructedUrl)) continue;
+
         const result = matchResults.get(item.index);
         if (result) {
-          if (item.lang === "en") {
+          if (item.lang === "en" && !result.enUrl) {
             result.enUrl = item.constructedUrl;
             result.confidenceEn = 90;
             result.matchMethodEn = "pattern+head";
-          } else {
+            usedEnUrls.add(item.constructedUrl);
+          } else if (item.lang === "fr" && !result.frUrl) {
             result.frUrl = item.constructedUrl;
             result.confidenceFr = 90;
             result.matchMethodFr = "pattern+head";
+            usedFrUrls.add(item.constructedUrl);
           }
           headMatched++;
         }
@@ -549,15 +591,17 @@ async function matchTab(
         result = { enUrl: null, frUrl: null, confidenceEn: null, confidenceFr: null, matchMethodEn: null, matchMethodFr: null };
         matchResults.set(rowIndex, result);
       }
-      if (titleResult.enUrl && !result.enUrl) {
+      if (titleResult.enUrl && !result.enUrl && !usedEnUrls.has(titleResult.enUrl)) {
         result.enUrl = titleResult.enUrl;
         result.confidenceEn = titleResult.confidenceEn;
         result.matchMethodEn = titleResult.matchMethodEn;
+        usedEnUrls.add(titleResult.enUrl);
       }
-      if (titleResult.frUrl && !result.frUrl) {
+      if (titleResult.frUrl && !result.frUrl && !usedFrUrls.has(titleResult.frUrl)) {
         result.frUrl = titleResult.frUrl;
         result.confidenceFr = titleResult.confidenceFr;
         result.matchMethodFr = titleResult.matchMethodFr;
+        usedFrUrls.add(titleResult.frUrl);
       }
     }
   }
@@ -629,7 +673,7 @@ async function matchTab(
     log(`  Deduplication removed ${dedupEn} EN and ${dedupFr} FR duplicate target assignments`);
   }
 
-  return { matchResults, enInventory, frInventory, tabPatterns };
+  return { matchResults, enInventory, frInventory, tabPatterns, usedEnUrls, usedFrUrls };
 }
 
 async function processJob(jobId: string, _threshold: number, control: { cancel: boolean }) {
@@ -658,7 +702,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
   }
 
   const globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
-  const tabInventories = new Map<string, { enInventory: CrawlInventory | null; frInventory: CrawlInventory | null; tabPatterns: TabPatterns }>();
+  const tabInventories = new Map<string, { enInventory: CrawlInventory | null; frInventory: CrawlInventory | null; tabPatterns: TabPatterns; usedEnUrls: Set<string>; usedFrUrls: Set<string> }>();
 
   for (let pass = 1; pass <= MAX_PASSES; pass++) {
     if (control.cancel) break;
@@ -718,8 +762,8 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       const stepLabel = pass > 1 ? `pass${pass}:${tabData.sheetName}` : `matching:${tabData.sheetName}`;
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
-      const { matchResults, enInventory, frInventory, tabPatterns } = await matchTab(tabData, crawlCache, control);
-      tabInventories.set(tabData.sheetName, { enInventory, frInventory, tabPatterns });
+      const { matchResults, enInventory, frInventory, tabPatterns, usedEnUrls, usedFrUrls } = await matchTab(tabData, crawlCache, control);
+      tabInventories.set(tabData.sheetName, { enInventory, frInventory, tabPatterns, usedEnUrls, usedFrUrls });
 
       if (!globalMatchResults.has(tabData.sheetName)) {
         globalMatchResults.set(tabData.sheetName, new Map());
@@ -933,16 +977,18 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
               existing = { enUrl: null, frUrl: null, confidenceEn: null, confidenceFr: null, matchMethodEn: null, matchMethodFr: null };
               sheetGlobal.set(rowIndex, existing);
             }
-            if (aiResult.enUrl && !existing.enUrl) {
+            if (aiResult.enUrl && !existing.enUrl && !inv.usedEnUrls.has(aiResult.enUrl)) {
               existing.enUrl = aiResult.enUrl;
               existing.confidenceEn = aiResult.confidenceEn;
               existing.matchMethodEn = aiResult.matchMethodEn;
+              inv.usedEnUrls.add(aiResult.enUrl);
               aiAccepted++;
             }
-            if (aiResult.frUrl && !existing.frUrl) {
+            if (aiResult.frUrl && !existing.frUrl && !inv.usedFrUrls.has(aiResult.frUrl)) {
               existing.frUrl = aiResult.frUrl;
               existing.confidenceFr = aiResult.confidenceFr;
               existing.matchMethodFr = aiResult.matchMethodFr;
+              inv.usedFrUrls.add(aiResult.frUrl);
               aiAccepted++;
             }
           }

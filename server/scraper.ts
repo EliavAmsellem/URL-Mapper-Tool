@@ -411,7 +411,7 @@ export function batchConstructUrls(
 
 const CRAWL_CONCURRENCY = 30;
 const CRAWL_TIMEOUT = 8000;
-const CRAWL_MAX_PAGES = 500;
+const CRAWL_MAX_PAGES = 3000;
 
 export interface CrawlInventory {
   urls: Set<string>;
@@ -495,7 +495,8 @@ function extractLinks(html: string, baseUrl: string, scopePrefix: string): strin
 export async function crawlDirectory(
   origin: string,
   rootPath: string[],
-  onProgress?: (crawled: number, queued: number) => void
+  onProgress?: (crawled: number, queued: number) => void,
+  seedUrls?: string[]
 ): Promise<CrawlInventory> {
   const inventory: CrawlInventory = {
     urls: new Set(),
@@ -514,6 +515,19 @@ export async function crawlDirectory(
   if (rootPath.length > 0) {
     const defaultUrl = origin + scopePrefix + "/Pages/default.aspx";
     queue.push(defaultUrl);
+  }
+
+  if (seedUrls) {
+    for (const seed of seedUrls) {
+      try {
+        const seedParsed = new URL(seed);
+        if (seedParsed.origin === origin && seedParsed.pathname.startsWith(scopePrefix)) {
+          if (!visited.has(seed)) {
+            queue.push(seed);
+          }
+        }
+      } catch {}
+    }
   }
 
   let crawled = 0;
@@ -703,7 +717,7 @@ function bestJaccardMatch(
     const total = srcSet.size + invWords.size - overlap;
     const score = total > 0 ? overlap / total : 0;
 
-    if (score >= 0.5 && (!best || score > best.score)) {
+    if (score >= 0.6 && overlap >= 2 && (!best || score > best.score)) {
       const realUrl = inventory.normalizedIndex.get(normUrl);
       if (realUrl) best = { url: realUrl, score };
     }
