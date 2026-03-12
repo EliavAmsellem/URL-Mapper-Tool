@@ -748,8 +748,12 @@ export async function crawlDirectory(
 
         if (isErrorPage) {
           removeFromInventory(inventory, url);
-        } else if (pageTitle) {
-          inventory.titleIndex.set(url, pageTitle);
+        } else {
+          let effectiveTitle = pageTitle || $("h1").first().text().trim();
+          if (effectiveTitle) {
+            effectiveTitle = effectiveTitle.replace(/\s*\|\s*ביטוח לאומי\s*$/, "").trim();
+            inventory.titleIndex.set(url, effectiveTitle);
+          }
         }
 
         const links = extractLinks(html, url, scopePrefix);
