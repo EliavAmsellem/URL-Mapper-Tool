@@ -631,6 +631,8 @@ async function matchTab(
 
   if (unmatchedForTitle.length > 0 && (enInventory || frInventory)) {
     log(`  Attempting title-based matching for ${unmatchedForTitle.length} unmatched URLs...`);
+    log(`  EN inventory: ${enInventory ? `${enInventory.urls.size} URLs, ${enInventory.titleIndex.size} titles` : 'null'}`);
+    log(`  FR inventory: ${frInventory ? `${frInventory.urls.size} URLs, ${frInventory.titleIndex.size} titles` : 'null'}`);
 
     const enAllowedRoots = new Set<string>();
     const frAllowedRoots = new Set<string>();
