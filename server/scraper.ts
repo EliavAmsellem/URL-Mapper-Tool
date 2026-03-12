@@ -1862,8 +1862,8 @@ export async function aiMatchUnmatched(
   if (unmatchedRows.length === 0) return results;
 
   const openai = new OpenAI({
-    apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
-    baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
+    apiKey: process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
+    ...(process.env.OPENAI_API_KEY ? {} : { baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL }),
   });
 
   const enInventoryUrls = enInventory ? Array.from(enInventory.urls) : [];
@@ -1975,7 +1975,7 @@ Return ONLY the JSON array, no other text.`;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const response = await openai.chat.completions.create({
-            model: "gpt-5-mini",
+            model: process.env.OPENAI_API_KEY ? "gpt-4o-mini" : "gpt-5-mini",
             messages: [
               { role: "system", content: systemPrompt },
               { role: "user", content: userPrompt },
