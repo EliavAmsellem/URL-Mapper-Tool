@@ -591,6 +591,15 @@ function getUrlTail(url: string, tailLen: number = 2): string {
   }
 }
 
+const BROWSER_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9,fr;q=0.8,he;q=0.7",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Cache-Control": "no-cache",
+  "Pragma": "no-cache",
+};
+
 async function fetchPage(url: string): Promise<string | null> {
   try {
     const controller = new AbortController();
@@ -605,6 +614,26 @@ async function fetchPage(url: string): Promise<string | null> {
       redirect: "follow",
     });
     clearTimeout(timeout);
+
+    if (response.status === 401) {
+      const controller2 = new AbortController();
+      const timeout2 = setTimeout(() => controller2.abort(), CRAWL_TIMEOUT);
+      const retryResponse = await fetch(url, {
+        method: "GET",
+        signal: controller2.signal,
+        headers: {
+          ...BROWSER_HEADERS,
+          "Referer": new URL(url).origin + "/",
+        },
+        redirect: "follow",
+      });
+      clearTimeout(timeout2);
+      if (!retryResponse.ok) return null;
+      const ct = retryResponse.headers.get("content-type") || "";
+      if (!ct.includes("text/html")) return null;
+      return await retryResponse.text();
+    }
+
     if (!response.ok) return null;
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.includes("text/html")) return null;
@@ -701,17 +730,26 @@ export async function crawlDirectory(
 
         const $ = cheerio.load(html);
         const pageTitle = $("title").first().text().trim();
-        if (pageTitle) {
-          const lowerTitle = pageTitle.toLowerCase();
-          const isErrorPage = lowerTitle.includes("page not found") ||
-            lowerTitle.includes("404 -") ||
-            lowerTitle.includes("שגיאה") ||
-            lowerTitle.includes("הדף לא נמצא");
-          if (isErrorPage) {
-            removeFromInventory(inventory, url);
-          } else {
-            inventory.titleIndex.set(url, pageTitle);
-          }
+        const lowerTitle = (pageTitle || "").toLowerCase();
+        const titleIsError = lowerTitle.includes("page not found") ||
+          lowerTitle.includes("404 -") ||
+          lowerTitle.includes("שגיאה") ||
+          lowerTitle.includes("הדף לא נמצא");
+
+        const htmlSnippet = html.slice(0, 8000);
+        const spSoftRedirect = /window\.location\.replace\s*\(\s*['"][^'"]*(?:PageNotFoundError|PageNotFound|404)[^'"]*['"]\s*\)/i.test(htmlSnippet) ||
+          /window\.location\.href\s*=\s*['"][^'"]*(?:PageNotFoundError|PageNotFound|404)[^'"]*['"]/i.test(htmlSnippet);
+        const spErrorMeta = !!$('meta[name="SharePointError"], meta[name="sharepointerror"]').length;
+        const robotsMeta = ($('meta[name="Robots"], meta[name="robots"]').attr("content") || "").toUpperCase();
+        const spNoIndex = robotsMeta.includes("NOINDEX");
+        const spMetaError = spErrorMeta || (spNoIndex && lowerTitle === "");
+
+        const isErrorPage = titleIsError || spSoftRedirect || spMetaError;
+
+        if (isErrorPage) {
+          removeFromInventory(inventory, url);
+        } else if (pageTitle) {
+          inventory.titleIndex.set(url, pageTitle);
         }
 
         const links = extractLinks(html, url, scopePrefix);

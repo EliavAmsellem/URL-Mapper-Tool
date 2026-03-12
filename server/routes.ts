@@ -432,15 +432,28 @@ async function matchTab(
   }
 
   const unmatchedForHead: { index: number; lang: "en" | "fr"; constructedUrl: string; sourceUrl: string }[] = [];
-  let debugSamples = 0;
-  const MAX_DEBUG_SAMPLES = 5;
+  let debugSamplesEn = 0;
+  let debugSamplesFr = 0;
+  const MAX_DEBUG_SAMPLES = 15;
   const methodCounts: Record<string, number> = {};
   let inventoryMatchCount = 0;
   let inventoryMissCount = 0;
   let dedupBlockedCount = 0;
+  const sectionStats: Record<string, { enMatched: number; enMissed: number; frMatched: number; frMissed: number }> = {};
+
+  function getSection(sourceUrl: string): string {
+    try {
+      const parsed = new URL(sourceUrl);
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      return parts.length >= 2 ? parts.slice(0, 2).join("/") : parts[0] || "root";
+    } catch { return "unknown"; }
+  }
 
   for (const row of needsMatching) {
     if (control.cancel) break;
+    const section = getSection(row.sourceUrl);
+    if (!sectionStats[section]) sectionStats[section] = { enMatched: 0, enMissed: 0, frMatched: 0, frMissed: 0 };
+
     const result: BatchMatchResult = {
       enUrl: null, frUrl: null,
       confidenceEn: null, confidenceFr: null,
@@ -456,17 +469,19 @@ async function matchTab(
         usedEnUrls.add(match.url);
         methodCounts[match.method] = (methodCounts[match.method] || 0) + 1;
         inventoryMatchCount++;
+        sectionStats[section].enMatched++;
       } else {
         if (match) dedupBlockedCount++; else inventoryMissCount++;
+        sectionStats[section].enMissed++;
         const allCandidates = constructAllTargetUrls(row.sourceUrl, "en", tabPatterns);
-        if (debugSamples < MAX_DEBUG_SAMPLES) {
+        if (debugSamplesEn < MAX_DEBUG_SAMPLES) {
           const reason = match ? `dedup-blocked (${match.url})` : "not-in-inventory";
           log(`    [DEBUG] EN miss: ${row.sourceUrl}`);
           log(`      candidates: ${allCandidates.length} URLs | reason: ${reason}`);
-          for (const c of allCandidates.slice(0, 3)) {
+          for (const c of allCandidates.slice(0, 5)) {
             log(`        ${c} | inInventory: ${enInventory.urls.has(c)}`);
           }
-          debugSamples++;
+          debugSamplesEn++;
         }
         for (const candidate of allCandidates) {
           if (!usedEnUrls.has(candidate)) {
@@ -485,9 +500,20 @@ async function matchTab(
         usedFrUrls.add(match.url);
         methodCounts[match.method] = (methodCounts[match.method] || 0) + 1;
         inventoryMatchCount++;
+        sectionStats[section].frMatched++;
       } else {
         if (match) dedupBlockedCount++; else inventoryMissCount++;
+        sectionStats[section].frMissed++;
         const allFrCandidates = constructAllTargetUrls(row.sourceUrl, "fr", tabPatterns);
+        if (debugSamplesFr < MAX_DEBUG_SAMPLES) {
+          const reason = match ? `dedup-blocked (${match.url})` : "not-in-inventory";
+          log(`    [DEBUG] FR miss: ${row.sourceUrl}`);
+          log(`      candidates: ${allFrCandidates.length} URLs | reason: ${reason}`);
+          for (const c of allFrCandidates.slice(0, 5)) {
+            log(`        ${c} | inInventory: ${frInventory.urls.has(c)}`);
+          }
+          debugSamplesFr++;
+        }
         for (const candidate of allFrCandidates) {
           if (!usedFrUrls.has(candidate)) {
             unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: candidate, sourceUrl: row.sourceUrl });
@@ -502,6 +528,16 @@ async function matchTab(
   const methodSummary = Object.entries(methodCounts).sort((a, b) => b[1] - a[1]).map(([m, c]) => `${m}:${c}`).join(", ");
   log(`  Pattern+Crawl stage: ${inventoryMatchCount} matched (${methodSummary || "none"}), ${inventoryMissCount} missed, ${dedupBlockedCount} dedup-blocked`);
   log(`  HEAD candidates: ${unmatchedForHead.length} URLs to verify`);
+
+  const sectionsWithMisses = Object.entries(sectionStats)
+    .filter(([, s]) => s.enMissed > 0 || s.frMissed > 0)
+    .sort((a, b) => (b[1].enMissed + b[1].frMissed) - (a[1].enMissed + a[1].frMissed));
+  if (sectionsWithMisses.length > 0) {
+    log(`  Section breakdown (sections with misses):`);
+    for (const [sec, s] of sectionsWithMisses.slice(0, 20)) {
+      log(`    ${sec}: EN ${s.enMatched}✓/${s.enMissed}✗ | FR ${s.frMatched}✓/${s.frMissed}✗`);
+    }
+  }
 
   const asciiOnly = unmatchedForHead.filter(u => {
     try {
