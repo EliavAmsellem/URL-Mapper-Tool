@@ -26,6 +26,30 @@ import {
 } from "./scraper";
 import { log } from "./index";
 
+async function readWorkbook(filePath: string, originalName?: string): Promise<ExcelJS.Workbook> {
+  const ext = path.extname(originalName ?? filePath).toLowerCase();
+  if (ext === ".xls") {
+    throw new Error(
+      "Legacy .xls format is not supported. Please convert your file to .xlsx (Excel 2007+) and try again."
+    );
+  }
+  const wb = new ExcelJS.Workbook();
+  if (ext === ".csv") {
+    await wb.csv.readFile(filePath);
+  } else {
+    await wb.xlsx.readFile(filePath);
+  }
+  return wb;
+}
+
+function findJobFile(jobId: string): string | null {
+  for (const ext of [".xlsx", ".csv"]) {
+    const p = `/tmp/uploads/${jobId}${ext}`;
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
 const upload = multer({
   dest: "/tmp/uploads/",
   limits: { fileSize: 10 * 1024 * 1024 },
@@ -52,8 +76,7 @@ export async function registerRoutes(
         return res.status(400).json({ message: "No file uploaded" });
       }
 
-      const workbook = new ExcelJS.Workbook();
-      await workbook.xlsx.readFile(req.file.path);
+      const workbook = await readWorkbook(req.file.path, req.file.originalname);
       let totalUrls = 0;
 
       for (const worksheet of workbook.worksheets) {
@@ -76,7 +99,9 @@ export async function registerRoutes(
       if (!fs.existsSync("/tmp/uploads")) {
         fs.mkdirSync("/tmp/uploads", { recursive: true });
       }
-      fs.copyFileSync(req.file.path, `/tmp/uploads/${job.id}.xlsx`);
+      const savedExt = path.extname(req.file.originalname).toLowerCase() === ".csv" ? ".csv" : ".xlsx";
+      const savedPath = `/tmp/uploads/${job.id}${savedExt}`;
+      fs.copyFileSync(req.file.path, savedPath);
       fs.unlinkSync(req.file.path);
 
       res.json({ jobId: job.id, totalUrls, sheets: workbook.worksheets.map(ws => ws.name) });
@@ -163,13 +188,12 @@ export async function registerRoutes(
       const job = await storage.getJob(jobId);
       if (!job) return res.status(404).json({ message: "Job not found" });
 
-      const filePath = `/tmp/uploads/${jobId}.xlsx`;
-      if (!fs.existsSync(filePath)) {
+      const filePath = findJobFile(jobId);
+      if (!filePath) {
         return res.status(404).json({ message: "Source file not found" });
       }
 
-      const workbook = new ExcelJS.Workbook();
-      await workbook.xlsx.readFile(filePath);
+      const workbook = await readWorkbook(filePath);
       const results = await storage.getResultsByJob(jobId);
 
       const resultMap = new Map<string, Map<number, typeof results[0]>>();
@@ -817,15 +841,14 @@ async function matchTab(
 }
 
 async function processJob(jobId: string, _threshold: number, control: { cancel: boolean }) {
-  const filePath = `/tmp/uploads/${jobId}.xlsx`;
-  if (!fs.existsSync(filePath)) {
+  const filePath = findJobFile(jobId);
+  if (!filePath) {
     throw new Error("Source file not found");
   }
 
   clearAllCaches();
 
-  const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.readFile(filePath);
+  const workbook = await readWorkbook(filePath);
   const job = await storage.getJob(jobId);
   if (!job) throw new Error("Job not found");
 
