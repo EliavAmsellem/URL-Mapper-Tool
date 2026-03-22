@@ -1,7 +1,7 @@
 import type { Express, Request, Response } from "express";
 import { createServer, type Server } from "http";
 import multer from "multer";
-import XLSX from "xlsx";
+import ExcelJS from "exceljs";
 import path from "path";
 import fs from "fs";
 import { storage } from "./storage";
@@ -52,13 +52,12 @@ export async function registerRoutes(
         return res.status(400).json({ message: "No file uploaded" });
       }
 
-      const workbook = XLSX.readFile(req.file.path);
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.readFile(req.file.path);
       let totalUrls = 0;
 
-      for (const sheetName of workbook.SheetNames) {
-        const ws = workbook.Sheets[sheetName];
-        const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
-        totalUrls += Math.max(0, data.length - 1);
+      for (const worksheet of workbook.worksheets) {
+        totalUrls += Math.max(0, worksheet.rowCount - 1);
       }
 
       const langStr = typeof req.body?.languages === "string" ? req.body.languages : "";
@@ -80,7 +79,7 @@ export async function registerRoutes(
       fs.copyFileSync(req.file.path, `/tmp/uploads/${job.id}.xlsx`);
       fs.unlinkSync(req.file.path);
 
-      res.json({ jobId: job.id, totalUrls, sheets: workbook.SheetNames });
+      res.json({ jobId: job.id, totalUrls, sheets: workbook.worksheets.map(ws => ws.name) });
     } catch (error: any) {
       log(`Upload error: ${error.message}`);
       res.status(500).json({ message: error.message });
@@ -169,7 +168,8 @@ export async function registerRoutes(
         return res.status(404).json({ message: "Source file not found" });
       }
 
-      const workbook = XLSX.readFile(filePath);
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.readFile(filePath);
       const results = await storage.getResultsByJob(jobId);
 
       const resultMap = new Map<string, Map<number, typeof results[0]>>();
@@ -180,37 +180,33 @@ export async function registerRoutes(
         resultMap.get(r.sheetName)!.set(r.rowIndex, r);
       }
 
-      for (const sheetName of workbook.SheetNames) {
-        const ws = workbook.Sheets[sheetName];
-        const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
+      for (const worksheet of workbook.worksheets) {
+        const sheetName = worksheet.name;
         const sheetResults = resultMap.get(sheetName);
         if (!sheetResults) continue;
 
-        for (let i = 1; i < data.length; i++) {
-          const result = sheetResults.get(i);
-          if (!result) continue;
+        worksheet.eachRow((row, rowNumber) => {
+          if (rowNumber === 1) return;
+          const result = sheetResults.get(rowNumber - 1);
+          if (!result) return;
 
-          while (data[i].length < 6) data[i].push("");
-
-          if (result.englishUrl && !data[i][2]) {
-            data[i][2] = result.englishUrl;
+          if (result.englishUrl && !row.getCell(3).value) {
+            row.getCell(3).value = result.englishUrl;
           }
-          if (result.frenchUrl && !data[i][3]) {
-            data[i][3] = result.frenchUrl;
+          if (result.frenchUrl && !row.getCell(4).value) {
+            row.getCell(4).value = result.frenchUrl;
           }
-          if (result.russianUrl && !data[i][4]) {
-            data[i][4] = result.russianUrl;
+          if (result.russianUrl && !row.getCell(5).value) {
+            row.getCell(5).value = result.russianUrl;
           }
-          if (result.arabicUrl && !data[i][5]) {
-            data[i][5] = result.arabicUrl;
+          if (result.arabicUrl && !row.getCell(6).value) {
+            row.getCell(6).value = result.arabicUrl;
           }
-        }
-
-        workbook.Sheets[sheetName] = XLSX.utils.aoa_to_sheet(data);
+        });
       }
 
       const outputPath = `/tmp/uploads/${jobId}_output.xlsx`;
-      XLSX.writeFile(workbook, outputPath);
+      await workbook.xlsx.writeFile(outputPath);
 
       const outputName = job.fileName.replace(/\.xlsx?$/i, "_mapped.xlsx");
       res.download(outputPath, outputName, () => {
@@ -248,12 +244,26 @@ interface TabData {
   data: any[][];
 }
 
+function worksheetToAoa(ws: ExcelJS.Worksheet): any[][] {
+  const data: any[][] = [];
+  ws.eachRow((row, _rowNum) => {
+    const arr: any[] = [];
+    row.eachCell({ includeEmpty: true }, (cell, colNum) => {
+      arr[colNum - 1] = cell.value instanceof Object && "text" in (cell.value as any)
+        ? (cell.value as any).text
+        : cell.value ?? "";
+    });
+    data.push(arr);
+  });
+  return data;
+}
+
 function parseSheet(
   sheetName: string,
-  ws: XLSX.WorkSheet,
+  ws: ExcelJS.Worksheet,
   targetLangs: string[]
 ): TabData | null {
-  const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
+  const data = worksheetToAoa(ws);
   if (data.length < 2) return null;
 
   const tabRefRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[] = [];
@@ -814,7 +824,8 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
   clearAllCaches();
 
-  const workbook = XLSX.readFile(filePath);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(filePath);
   const job = await storage.getJob(jobId);
   if (!job) throw new Error("Job not found");
 
@@ -825,9 +836,8 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
   const crawlCache = new Map<string, CrawlInventory>();
 
   const allTabData: TabData[] = [];
-  for (const sheetName of workbook.SheetNames) {
-    const ws = workbook.Sheets[sheetName];
-    const td = parseSheet(sheetName, ws, targetLangs);
+  for (const worksheet of workbook.worksheets) {
+    const td = parseSheet(worksheet.name, worksheet, targetLangs);
     if (td) allTabData.push(td);
   }
 
