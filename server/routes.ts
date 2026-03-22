@@ -2,6 +2,7 @@ import type { Express, Request, Response } from "express";
 import { createServer, type Server } from "http";
 import multer from "multer";
 import ExcelJS from "exceljs";
+import type { XlsBook } from "node-xlrd";
 import xlrd from "node-xlrd";
 import path from "path";
 import fs from "fs";
@@ -29,7 +30,7 @@ import { log } from "./index";
 
 function xlsToWorkbook(filePath: string): Promise<ExcelJS.Workbook> {
   return new Promise((resolve, reject) => {
-    xlrd.open(filePath, (err: Error | null, bk: any) => {
+    xlrd.open(filePath, (err: Error | null, bk: XlsBook) => {
       if (err) return reject(err);
       try {
         const wb = new ExcelJS.Workbook();
