@@ -55,10 +55,12 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
-    if ([".xlsx", ".xls", ".csv"].includes(ext)) {
+    if ([".xlsx", ".csv"].includes(ext)) {
       cb(null, true);
+    } else if (ext === ".xls") {
+      cb(new Error("Legacy .xls format is not supported. Please open in Excel and save as .xlsx (Excel Workbook), then upload again."));
     } else {
-      cb(new Error("Only Excel and CSV files are allowed"));
+      cb(new Error("Only .xlsx and .csv files are allowed"));
     }
   },
 });
@@ -268,14 +270,25 @@ interface TabData {
   data: any[][];
 }
 
+function cellValueToString(v: ExcelJS.CellValue): string | number | boolean | Date | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "string" || typeof v === "number" || typeof v === "boolean" || v instanceof Date) return v;
+  if ("richText" in v) return (v as ExcelJS.CellRichTextValue).richText.map(r => r.text).join("");
+  if ("text" in v) return (v as ExcelJS.CellHyperlinkValue).text;
+  if ("result" in v) {
+    const res = (v as ExcelJS.CellFormulaValue).result;
+    return (res !== undefined && res !== null) ? cellValueToString(res as ExcelJS.CellValue) : null;
+  }
+  if ("error" in v) return String((v as ExcelJS.CellErrorValue).error);
+  return null;
+}
+
 function worksheetToAoa(ws: ExcelJS.Worksheet): any[][] {
   const data: any[][] = [];
   ws.eachRow((row, _rowNum) => {
     const arr: any[] = [];
     row.eachCell({ includeEmpty: true }, (cell, colNum) => {
-      arr[colNum - 1] = cell.value instanceof Object && "text" in (cell.value as any)
-        ? (cell.value as any).text
-        : cell.value ?? "";
+      arr[colNum - 1] = cellValueToString(cell.value) ?? "";
     });
     data.push(arr);
   });
