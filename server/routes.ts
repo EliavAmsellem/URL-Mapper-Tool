@@ -38,11 +38,11 @@ function xlsToWorkbook(filePath: string): Promise<ExcelJS.Workbook> {
           const xlSheet = bk.sheet.byIndex(si);
           const ws = wb.addWorksheet(xlSheet.name);
           for (let r = 0; r < xlSheet.nrows; r++) {
-            const vals: any[] = bk.sheet.byIndex(si).row.getValues(r);
+            const vals: unknown[] = xlSheet.row.getValues(r);
             const wsRow = ws.getRow(r + 1);
             for (let c = 0; c < vals.length; c++) {
               const v = vals[c];
-              wsRow.getCell(c + 1).value = (v === null || v === undefined) ? null : v;
+              wsRow.getCell(c + 1).value = (v === null || v === undefined) ? null : (v as ExcelJS.CellValue);
             }
             wsRow.commit();
           }
@@ -375,6 +375,8 @@ async function matchTab(
   enInventory: CrawlInventory | null;
   frInventory: CrawlInventory | null;
   tabPatterns: TabPatterns;
+  usedEnUrls: Set<string>;
+  usedFrUrls: Set<string>;
 }> {
   const { sheetName, allRows, tabRefRows } = tabData;
 
