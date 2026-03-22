@@ -311,13 +311,15 @@ function cellValueToString(v: ExcelJS.CellValue): string | number | boolean | Da
 
 function worksheetToAoa(ws: ExcelJS.Worksheet): any[][] {
   const data: any[][] = [];
-  ws.eachRow((row, _rowNum) => {
+  const rowCount = ws.rowCount;
+  for (let r = 1; r <= rowCount; r++) {
     const arr: any[] = [];
+    const row = ws.getRow(r);
     row.eachCell({ includeEmpty: true }, (cell, colNum) => {
       arr[colNum - 1] = cellValueToString(cell.value) ?? "";
     });
     data.push(arr);
-  });
+  }
   return data;
 }
 
