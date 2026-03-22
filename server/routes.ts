@@ -2,6 +2,7 @@ import type { Express, Request, Response } from "express";
 import { createServer, type Server } from "http";
 import multer from "multer";
 import ExcelJS from "exceljs";
+import xlrd from "node-xlrd";
 import path from "path";
 import fs from "fs";
 import { storage } from "./storage";
@@ -26,12 +27,38 @@ import {
 } from "./scraper";
 import { log } from "./index";
 
+function xlsToWorkbook(filePath: string): Promise<ExcelJS.Workbook> {
+  return new Promise((resolve, reject) => {
+    xlrd.open(filePath, (err: Error | null, bk: any) => {
+      if (err) return reject(err);
+      try {
+        const wb = new ExcelJS.Workbook();
+        const sheetCount: number = bk.sheet.count;
+        for (let si = 0; si < sheetCount; si++) {
+          const xlSheet = bk.sheet.byIndex(si);
+          const ws = wb.addWorksheet(xlSheet.name);
+          for (let r = 0; r < xlSheet.nrows; r++) {
+            const vals: any[] = bk.sheet.byIndex(si).row.getValues(r);
+            const wsRow = ws.getRow(r + 1);
+            for (let c = 0; c < vals.length; c++) {
+              const v = vals[c];
+              wsRow.getCell(c + 1).value = (v === null || v === undefined) ? null : v;
+            }
+            wsRow.commit();
+          }
+        }
+        resolve(wb);
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
 async function readWorkbook(filePath: string, originalName?: string): Promise<ExcelJS.Workbook> {
   const ext = path.extname(originalName ?? filePath).toLowerCase();
   if (ext === ".xls") {
-    throw new Error(
-      "Legacy .xls format is not supported. Please convert your file to .xlsx (Excel 2007+) and try again."
-    );
+    return xlsToWorkbook(filePath);
   }
   const wb = new ExcelJS.Workbook();
   if (ext === ".csv") {
@@ -43,7 +70,7 @@ async function readWorkbook(filePath: string, originalName?: string): Promise<Ex
 }
 
 function findJobFile(jobId: string): string | null {
-  for (const ext of [".xlsx", ".csv"]) {
+  for (const ext of [".xlsx", ".xls", ".csv"]) {
     const p = `/tmp/uploads/${jobId}${ext}`;
     if (fs.existsSync(p)) return p;
   }
@@ -55,12 +82,10 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
-    if ([".xlsx", ".csv"].includes(ext)) {
+    if ([".xlsx", ".xls", ".csv"].includes(ext)) {
       cb(null, true);
-    } else if (ext === ".xls") {
-      cb(new Error("Legacy .xls format is not supported. Please open in Excel and save as .xlsx (Excel Workbook), then upload again."));
     } else {
-      cb(new Error("Only .xlsx and .csv files are allowed"));
+      cb(new Error("Only Excel (.xlsx, .xls) and CSV files are allowed"));
     }
   },
 });
@@ -101,7 +126,8 @@ export async function registerRoutes(
       if (!fs.existsSync("/tmp/uploads")) {
         fs.mkdirSync("/tmp/uploads", { recursive: true });
       }
-      const savedExt = path.extname(req.file.originalname).toLowerCase() === ".csv" ? ".csv" : ".xlsx";
+      const origExt = path.extname(req.file.originalname).toLowerCase();
+      const savedExt = [".xls", ".csv"].includes(origExt) ? origExt : ".xlsx";
       const savedPath = `/tmp/uploads/${job.id}${savedExt}`;
       fs.copyFileSync(req.file.path, savedPath);
       fs.unlinkSync(req.file.path);
