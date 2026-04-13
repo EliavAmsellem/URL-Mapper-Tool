@@ -1772,10 +1772,14 @@ export async function titleMatchUnmatched(
         } catch { tails[l] = []; }
       }
 
+      const latinLangs: Set<TargetLang> = new Set(["en", "fr"]);
+      const scriptCompatible = (a: TargetLang, b: TargetLang) => latinLangs.has(a) && latinLangs.has(b);
+
       for (let i = 0; i < matchedLangs.length; i++) {
         for (let j = i + 1; j < matchedLangs.length; j++) {
           const la = matchedLangs[i], lb = matchedLangs[j];
           if (!m[la] || !m[lb]) continue;
+          if (!scriptCompatible(la, lb)) continue;
           let tailOverlap = 0;
           for (const seg of tails[la]) {
             if (tails[lb].some(f => f === seg || (seg.length > 4 && f.includes(seg)) || (f.length > 4 && seg.includes(f)))) {
