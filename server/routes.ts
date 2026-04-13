@@ -22,6 +22,16 @@ import {
   clearCaches,
   clearAllCaches,
   validateDepthMatch,
+  emptyBatchResult,
+  getResultUrl,
+  getResultConf,
+  getResultMethod,
+  setResultMatch,
+  clearResultMatch,
+  langRoot,
+  langSrcRoot,
+  langCrawlScope,
+  type TargetLang,
   type TabPatterns,
   type CrawlInventory,
   type BatchMatchResult,
@@ -284,16 +294,22 @@ interface RowData {
   sourceUrl: string;
   existingEn: string;
   existingFr: string;
+  existingRu: string;
+  existingAr: string;
   originalEn: string;
   originalFr: string;
+  originalRu: string;
+  originalAr: string;
   needsEn: boolean;
   needsFr: boolean;
+  needsRu: boolean;
+  needsAr: boolean;
 }
 
 interface TabData {
   sheetName: string;
   allRows: RowData[];
-  tabRefRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[];
+  tabRefRows: { sourceUrl: string; enUrl?: string; frUrl?: string; ruUrl?: string; arUrl?: string }[];
   data: any[][];
 }
 
@@ -332,7 +348,7 @@ function parseSheet(
   const data = worksheetToAoa(ws);
   if (data.length < 2) return null;
 
-  const tabRefRows: { sourceUrl: string; enUrl?: string; frUrl?: string }[] = [];
+  const tabRefRows: TabData["tabRefRows"] = [];
   const allRows: RowData[] = [];
 
   for (let i = 1; i < data.length; i++) {
@@ -341,6 +357,8 @@ function parseSheet(
     const rawSource = (row[1] || "").toString().trim();
     const existingEn = (row[2] || "").toString().trim();
     const existingFr = (row[3] || "").toString().trim();
+    const existingRu = (row[4] || "").toString().trim();
+    const existingAr = (row[5] || "").toString().trim();
 
     let sourceUrl = rawSource;
     if (!sourceUrl.startsWith("http") && sourceUrl.includes("|")) {
@@ -350,18 +368,27 @@ function parseSheet(
 
     if (!sourceUrl || !sourceUrl.startsWith("http")) continue;
 
-    if (existingEn || existingFr) {
+    if (existingEn || existingFr || existingRu || existingAr) {
       tabRefRows.push({
         sourceUrl,
         enUrl: existingEn || undefined,
         frUrl: existingFr || undefined,
+        ruUrl: existingRu || undefined,
+        arUrl: existingAr || undefined,
       });
     }
 
     const needsEn = targetLangs.includes("en") && !existingEn;
     const needsFr = targetLangs.includes("fr") && !existingFr;
+    const needsRu = targetLangs.includes("ru") && !existingRu;
+    const needsAr = targetLangs.includes("ar") && !existingAr;
 
-    allRows.push({ rowIndex: i, title, sourceUrl, existingEn, existingFr, originalEn: existingEn, originalFr: existingFr, needsEn, needsFr });
+    allRows.push({
+      rowIndex: i, title, sourceUrl,
+      existingEn, existingFr, existingRu, existingAr,
+      originalEn: existingEn, originalFr: existingFr, originalRu: existingRu, originalAr: existingAr,
+      needsEn, needsFr, needsRu, needsAr,
+    });
   }
 
   return { sheetName, allRows, tabRefRows, data };
@@ -373,28 +400,31 @@ async function matchTab(
   control: { cancel: boolean },
 ): Promise<{
   matchResults: Map<number, BatchMatchResult>;
-  enInventory: CrawlInventory | null;
-  frInventory: CrawlInventory | null;
+  inventories: Record<TargetLang, CrawlInventory | null>;
   tabPatterns: TabPatterns;
-  usedEnUrls: Set<string>;
-  usedFrUrls: Set<string>;
+  usedUrls: Record<TargetLang, Set<string>>;
 }> {
   const { sheetName, allRows, tabRefRows } = tabData;
+  const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
+  const langLabels: Record<TargetLang, string> = { en: "EN", fr: "FR", ru: "RU", ar: "AR" };
+  const refUrlKey: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = { en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl" };
 
   const tabPatterns = learnTabPatterns(tabRefRows);
   log(`Tab "${sheetName}": ${tabRefRows.length} reference rows, ${allRows.length} total rows`);
 
-  const needsMatching = allRows.filter((r) => r.needsEn || r.needsFr);
+  const needsMatching = allRows.filter((r) => r.needsEn || r.needsFr || r.needsRu || r.needsAr);
   const matchResults = new Map<number, BatchMatchResult>();
-  let enInventory: CrawlInventory | null = null;
-  let frInventory: CrawlInventory | null = null;
+  const inventories: Record<TargetLang, CrawlInventory | null> = { en: null, fr: null, ru: null, ar: null };
+  const usedUrls: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
 
-  if (needsMatching.length === 0 || (tabPatterns.enRoot.length === 0 && tabPatterns.frRoot.length === 0)) {
-    return { matchResults, enInventory, frInventory, tabPatterns, usedEnUrls: new Set<string>(), usedFrUrls: new Set<string>() };
+  const hasAnyRoot = langs.some(l => langRoot(tabPatterns, l).length > 0);
+  if (needsMatching.length === 0 || !hasAnyRoot) {
+    return { matchResults, inventories, tabPatterns, usedUrls };
   }
 
-  if (tabPatterns.enRoot.length > 0) tabPatterns.patternValidated.en = true;
-  if (tabPatterns.frRoot.length > 0) tabPatterns.patternValidated.fr = true;
+  for (const l of langs) {
+    if (langRoot(tabPatterns, l).length > 0) tabPatterns.patternValidated[l] = true;
+  }
 
   const origin = (() => {
     for (const ref of tabRefRows) {
@@ -406,118 +436,82 @@ async function matchTab(
     return "";
   })();
 
-  const enSeedUrls: string[] = [];
-  const frSeedUrls: string[] = [];
+  const seedUrls: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
   for (const ref of tabRefRows) {
-    if (ref.enUrl) {
-      try {
-        const enParsed = new URL(ref.enUrl);
-        const pathSegs = enParsed.pathname.split("/").filter(Boolean);
-        const parentPath = pathSegs.slice(0, -1);
-        const parentUrl = enParsed.origin + "/" + parentPath.join("/") + "/";
-        enSeedUrls.push(ref.enUrl);
-        enSeedUrls.push(parentUrl);
-        const pagesIdx = parentPath.findIndex(s => s.toLowerCase() === "pages");
-        if (pagesIdx >= 0) {
-          const sectionPath = parentPath.slice(0, pagesIdx);
-          const sectionPagesDir = enParsed.origin + "/" + sectionPath.join("/") + "/Pages/";
-          enSeedUrls.push(sectionPagesDir);
-          enSeedUrls.push(sectionPagesDir + "default.aspx");
-          enSeedUrls.push(sectionPagesDir + "Forms/AllItems.aspx");
-        } else {
-          enSeedUrls.push(enParsed.origin + "/" + parentPath.join("/") + "/Pages/default.aspx");
-        }
-      } catch {}
-    }
-    if (ref.frUrl) {
-      try {
-        const frParsed = new URL(ref.frUrl);
-        const pathSegs = frParsed.pathname.split("/").filter(Boolean);
-        const parentPath = pathSegs.slice(0, -1);
-        const parentUrl = frParsed.origin + "/" + parentPath.join("/") + "/";
-        frSeedUrls.push(ref.frUrl);
-        frSeedUrls.push(parentUrl);
-        const pagesIdx = parentPath.findIndex(s => s.toLowerCase() === "pages");
-        if (pagesIdx >= 0) {
-          const sectionPath = parentPath.slice(0, pagesIdx);
-          const sectionPagesDir = frParsed.origin + "/" + sectionPath.join("/") + "/Pages/";
-          frSeedUrls.push(sectionPagesDir);
-          frSeedUrls.push(sectionPagesDir + "default.aspx");
-          frSeedUrls.push(sectionPagesDir + "Forms/AllItems.aspx");
-        } else {
-          frSeedUrls.push(frParsed.origin + "/" + parentPath.join("/") + "/Pages/default.aspx");
-        }
-      } catch {}
+    for (const l of langs) {
+      const url = ref[refUrlKey[l]];
+      if (url) {
+        try {
+          const parsed = new URL(url);
+          const pathSegs = parsed.pathname.split("/").filter(Boolean);
+          const parentPath = pathSegs.slice(0, -1);
+          const parentUrl = parsed.origin + "/" + parentPath.join("/") + "/";
+          seedUrls[l].push(url);
+          seedUrls[l].push(parentUrl);
+          const pagesIdx = parentPath.findIndex(s => s.toLowerCase() === "pages");
+          if (pagesIdx >= 0) {
+            const sectionPath = parentPath.slice(0, pagesIdx);
+            const sectionPagesDir = parsed.origin + "/" + sectionPath.join("/") + "/Pages/";
+            seedUrls[l].push(sectionPagesDir);
+            seedUrls[l].push(sectionPagesDir + "default.aspx");
+            seedUrls[l].push(sectionPagesDir + "Forms/AllItems.aspx");
+          } else {
+            seedUrls[l].push(parsed.origin + "/" + parentPath.join("/") + "/Pages/default.aspx");
+          }
+        } catch {}
+      }
     }
   }
 
+  const needsKey: Record<TargetLang, keyof RowData> = { en: "needsEn", fr: "needsFr", ru: "needsRu", ar: "needsAr" };
   for (const row of needsMatching) {
-    if (row.needsEn && tabPatterns.enRoot.length > 0) {
-      for (const url of constructAllTargetUrls(row.sourceUrl, "en", tabPatterns)) {
-        enSeedUrls.push(url);
-      }
-    }
-    if (row.needsFr && tabPatterns.frRoot.length > 0) {
-      for (const url of constructAllTargetUrls(row.sourceUrl, "fr", tabPatterns)) {
-        frSeedUrls.push(url);
+    for (const l of langs) {
+      if (row[needsKey[l]] && langRoot(tabPatterns, l).length > 0) {
+        for (const url of constructAllTargetUrls(row.sourceUrl, l, tabPatterns)) {
+          seedUrls[l].push(url);
+        }
       }
     }
   }
 
   const crawlPromises: Promise<void>[] = [];
-  if (origin && tabPatterns.enRoot.length > 0) {
-    const enScope = tabPatterns.enCrawlScope.length > 0 ? tabPatterns.enCrawlScope : tabPatterns.enRoot;
-    const enCacheKey = `en:${enScope.join("/")}`;
-    if (crawlCache.has(enCacheKey)) {
-      enInventory = crawlCache.get(enCacheKey)!;
-      log(`  EN directory cached: ${enInventory.urls.size} URLs`);
-    } else {
-      const uniqueSeeds = Array.from(new Set(enSeedUrls));
-      log(`  Crawling EN directory: /${enScope.join("/")}/  (${uniqueSeeds.length} seed URLs incl. source-derived)`);
-      crawlPromises.push(
-        crawlDirectory(origin, enScope, (c, q) => {
-          if (c % 100 === 0) log(`    EN crawl progress: ${c} pages fetched, ${q} queued`);
-        }, uniqueSeeds).then(inv => { enInventory = inv; crawlCache.set(enCacheKey, inv); log(`  EN crawl complete: ${inv.urls.size} URLs discovered`); })
-      );
-    }
-  }
-
-  if (origin && tabPatterns.frRoot.length > 0) {
-    const frScope = tabPatterns.frCrawlScope.length > 0 ? tabPatterns.frCrawlScope : tabPatterns.frRoot;
-    const frCacheKey = `fr:${frScope.join("/")}`;
-    if (crawlCache.has(frCacheKey)) {
-      frInventory = crawlCache.get(frCacheKey)!;
-      log(`  FR directory cached: ${frInventory.urls.size} URLs`);
-    } else {
-      const uniqueSeeds = Array.from(new Set(frSeedUrls));
-      log(`  Crawling FR directory: /${frScope.join("/")}/  (${uniqueSeeds.length} seed URLs incl. source-derived)`);
-      crawlPromises.push(
-        crawlDirectory(origin, frScope, (c, q) => {
-          if (c % 100 === 0) log(`    FR crawl progress: ${c} pages fetched, ${q} queued`);
-        }, uniqueSeeds).then(inv => { frInventory = inv; crawlCache.set(frCacheKey, inv); log(`  FR crawl complete: ${inv.urls.size} URLs discovered`); })
-      );
+  for (const l of langs) {
+    const root = langRoot(tabPatterns, l);
+    if (origin && root.length > 0) {
+      const scope = langCrawlScope(tabPatterns, l).length > 0 ? langCrawlScope(tabPatterns, l) : root;
+      const cacheKey = `${l}:${scope.join("/")}`;
+      if (crawlCache.has(cacheKey)) {
+        inventories[l] = crawlCache.get(cacheKey)!;
+        log(`  ${langLabels[l]} directory cached: ${inventories[l]!.urls.size} URLs`);
+      } else {
+        const uniqueSeeds = Array.from(new Set(seedUrls[l]));
+        log(`  Crawling ${langLabels[l]} directory: /${scope.join("/")}/  (${uniqueSeeds.length} seed URLs incl. source-derived)`);
+        crawlPromises.push(
+          crawlDirectory(origin, scope, (c, q) => {
+            if (c % 100 === 0) log(`    ${langLabels[l]} crawl progress: ${c} pages fetched, ${q} queued`);
+          }, uniqueSeeds).then(inv => { inventories[l] = inv; crawlCache.set(cacheKey, inv); log(`  ${langLabels[l]} crawl complete: ${inv.urls.size} URLs discovered`); })
+        );
+      }
     }
   }
 
   if (crawlPromises.length > 0) await Promise.all(crawlPromises);
 
-  const usedEnUrls = new Set<string>();
-  const usedFrUrls = new Set<string>();
-
   for (const ref of tabRefRows) {
-    if (ref.enUrl) usedEnUrls.add(ref.enUrl);
-    if (ref.frUrl) usedFrUrls.add(ref.frUrl);
+    for (const l of langs) {
+      const url = ref[refUrlKey[l]];
+      if (url) usedUrls[l].add(url);
+    }
   }
 
-  const unmatchedForHead: { index: number; lang: "en" | "fr"; constructedUrl: string; sourceUrl: string }[] = [];
-  let debugSamplesEn = 0;
-  let debugSamplesFr = 0;
+  const unmatchedForHead: { index: number; lang: TargetLang; constructedUrl: string; sourceUrl: string }[] = [];
+  const debugSamples: Record<string, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
   const MAX_DEBUG_SAMPLES = 15;
   const methodCounts: Record<string, number> = {};
   let inventoryMatchCount = 0;
   let inventoryMissCount = 0;
   let dedupBlockedCount = 0;
-  const sectionStats: Record<string, { enMatched: number; enMissed: number; frMatched: number; frMissed: number }> = {};
+  const sectionStats: Record<string, Record<string, number>> = {};
 
   function getSection(sourceUrl: string): string {
     try {
@@ -530,71 +524,39 @@ async function matchTab(
   for (const row of needsMatching) {
     if (control.cancel) break;
     const section = getSection(row.sourceUrl);
-    if (!sectionStats[section]) sectionStats[section] = { enMatched: 0, enMissed: 0, frMatched: 0, frMissed: 0 };
-
-    const result: BatchMatchResult = {
-      enUrl: null, frUrl: null,
-      confidenceEn: null, confidenceFr: null,
-      matchMethodEn: null, matchMethodFr: null,
-    };
-
-    if (row.needsEn && tabPatterns.patternValidated.en && enInventory) {
-      const match = matchAgainstInventory(row.sourceUrl, "en", tabPatterns, enInventory);
-      if (match && !usedEnUrls.has(match.url)) {
-        result.enUrl = match.url;
-        result.confidenceEn = match.confidence;
-        result.matchMethodEn = match.method;
-        usedEnUrls.add(match.url);
-        methodCounts[match.method] = (methodCounts[match.method] || 0) + 1;
-        inventoryMatchCount++;
-        sectionStats[section].enMatched++;
-      } else {
-        if (match) dedupBlockedCount++; else inventoryMissCount++;
-        sectionStats[section].enMissed++;
-        const allCandidates = constructAllTargetUrls(row.sourceUrl, "en", tabPatterns);
-        if (debugSamplesEn < MAX_DEBUG_SAMPLES) {
-          const reason = match ? `dedup-blocked (${match.url})` : "not-in-inventory";
-          log(`    [DEBUG] EN miss: ${row.sourceUrl}`);
-          log(`      candidates: ${allCandidates.length} URLs | reason: ${reason}`);
-          for (const c of allCandidates.slice(0, 5)) {
-            log(`        ${c} | inInventory: ${enInventory.urls.has(c)}`);
-          }
-          debugSamplesEn++;
-        }
-        for (const candidate of allCandidates) {
-          if (!usedEnUrls.has(candidate)) {
-            unmatchedForHead.push({ index: row.rowIndex, lang: "en", constructedUrl: candidate, sourceUrl: row.sourceUrl });
-          }
-        }
-      }
+    if (!sectionStats[section]) {
+      sectionStats[section] = {};
+      for (const l of langs) { sectionStats[section][`${l}Matched`] = 0; sectionStats[section][`${l}Missed`] = 0; }
     }
 
-    if (row.needsFr && tabPatterns.patternValidated.fr && frInventory) {
-      const match = matchAgainstInventory(row.sourceUrl, "fr", tabPatterns, frInventory);
-      if (match && !usedFrUrls.has(match.url)) {
-        result.frUrl = match.url;
-        result.confidenceFr = match.confidence;
-        result.matchMethodFr = match.method;
-        usedFrUrls.add(match.url);
-        methodCounts[match.method] = (methodCounts[match.method] || 0) + 1;
-        inventoryMatchCount++;
-        sectionStats[section].frMatched++;
-      } else {
-        if (match) dedupBlockedCount++; else inventoryMissCount++;
-        sectionStats[section].frMissed++;
-        const allFrCandidates = constructAllTargetUrls(row.sourceUrl, "fr", tabPatterns);
-        if (debugSamplesFr < MAX_DEBUG_SAMPLES) {
-          const reason = match ? `dedup-blocked (${match.url})` : "not-in-inventory";
-          log(`    [DEBUG] FR miss: ${row.sourceUrl}`);
-          log(`      candidates: ${allFrCandidates.length} URLs | reason: ${reason}`);
-          for (const c of allFrCandidates.slice(0, 5)) {
-            log(`        ${c} | inInventory: ${frInventory.urls.has(c)}`);
+    const result = emptyBatchResult();
+
+    for (const l of langs) {
+      if (row[needsKey[l]] && tabPatterns.patternValidated[l] && inventories[l]) {
+        const match = matchAgainstInventory(row.sourceUrl, l, tabPatterns, inventories[l]!);
+        if (match && !usedUrls[l].has(match.url)) {
+          setResultMatch(result, l, match.url, match.confidence, match.method);
+          usedUrls[l].add(match.url);
+          methodCounts[match.method] = (methodCounts[match.method] || 0) + 1;
+          inventoryMatchCount++;
+          sectionStats[section][`${l}Matched`]++;
+        } else {
+          if (match) dedupBlockedCount++; else inventoryMissCount++;
+          sectionStats[section][`${l}Missed`]++;
+          const allCandidates = constructAllTargetUrls(row.sourceUrl, l, tabPatterns);
+          if (debugSamples[l] < MAX_DEBUG_SAMPLES) {
+            const reason = match ? `dedup-blocked (${match.url})` : "not-in-inventory";
+            log(`    [DEBUG] ${langLabels[l]} miss: ${row.sourceUrl}`);
+            log(`      candidates: ${allCandidates.length} URLs | reason: ${reason}`);
+            for (const c of allCandidates.slice(0, 5)) {
+              log(`        ${c} | inInventory: ${inventories[l]!.urls.has(c)}`);
+            }
+            debugSamples[l]++;
           }
-          debugSamplesFr++;
-        }
-        for (const candidate of allFrCandidates) {
-          if (!usedFrUrls.has(candidate)) {
-            unmatchedForHead.push({ index: row.rowIndex, lang: "fr", constructedUrl: candidate, sourceUrl: row.sourceUrl });
+          for (const candidate of allCandidates) {
+            if (!usedUrls[l].has(candidate)) {
+              unmatchedForHead.push({ index: row.rowIndex, lang: l, constructedUrl: candidate, sourceUrl: row.sourceUrl });
+            }
           }
         }
       }
@@ -608,12 +570,17 @@ async function matchTab(
   log(`  HEAD candidates: ${unmatchedForHead.length} URLs to verify`);
 
   const sectionsWithMisses = Object.entries(sectionStats)
-    .filter(([, s]) => s.enMissed > 0 || s.frMissed > 0)
-    .sort((a, b) => (b[1].enMissed + b[1].frMissed) - (a[1].enMissed + a[1].frMissed));
+    .filter(([, s]) => langs.some(l => (s[`${l}Missed`] || 0) > 0))
+    .sort((a, b) => {
+      const aMiss = langs.reduce((sum, l) => sum + (a[1][`${l}Missed`] || 0), 0);
+      const bMiss = langs.reduce((sum, l) => sum + (b[1][`${l}Missed`] || 0), 0);
+      return bMiss - aMiss;
+    });
   if (sectionsWithMisses.length > 0) {
     log(`  Section breakdown (sections with misses):`);
     for (const [sec, s] of sectionsWithMisses.slice(0, 20)) {
-      log(`    ${sec}: EN ${s.enMatched}✓/${s.enMissed}✗ | FR ${s.frMatched}✓/${s.frMissed}✗`);
+      const parts = langs.map(l => `${langLabels[l]} ${s[`${l}Matched`] || 0}✓/${s[`${l}Missed`] || 0}✗`);
+      log(`    ${sec}: ${parts.join(" | ")}`);
     }
   }
 
@@ -640,15 +607,11 @@ async function matchTab(
     log(`  HEAD results: ${headVerified} verified, ${headFailed} failed out of ${existence.size} checked`);
     let headMatched = 0;
     let headDepthRejected = 0;
-    const enSrcRoot = tabPatterns.enSrcRoot;
-    const frSrcRoot = tabPatterns.frSrcRoot;
-    const enTgtRoot = tabPatterns.enRoot;
-    const frTgtRoot = tabPatterns.frRoot;
 
     for (const item of asciiOnly) {
       if (existence.get(item.constructedUrl)) {
-        const srcRoot = item.lang === "en" ? enSrcRoot : frSrcRoot;
-        const tgtRoot = item.lang === "en" ? enTgtRoot : frTgtRoot;
+        const srcRoot = langSrcRoot(tabPatterns, item.lang);
+        const tgtRoot = langRoot(tabPatterns, item.lang);
 
         try {
           const srcParts = new URL(item.sourceUrl).pathname.split("/").filter(Boolean);
@@ -667,22 +630,12 @@ async function matchTab(
           }
         } catch {}
 
-        const usedSet = item.lang === "en" ? usedEnUrls : usedFrUrls;
-        if (usedSet.has(item.constructedUrl)) continue;
+        if (usedUrls[item.lang].has(item.constructedUrl)) continue;
 
         const result = matchResults.get(item.index);
-        if (result) {
-          if (item.lang === "en" && !result.enUrl) {
-            result.enUrl = item.constructedUrl;
-            result.confidenceEn = 90;
-            result.matchMethodEn = "pattern+head";
-            usedEnUrls.add(item.constructedUrl);
-          } else if (item.lang === "fr" && !result.frUrl) {
-            result.frUrl = item.constructedUrl;
-            result.confidenceFr = 90;
-            result.matchMethodFr = "pattern+head";
-            usedFrUrls.add(item.constructedUrl);
-          }
+        if (result && !getResultUrl(result, item.lang)) {
+          setResultMatch(result, item.lang, item.constructedUrl, 90, "pattern+head");
+          usedUrls[item.lang].add(item.constructedUrl);
           headMatched++;
         }
       }
@@ -692,130 +645,89 @@ async function matchTab(
 
   const unmatchedForTitle = needsMatching.filter(row => {
     const m = matchResults.get(row.rowIndex);
-    return row.title && (
-      (row.needsEn && (!m || !m.enUrl)) ||
-      (row.needsFr && (!m || !m.frUrl))
+    return row.title && langs.some(l =>
+      row[needsKey[l]] && (!m || !getResultUrl(m, l))
     );
   }).map(row => {
     const m = matchResults.get(row.rowIndex);
-    return {
-      rowIndex: row.rowIndex,
-      title: row.title,
-      sourceUrl: row.sourceUrl,
-      needsEn: row.needsEn && (!m || !m.enUrl),
-      needsFr: row.needsFr && (!m || !m.frUrl),
-    };
+    const needs: Record<TargetLang, boolean> = { en: false, fr: false, ru: false, ar: false };
+    for (const l of langs) {
+      needs[l] = !!(row[needsKey[l]] && (!m || !getResultUrl(m, l)));
+    }
+    return { rowIndex: row.rowIndex, title: row.title, sourceUrl: row.sourceUrl, needs };
   });
 
-  if (unmatchedForTitle.length > 0 && (enInventory || frInventory)) {
+  const hasAnyInventory = langs.some(l => inventories[l] !== null);
+  if (unmatchedForTitle.length > 0 && hasAnyInventory) {
     log(`  Attempting title-based matching for ${unmatchedForTitle.length} unmatched URLs...`);
-    log(`  EN inventory: ${enInventory ? `${enInventory.urls.size} URLs, ${enInventory.titleIndex.size} titles` : 'null'}`);
-    log(`  FR inventory: ${frInventory ? `${frInventory.urls.size} URLs, ${frInventory.titleIndex.size} titles` : 'null'}`);
-
-    const enAllowedRoots = new Set<string>();
-    const frAllowedRoots = new Set<string>();
-
-    if (tabPatterns.enRoot.length > 0) {
-      enAllowedRoots.add("/" + tabPatterns.enRoot.join("/") + "/");
-    }
-    if (tabPatterns.frRoot.length > 0) {
-      frAllowedRoots.add("/" + tabPatterns.frRoot.join("/") + "/");
+    for (const l of langs) {
+      const inv = inventories[l];
+      log(`  ${langLabels[l]} inventory: ${inv ? `${inv.urls.size} URLs, ${inv.titleIndex.size} titles` : 'null'}`);
     }
 
-    for (const ref of tabRefRows) {
-      if (ref.enUrl) {
-        try {
-          const enPath = new URL(ref.enUrl).pathname;
-          const enParts = enPath.split("/").filter(Boolean);
-          if (enParts.length >= 2) {
-            enAllowedRoots.add("/" + enParts.slice(0, 2).join("/") + "/");
-          } else if (enParts.length >= 1) {
-            enAllowedRoots.add("/" + enParts[0] + "/");
-          }
-        } catch {}
+    const allowedRoots: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
+    for (const l of langs) {
+      const rootSet = new Set<string>();
+      const root = langRoot(tabPatterns, l);
+      if (root.length > 0) rootSet.add("/" + root.join("/") + "/");
+      for (const ref of tabRefRows) {
+        const url = ref[refUrlKey[l]];
+        if (url) {
+          try {
+            const parts = new URL(url).pathname.split("/").filter(Boolean);
+            if (parts.length >= 2) rootSet.add("/" + parts.slice(0, 2).join("/") + "/");
+            else if (parts.length >= 1) rootSet.add("/" + parts[0] + "/");
+          } catch {}
+        }
       }
-      if (ref.frUrl) {
-        try {
-          const frPath = new URL(ref.frUrl).pathname;
-          const frParts = frPath.split("/").filter(Boolean);
-          if (frParts.length >= 2) {
-            frAllowedRoots.add("/" + frParts.slice(0, 2).join("/") + "/");
-          } else if (frParts.length >= 1) {
-            frAllowedRoots.add("/" + frParts[0] + "/");
-          }
-        } catch {}
-      }
+      allowedRoots[l] = Array.from(rootSet);
+      if (allowedRoots[l].length > 0) log(`  ${langLabels[l]} allowed roots for title matching: ${allowedRoots[l].join(", ")}`);
+      else log(`  ${langLabels[l]} title matching SKIPPED: no allowed roots could be determined`);
     }
 
-    const enRootsArr = Array.from(enAllowedRoots);
-    const frRootsArr = Array.from(frAllowedRoots);
-    if (enRootsArr.length > 0) log(`  EN allowed roots for title matching: ${enRootsArr.join(", ")}`);
-    else log(`  EN title matching SKIPPED: no allowed roots could be determined`);
-    if (frRootsArr.length > 0) log(`  FR allowed roots for title matching: ${frRootsArr.join(", ")}`);
-    else log(`  FR title matching SKIPPED: no allowed roots could be determined`);
-
-    const enRefDepths: number[] = [];
-    const frRefDepths: number[] = [];
-    const knownEnUrls = new Set<string>();
-    const knownFrUrls = new Set<string>();
-
-    for (const ref of tabRefRows) {
-      if (ref.enUrl) {
-        try {
-          enRefDepths.push(new URL(ref.enUrl).pathname.split("/").filter(Boolean).length);
-          knownEnUrls.add(ref.enUrl);
-        } catch {}
+    const refDepths: Record<TargetLang, number[] | undefined> = { en: undefined, fr: undefined, ru: undefined, ar: undefined };
+    const knownUrlSets: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
+    for (const l of langs) {
+      const depths: number[] = [];
+      for (const ref of tabRefRows) {
+        const url = ref[refUrlKey[l]];
+        if (url) {
+          try {
+            depths.push(new URL(url).pathname.split("/").filter(Boolean).length);
+            knownUrlSets[l].add(url);
+          } catch {}
+        }
       }
-      if (ref.frUrl) {
-        try {
-          frRefDepths.push(new URL(ref.frUrl).pathname.split("/").filter(Boolean).length);
-          knownFrUrls.add(ref.frUrl);
-        } catch {}
+      refDepths[l] = depths.length > 0 ? depths : undefined;
+      for (const [, mr] of Array.from(matchResults.entries())) {
+        const u = getResultUrl(mr, l);
+        if (u) knownUrlSets[l].add(u);
       }
+      if (depths.length > 0) log(`  ${langLabels[l]} ref depths: min=${Math.min(...depths)} max=${Math.max(...depths)} (${depths.length} refs)`);
     }
-
-    for (const [, mr] of Array.from(matchResults.entries())) {
-      if (mr.enUrl) knownEnUrls.add(mr.enUrl);
-      if (mr.frUrl) knownFrUrls.add(mr.frUrl);
-    }
-
-    if (enRefDepths.length > 0) log(`  EN ref depths: min=${Math.min(...enRefDepths)} max=${Math.max(...enRefDepths)} (${enRefDepths.length} refs)`);
-    if (frRefDepths.length > 0) log(`  FR ref depths: min=${Math.min(...frRefDepths)} max=${Math.max(...frRefDepths)} (${frRefDepths.length} refs)`);
-    log(`  Known URLs to exclude: ${knownEnUrls.size} EN, ${knownFrUrls.size} FR`);
+    const knownSummary = langs.map(l => `${knownUrlSets[l].size} ${langLabels[l]}`).join(", ");
+    log(`  Known URLs to exclude: ${knownSummary}`);
 
     const titleMatches = await titleMatchUnmatched(
-      unmatchedForTitle, enInventory, frInventory, storage,
-      enRootsArr,
-      frRootsArr,
-      enRefDepths.length > 0 ? enRefDepths : undefined,
-      frRefDepths.length > 0 ? frRefDepths : undefined,
-      knownEnUrls,
-      knownFrUrls,
+      unmatchedForTitle, inventories, storage,
+      allowedRoots, refDepths, knownUrlSets,
     );
 
     for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
       let result = matchResults.get(rowIndex);
       if (!result) {
-        result = { enUrl: null, frUrl: null, confidenceEn: null, confidenceFr: null, matchMethodEn: null, matchMethodFr: null };
+        result = emptyBatchResult();
         matchResults.set(rowIndex, result);
       }
-      if (titleResult.enUrl && !result.enUrl && !usedEnUrls.has(titleResult.enUrl)) {
-        result.enUrl = titleResult.enUrl;
-        result.confidenceEn = titleResult.confidenceEn;
-        result.matchMethodEn = titleResult.matchMethodEn;
-        usedEnUrls.add(titleResult.enUrl);
-      }
-      if (titleResult.frUrl && !result.frUrl && !usedFrUrls.has(titleResult.frUrl)) {
-        result.frUrl = titleResult.frUrl;
-        result.confidenceFr = titleResult.confidenceFr;
-        result.matchMethodFr = titleResult.matchMethodFr;
-        usedFrUrls.add(titleResult.frUrl);
+      for (const l of langs) {
+        const tUrl = getResultUrl(titleResult, l);
+        if (tUrl && !getResultUrl(result, l) && !usedUrls[l].has(tUrl)) {
+          setResultMatch(result, l, tUrl, getResultConf(titleResult, l) || 0, getResultMethod(titleResult, l) || "");
+          usedUrls[l].add(tUrl);
+        }
       }
     }
   }
-
-  let dedupEn = 0;
-  let dedupFr = 0;
 
   const sourceUrlByRow = new Map<number, string>();
   for (const row of needsMatching) {
@@ -832,11 +744,11 @@ async function matchTab(
     } catch { return url.toLowerCase(); }
   }
 
-  function dedupLang(lang: "en" | "fr") {
+  function dedupLang(lang: TargetLang) {
     const urlToRows = new Map<string, { rowIndex: number; confidence: number; normSource: string }[]>();
     for (const [rowIndex, result] of Array.from(matchResults.entries())) {
-      const targetUrl = lang === "en" ? result.enUrl : result.frUrl;
-      const conf = lang === "en" ? result.confidenceEn : result.confidenceFr;
+      const targetUrl = getResultUrl(result, lang);
+      const conf = getResultConf(result, lang);
       if (!targetUrl) continue;
       if (!urlToRows.has(targetUrl)) urlToRows.set(targetUrl, []);
       const srcUrl = sourceUrlByRow.get(rowIndex) || "";
@@ -846,42 +758,32 @@ async function matchTab(
     let count = 0;
     for (const [url, rows] of Array.from(urlToRows.entries())) {
       if (rows.length <= 1) continue;
-
       const uniqueSources = new Set(rows.map(r => r.normSource));
       if (uniqueSources.size <= 1) continue;
-
       rows.sort((a, b) => b.confidence - a.confidence);
       for (let i = 1; i < rows.length; i++) {
         if (rows[i].normSource === rows[0].normSource) continue;
         const result = matchResults.get(rows[i].rowIndex);
-        if (result) {
-          if (lang === "en" && result.enUrl === url) {
-            log(`    Dedup EN REJECTED: ${url} for row ${rows[i].rowIndex} (kept for row ${rows[0].rowIndex})`);
-            result.enUrl = null;
-            result.confidenceEn = null;
-            result.matchMethodEn = null;
-            count++;
-          } else if (lang === "fr" && result.frUrl === url) {
-            log(`    Dedup FR REJECTED: ${url} for row ${rows[i].rowIndex} (kept for row ${rows[0].rowIndex})`);
-            result.frUrl = null;
-            result.confidenceFr = null;
-            result.matchMethodFr = null;
-            count++;
-          }
+        if (result && getResultUrl(result, lang) === url) {
+          log(`    Dedup ${langLabels[lang]} REJECTED: ${url} for row ${rows[i].rowIndex} (kept for row ${rows[0].rowIndex})`);
+          clearResultMatch(result, lang);
+          count++;
         }
       }
     }
     return count;
   }
 
-  dedupEn = dedupLang("en");
-  dedupFr = dedupLang("fr");
+  const dedupCounts: Record<string, number> = {};
+  for (const l of langs) { dedupCounts[l] = dedupLang(l); }
 
-  if (dedupEn > 0 || dedupFr > 0) {
-    log(`  Deduplication removed ${dedupEn} EN and ${dedupFr} FR duplicate target assignments`);
+  const dedupTotal = Object.values(dedupCounts).reduce((a, b) => a + b, 0);
+  if (dedupTotal > 0) {
+    const summary = langs.filter(l => dedupCounts[l] > 0).map(l => `${dedupCounts[l]} ${langLabels[l]}`).join(" and ");
+    log(`  Deduplication removed ${summary} duplicate target assignments`);
   }
 
-  return { matchResults, enInventory, frInventory, tabPatterns, usedEnUrls, usedFrUrls };
+  return { matchResults, inventories, tabPatterns, usedUrls };
 }
 
 async function processJob(jobId: string, _threshold: number, control: { cancel: boolean }) {
@@ -908,8 +810,42 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
     if (td) allTabData.push(td);
   }
 
+  const allLangs: TargetLang[] = ["en", "fr", "ru", "ar"];
+  const existingKey: Record<TargetLang, keyof RowData> = { en: "existingEn", fr: "existingFr", ru: "existingRu", ar: "existingAr" };
+  const needsKey: Record<TargetLang, keyof RowData> = { en: "needsEn", fr: "needsFr", ru: "needsRu", ar: "needsAr" };
+  const refUrlKey: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = { en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl" };
+
   const globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
-  const tabInventories = new Map<string, { enInventory: CrawlInventory | null; frInventory: CrawlInventory | null; tabPatterns: TabPatterns; usedEnUrls: Set<string>; usedFrUrls: Set<string> }>();
+  const tabInventories = new Map<string, { inventories: Record<TargetLang, CrawlInventory | null>; tabPatterns: TabPatterns; usedUrls: Record<TargetLang, Set<string>> }>();
+
+  function updateRowsFromResults(allTabDataList: TabData[], results: Map<string, Map<number, BatchMatchResult>>) {
+    for (const tabData of allTabDataList) {
+      const prevResults = results.get(tabData.sheetName);
+      if (!prevResults) continue;
+      for (const row of tabData.allRows) {
+        const m = prevResults.get(row.rowIndex);
+        if (!m) continue;
+        for (const l of allLangs) {
+          const url = getResultUrl(m, l);
+          if (url && row[needsKey[l]]) {
+            (row as any)[existingKey[l]] = url;
+            (row as any)[needsKey[l]] = false;
+          }
+        }
+      }
+      tabData.tabRefRows = [];
+      for (const row of tabData.allRows) {
+        const hasAny = allLangs.some(l => (row as any)[existingKey[l]]);
+        if (hasAny) {
+          const ref: any = { sourceUrl: row.sourceUrl };
+          for (const l of allLangs) {
+            ref[refUrlKey[l]] = (row as any)[existingKey[l]] || undefined;
+          }
+          tabData.tabRefRows.push(ref);
+        }
+      }
+    }
+  }
 
   for (let pass = 1; pass <= MAX_PASSES; pass++) {
     if (control.cancel) break;
@@ -919,42 +855,14 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
 
     if (pass > 1) {
       log(`\n========== PASS ${pass} ==========`);
-      log(`Re-learning patterns from ${pass === 1 ? "original" : "updated"} reference rows...`);
-
-      for (const tabData of allTabData) {
-        const prevResults = globalMatchResults.get(tabData.sheetName);
-        if (!prevResults) continue;
-
-        for (const row of tabData.allRows) {
-          const m = prevResults.get(row.rowIndex);
-          if (!m) continue;
-          if (m.enUrl && row.needsEn) {
-            row.existingEn = m.enUrl;
-            row.needsEn = false;
-          }
-          if (m.frUrl && row.needsFr) {
-            row.existingFr = m.frUrl;
-            row.needsFr = false;
-          }
-        }
-
-        tabData.tabRefRows = [];
-        for (const row of tabData.allRows) {
-          if (row.existingEn || row.existingFr) {
-            tabData.tabRefRows.push({
-              sourceUrl: row.sourceUrl,
-              enUrl: row.existingEn || undefined,
-              frUrl: row.existingFr || undefined,
-            });
-          }
-        }
-      }
+      log(`Re-learning patterns from updated reference rows...`);
+      updateRowsFromResults(allTabData, globalMatchResults);
     }
 
     for (const tabData of allTabData) {
       if (control.cancel) break;
 
-      const needsMatching = tabData.allRows.filter((r) => r.needsEn || r.needsFr);
+      const needsMatching = tabData.allRows.filter((r) => r.needsEn || r.needsFr || r.needsRu || r.needsAr);
       if (needsMatching.length === 0) {
         if (pass === 1) {
           log(`\n=== Processing tab: "${tabData.sheetName}" (${tabData.allRows.length} rows) ===`);
@@ -969,8 +877,8 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       const stepLabel = pass > 1 ? `pass${pass}:${tabData.sheetName}` : `matching:${tabData.sheetName}`;
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
-      const { matchResults, enInventory, frInventory, tabPatterns, usedEnUrls, usedFrUrls } = await matchTab(tabData, crawlCache, control);
-      tabInventories.set(tabData.sheetName, { enInventory, frInventory, tabPatterns, usedEnUrls, usedFrUrls });
+      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control);
+      tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
 
       if (!globalMatchResults.has(tabData.sheetName)) {
         globalMatchResults.set(tabData.sheetName, new Map());
@@ -981,22 +889,18 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       for (const [rowIndex, result] of Array.from(matchResults.entries())) {
         const existing = sheetGlobal.get(rowIndex);
         if (!existing) {
-          if (result.enUrl || result.frUrl) {
+          const hasAny = allLangs.some(l => getResultUrl(result, l) !== null);
+          if (hasAny) {
             sheetGlobal.set(rowIndex, result);
             tabNewMatches++;
           }
         } else {
-          if (result.enUrl && !existing.enUrl) {
-            existing.enUrl = result.enUrl;
-            existing.confidenceEn = result.confidenceEn;
-            existing.matchMethodEn = result.matchMethodEn;
-            tabNewMatches++;
-          }
-          if (result.frUrl && !existing.frUrl) {
-            existing.frUrl = result.frUrl;
-            existing.confidenceFr = result.confidenceFr;
-            existing.matchMethodFr = result.matchMethodFr;
-            tabNewMatches++;
+          for (const l of allLangs) {
+            const url = getResultUrl(result, l);
+            if (url && !getResultUrl(existing, l)) {
+              setResultMatch(existing, l, url, getResultConf(result, l) || 0, getResultMethod(result, l) || "");
+              tabNewMatches++;
+            }
           }
         }
       }
@@ -1023,32 +927,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
     }
 
     if (pass < MAX_PASSES && passNewMatches > 0) {
-      for (const tabData of allTabData) {
-        const prevResults = globalMatchResults.get(tabData.sheetName);
-        if (!prevResults) continue;
-        for (const row of tabData.allRows) {
-          const m = prevResults.get(row.rowIndex);
-          if (!m) continue;
-          if (m.enUrl && row.needsEn) {
-            row.existingEn = m.enUrl;
-            row.needsEn = false;
-          }
-          if (m.frUrl && row.needsFr) {
-            row.existingFr = m.frUrl;
-            row.needsFr = false;
-          }
-        }
-        tabData.tabRefRows = [];
-        for (const row of tabData.allRows) {
-          if (row.existingEn || row.existingFr) {
-            tabData.tabRefRows.push({
-              sourceUrl: row.sourceUrl,
-              enUrl: row.existingEn || undefined,
-              frUrl: row.existingFr || undefined,
-            });
-          }
-        }
-      }
+      updateRowsFromResults(allTabData, globalMatchResults);
     }
   }
 
@@ -1065,18 +944,14 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       const unmatchedForAi = tabData.allRows.filter(row => {
         if (!row.title) return false;
         const m = sheetGlobal.get(row.rowIndex);
-        const stillNeedsEn = row.needsEn && (!m || !m.enUrl);
-        const stillNeedsFr = row.needsFr && (!m || !m.frUrl);
-        return stillNeedsEn || stillNeedsFr;
+        return allLangs.some(l => row[needsKey[l]] && (!m || !getResultUrl(m, l)));
       }).map(row => {
         const m = sheetGlobal.get(row.rowIndex);
-        return {
-          rowIndex: row.rowIndex,
-          title: row.title,
-          sourceUrl: row.sourceUrl,
-          needsEn: row.needsEn && (!m || !m.enUrl),
-          needsFr: row.needsFr && (!m || !m.frUrl),
-        };
+        const needs: Record<TargetLang, boolean> = { en: false, fr: false, ru: false, ar: false };
+        for (const l of allLangs) {
+          needs[l] = !!(row[needsKey[l]] && (!m || !getResultUrl(m, l)));
+        }
+        return { rowIndex: row.rowIndex, title: row.title, sourceUrl: row.sourceUrl, needs };
       });
 
       if (unmatchedForAi.length === 0) continue;
@@ -1084,49 +959,46 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       log(`\n=== AI Matching for tab: "${tabData.sheetName}" (${unmatchedForAi.length} unmatched) ===`);
       await storage.updateJob(jobId, { currentStep: `ai:${tabData.sheetName}` });
 
-      const knownEnUrls = new Set<string>();
-      const knownFrUrls = new Set<string>();
+      const knownUrlSets: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
       for (const ref of tabData.tabRefRows) {
-        if (ref.enUrl) knownEnUrls.add(ref.enUrl);
-        if (ref.frUrl) knownFrUrls.add(ref.frUrl);
+        for (const l of allLangs) {
+          const url = ref[refUrlKey[l]];
+          if (url) knownUrlSets[l].add(url);
+        }
       }
       for (const [, mr] of Array.from(sheetGlobal.entries())) {
-        if (mr.enUrl) knownEnUrls.add(mr.enUrl);
-        if (mr.frUrl) knownFrUrls.add(mr.frUrl);
+        for (const l of allLangs) {
+          const url = getResultUrl(mr, l);
+          if (url) knownUrlSets[l].add(url);
+        }
       }
 
       const matchedExamples = tabData.tabRefRows.slice(0, 10);
 
-      const titlesForEn = unmatchedForAi.filter(r => r.needsEn).map(r => r.title).filter(Boolean);
-      const titlesForFr = unmatchedForAi.filter(r => r.needsFr).map(r => r.title).filter(Boolean);
-
-      let enTranslations = new Map<string, string>();
-      let frTranslations = new Map<string, string>();
-
-      if (titlesForEn.length > 0) {
-        enTranslations = await batchTranslate(titlesForEn, "en", storage);
-      }
-      if (titlesForFr.length > 0) {
-        frTranslations = await batchTranslate(titlesForFr, "fr", storage);
+      const allTranslations: Record<TargetLang, Map<string, string>> = { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() };
+      for (const l of allLangs) {
+        const titles = unmatchedForAi.filter(r => r.needs[l]).map(r => r.title).filter(Boolean);
+        if (titles.length > 0) {
+          allTranslations[l] = await batchTranslate(titles, l, storage);
+        }
       }
 
       const aiMatches = await aiMatchUnmatched(
         unmatchedForAi,
-        inv.enInventory,
-        inv.frInventory,
+        inv.inventories,
         inv.tabPatterns,
         matchedExamples,
-        enTranslations,
-        frTranslations,
-        knownEnUrls,
-        knownFrUrls,
+        allTranslations,
+        knownUrlSets,
       );
 
       if (aiMatches.size > 0) {
         const aiUrls: string[] = [];
         for (const [, aiResult] of Array.from(aiMatches.entries())) {
-          if (aiResult.enUrl) aiUrls.push(aiResult.enUrl);
-          if (aiResult.frUrl) aiUrls.push(aiResult.frUrl);
+          for (const l of allLangs) {
+            const url = getResultUrl(aiResult, l);
+            if (url) aiUrls.push(url);
+          }
         }
 
         log(`  HEAD-verifying ${aiUrls.length} AI-suggested URLs...`);
@@ -1144,59 +1016,41 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
         for (const [rowIndex, aiResult] of Array.from(aiMatches.entries())) {
           const srcUrl = rowSourceMap.get(rowIndex) || "";
 
-          if (aiResult.enUrl && !existence.get(aiResult.enUrl)) {
-            log(`    AI HEAD REJECTED: EN ${aiResult.enUrl}`);
-            aiResult.enUrl = null;
-            aiResult.confidenceEn = null;
-            aiResult.matchMethodEn = null;
-            aiHeadRejected++;
-          }
-          if (aiResult.frUrl && !existence.get(aiResult.frUrl)) {
-            log(`    AI HEAD REJECTED: FR ${aiResult.frUrl}`);
-            aiResult.frUrl = null;
-            aiResult.confidenceFr = null;
-            aiResult.matchMethodFr = null;
-            aiHeadRejected++;
-          }
-
-          if (aiResult.enUrl && srcUrl && inv.tabPatterns.enSrcRoot.length > 0) {
-            if (!validateDepthMatch(srcUrl, aiResult.enUrl, inv.tabPatterns.enSrcRoot, inv.tabPatterns.enRoot)) {
-              log(`    AI DEPTH REJECTED: EN ${aiResult.enUrl}`);
-              aiResult.enUrl = null;
-              aiResult.confidenceEn = null;
-              aiResult.matchMethodEn = null;
-              aiDepthRejected++;
-            }
-          }
-          if (aiResult.frUrl && srcUrl && inv.tabPatterns.frSrcRoot.length > 0) {
-            if (!validateDepthMatch(srcUrl, aiResult.frUrl, inv.tabPatterns.frSrcRoot, inv.tabPatterns.frRoot)) {
-              log(`    AI DEPTH REJECTED: FR ${aiResult.frUrl}`);
-              aiResult.frUrl = null;
-              aiResult.confidenceFr = null;
-              aiResult.matchMethodFr = null;
-              aiDepthRejected++;
+          for (const l of allLangs) {
+            const url = getResultUrl(aiResult, l);
+            if (url && !existence.get(url)) {
+              log(`    AI HEAD REJECTED: ${l.toUpperCase()} ${url}`);
+              clearResultMatch(aiResult, l);
+              aiHeadRejected++;
             }
           }
 
-          if (aiResult.enUrl || aiResult.frUrl) {
+          for (const l of allLangs) {
+            const url = getResultUrl(aiResult, l);
+            const sr = langSrcRoot(inv.tabPatterns, l);
+            if (url && srcUrl && sr.length > 0) {
+              if (!validateDepthMatch(srcUrl, url, sr, langRoot(inv.tabPatterns, l))) {
+                log(`    AI DEPTH REJECTED: ${l.toUpperCase()} ${url}`);
+                clearResultMatch(aiResult, l);
+                aiDepthRejected++;
+              }
+            }
+          }
+
+          const hasAny = allLangs.some(l => getResultUrl(aiResult, l) !== null);
+          if (hasAny) {
             let existing = sheetGlobal.get(rowIndex);
             if (!existing) {
-              existing = { enUrl: null, frUrl: null, confidenceEn: null, confidenceFr: null, matchMethodEn: null, matchMethodFr: null };
+              existing = emptyBatchResult();
               sheetGlobal.set(rowIndex, existing);
             }
-            if (aiResult.enUrl && !existing.enUrl && !inv.usedEnUrls.has(aiResult.enUrl)) {
-              existing.enUrl = aiResult.enUrl;
-              existing.confidenceEn = aiResult.confidenceEn;
-              existing.matchMethodEn = aiResult.matchMethodEn;
-              inv.usedEnUrls.add(aiResult.enUrl);
-              aiAccepted++;
-            }
-            if (aiResult.frUrl && !existing.frUrl && !inv.usedFrUrls.has(aiResult.frUrl)) {
-              existing.frUrl = aiResult.frUrl;
-              existing.confidenceFr = aiResult.confidenceFr;
-              existing.matchMethodFr = aiResult.matchMethodFr;
-              inv.usedFrUrls.add(aiResult.frUrl);
-              aiAccepted++;
+            for (const l of allLangs) {
+              const url = getResultUrl(aiResult, l);
+              if (url && !getResultUrl(existing, l) && !inv.usedUrls[l].has(url)) {
+                setResultMatch(existing, l, url, getResultConf(aiResult, l) || 0, getResultMethod(aiResult, l) || "");
+                inv.usedUrls[l].add(url);
+                aiAccepted++;
+              }
             }
           }
         }
@@ -1226,24 +1080,30 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       const match = sheetGlobal.get(row.rowIndex);
       let enUrl: string | null = row.originalEn || null;
       let frUrl: string | null = row.originalFr || null;
+      let ruUrl: string | null = row.originalRu || null;
+      let arUrl: string | null = row.originalAr || null;
       let confidenceEn: number | null = null;
       let confidenceFr: number | null = null;
+      let confidenceRu: number | null = null;
+      let confidenceAr: number | null = null;
       let matchMethodEn: string | null = row.originalEn ? "existing" : null;
       let matchMethodFr: string | null = row.originalFr ? "existing" : null;
+      let matchMethodRu: string | null = row.originalRu ? "existing" : null;
+      let matchMethodAr: string | null = row.originalAr ? "existing" : null;
 
       if (match) {
         let rowHasMatch = false;
         if (match.enUrl && !row.originalEn) {
-          enUrl = match.enUrl;
-          confidenceEn = match.confidenceEn;
-          matchMethodEn = match.matchMethodEn;
-          rowHasMatch = true;
+          enUrl = match.enUrl; confidenceEn = match.confidenceEn; matchMethodEn = match.matchMethodEn; rowHasMatch = true;
         }
         if (match.frUrl && !row.originalFr) {
-          frUrl = match.frUrl;
-          confidenceFr = match.confidenceFr;
-          matchMethodFr = match.matchMethodFr;
-          rowHasMatch = true;
+          frUrl = match.frUrl; confidenceFr = match.confidenceFr; matchMethodFr = match.matchMethodFr; rowHasMatch = true;
+        }
+        if (match.ruUrl && !row.originalRu) {
+          ruUrl = match.ruUrl; confidenceRu = match.confidenceRu; matchMethodRu = match.matchMethodRu; rowHasMatch = true;
+        }
+        if (match.arUrl && !row.originalAr) {
+          arUrl = match.arUrl; confidenceAr = match.confidenceAr; matchMethodAr = match.matchMethodAr; rowHasMatch = true;
         }
         if (rowHasMatch) finalMatchedCount++;
       }
@@ -1256,8 +1116,8 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
         sourceUrl: row.sourceUrl,
         englishUrl: enUrl,
         frenchUrl: frUrl,
-        russianUrl: null,
-        arabicUrl: null,
+        russianUrl: ruUrl,
+        arabicUrl: arUrl,
         confidenceEn,
         confidenceFr,
         matchMethodEn,

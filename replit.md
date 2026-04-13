@@ -49,4 +49,7 @@ The system supports multi-pass processing, where newly matched URLs in each pass
 
 ### External Web Requests
 -   HTTP HEAD requests are made to verify the existence of constructed target URLs.
--   Google Translate (GTX endpoint) is used for Hebrew→EN/FR title translations.
+-   Google Translate (GTX endpoint) is used for Hebrew→EN/FR/RU/AR title translations.
+
+### Target Languages
+The system supports four target languages: English (EN), French (FR), Russian (RU), and Arabic (AR). Source language is always Hebrew. Excel columns: 0=Title, 1=Source, 2=EN, 3=FR, 4=RU, 5=AR. The `TargetLang` type alias (`"en" | "fr" | "ru" | "ar"`) and helper functions (`langRoot`, `langSrcRoot`, `langCrawlScope`, `getResultUrl`, `getResultConf`, `getResultMethod`, `setResultMatch`, `clearResultMatch`, `emptyBatchResult`) centralize language-specific access to pattern data and match results, avoiding duplicated EN/FR ternaries.
