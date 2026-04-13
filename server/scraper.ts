@@ -1772,7 +1772,7 @@ export async function titleMatchUnmatched(
         } catch { tails[l] = []; }
       }
 
-      const latinLangs: Set<TargetLang> = new Set(["en", "fr"]);
+      const latinLangs = new Set<TargetLang>(["en", "fr"]);
       const scriptCompatible = (a: TargetLang, b: TargetLang) => latinLangs.has(a) && latinLangs.has(b);
 
       for (let i = 0; i < matchedLangs.length; i++) {
