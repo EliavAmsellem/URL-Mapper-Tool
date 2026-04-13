@@ -122,7 +122,7 @@ export async function registerRoutes(
       }
 
       const langStr = typeof req.body?.languages === "string" ? req.body.languages : "";
-      const targetLangs = langStr ? langStr.split(",") : ["en", "fr"];
+      const targetLangs = langStr ? langStr.split(",") : ["en", "fr", "ru", "ar"];
 
       const job = await storage.createJob({
         fileName: req.file.originalname,
@@ -798,7 +798,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
   const job = await storage.getJob(jobId);
   if (!job) throw new Error("Job not found");
 
-  const targetLangs = (job.targetLanguages || ["en", "fr"]) as string[];
+  const targetLangs = (job.targetLanguages || ["en", "fr", "ru", "ar"]) as string[];
   let processedCount = 0;
   let matchedCount = 0;
   const startTime = Date.now();
@@ -818,6 +818,19 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
   const globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
   const tabInventories = new Map<string, { inventories: Record<TargetLang, CrawlInventory | null>; tabPatterns: TabPatterns; usedUrls: Record<TargetLang, Set<string>> }>();
 
+  function getRowExisting(row: RowData, lang: TargetLang): string {
+    switch (lang) { case "en": return row.existingEn; case "fr": return row.existingFr; case "ru": return row.existingRu; case "ar": return row.existingAr; }
+  }
+  function setRowExisting(row: RowData, lang: TargetLang, val: string) {
+    switch (lang) { case "en": row.existingEn = val; break; case "fr": row.existingFr = val; break; case "ru": row.existingRu = val; break; case "ar": row.existingAr = val; break; }
+  }
+  function getRowNeeds(row: RowData, lang: TargetLang): boolean {
+    switch (lang) { case "en": return row.needsEn; case "fr": return row.needsFr; case "ru": return row.needsRu; case "ar": return row.needsAr; }
+  }
+  function setRowNeeds(row: RowData, lang: TargetLang, val: boolean) {
+    switch (lang) { case "en": row.needsEn = val; break; case "fr": row.needsFr = val; break; case "ru": row.needsRu = val; break; case "ar": row.needsAr = val; break; }
+  }
+
   function updateRowsFromResults(allTabDataList: TabData[], results: Map<string, Map<number, BatchMatchResult>>) {
     for (const tabData of allTabDataList) {
       const prevResults = results.get(tabData.sheetName);
@@ -827,21 +840,23 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
         if (!m) continue;
         for (const l of allLangs) {
           const url = getResultUrl(m, l);
-          if (url && row[needsKey[l]]) {
-            (row as any)[existingKey[l]] = url;
-            (row as any)[needsKey[l]] = false;
+          if (url && getRowNeeds(row, l)) {
+            setRowExisting(row, l, url);
+            setRowNeeds(row, l, false);
           }
         }
       }
       tabData.tabRefRows = [];
       for (const row of tabData.allRows) {
-        const hasAny = allLangs.some(l => (row as any)[existingKey[l]]);
+        const hasAny = allLangs.some(l => !!getRowExisting(row, l));
         if (hasAny) {
-          const ref: any = { sourceUrl: row.sourceUrl };
-          for (const l of allLangs) {
-            ref[refUrlKey[l]] = (row as any)[existingKey[l]] || undefined;
-          }
-          tabData.tabRefRows.push(ref);
+          tabData.tabRefRows.push({
+            sourceUrl: row.sourceUrl,
+            enUrl: row.existingEn || undefined,
+            frUrl: row.existingFr || undefined,
+            ruUrl: row.existingRu || undefined,
+            arUrl: row.existingAr || undefined,
+          });
         }
       }
     }

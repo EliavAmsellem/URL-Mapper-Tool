@@ -65,7 +65,7 @@ function App() {
           <div className="flex items-center gap-4">
             <button className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors px-3 py-1.5 rounded-lg hover:bg-muted/50" data-testid="button-languages">
               <Languages className="w-4 h-4" />
-              <span>Target: EN, FR</span>
+              <span>Target: EN, FR, RU, AR</span>
             </button>
           </div>
         </header>
