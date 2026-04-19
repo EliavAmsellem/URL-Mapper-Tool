@@ -164,18 +164,36 @@ function combineSignals(parent: AbortSignal | undefined, timeoutMs: number): { s
   };
 }
 
+function parseHttpUrl(url: string): URL | null {
+  if (typeof url !== "string" || !/^https?:\/\//i.test(url)) return null;
+  try {
+    return new URL(url);
+  } catch {
+    return null;
+  }
+}
+
+function buildVerificationHeaders(parsed: URL, extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...BROWSER_HEADERS, ...(extra ?? {}) };
+  if (parsed.origin && parsed.origin !== "null") {
+    headers["Referer"] = parsed.origin + "/";
+  }
+  return headers;
+}
+
 async function getCheck(url: string, signal?: AbortSignal): Promise<boolean> {
   if (signal?.aborted) return false;
+  const parsed = parseHttpUrl(url);
+  if (!parsed) {
+    console.warn(`[scraper] skipped: invalid URL (${url})`);
+    return false;
+  }
   const { signal: combined, cleanup } = combineSignals(signal, HEAD_TIMEOUT);
   try {
     const response = await fetch(url, {
       method: "GET",
       signal: combined,
-      headers: {
-        ...BROWSER_HEADERS,
-        "Referer": new URL(url).origin + "/",
-        "Range": "bytes=0-2047",
-      },
+      headers: buildVerificationHeaders(parsed, { "Range": "bytes=0-2047" }),
       redirect: "follow",
     });
     try { (response.body as any)?.cancel?.(); } catch {}
@@ -190,6 +208,12 @@ async function getCheck(url: string, signal?: AbortSignal): Promise<boolean> {
 async function headCheck(url: string, signal?: AbortSignal): Promise<boolean> {
   if (urlExistenceCache.has(url)) return urlExistenceCache.get(url)!;
   if (signal?.aborted) return false;
+  const parsed = parseHttpUrl(url);
+  if (!parsed) {
+    console.warn(`[scraper] skipped: invalid URL (${url})`);
+    urlExistenceCache.set(url, false);
+    return false;
+  }
   const { signal: combined, cleanup } = combineSignals(signal, HEAD_TIMEOUT);
   let headOk = false;
   let headFailed = false;
@@ -197,10 +221,7 @@ async function headCheck(url: string, signal?: AbortSignal): Promise<boolean> {
     const response = await fetch(url, {
       method: "HEAD",
       signal: combined,
-      headers: {
-        ...BROWSER_HEADERS,
-        "Referer": new URL(url).origin + "/",
-      },
+      headers: buildVerificationHeaders(parsed),
       redirect: "follow",
     });
     cleanup();
