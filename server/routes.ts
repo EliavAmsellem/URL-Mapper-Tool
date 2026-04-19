@@ -509,37 +509,119 @@ async function matchTab(
     }
   }
 
+  function normalizeAnchorRoot(anchor: string[]): string[] {
+    let s = anchor.slice();
+    while (s.length > 0) {
+      const last = s[s.length - 1];
+      if (/\.[a-z0-9]{2,5}$/i.test(last)) { s.pop(); continue; }
+      if (last.toLowerCase() === "pages" || last.toLowerCase() === "forms") { s.pop(); continue; }
+      break;
+    }
+    return s;
+  }
+
   const crawlPromises: Promise<void>[] = [];
+  const perLangInvs: Record<TargetLang, CrawlInventory[]> = { en: [], fr: [], ru: [], ar: [] };
+  const useMultiAnchor: Record<TargetLang, boolean> = { en: false, fr: false, ru: false, ar: false };
+
   for (const l of langs) {
     const root = langRoot(tabPatterns, l);
     const perPair = tabPatterns.rootMappings.get(l) || [];
     const hasPerPairRoot = perPair.some(m => m.targetRoot.length > 0);
-    if (origin && (root.length > 0 || hasPerPairRoot)) {
-      let scope = langCrawlScope(tabPatterns, l);
-      if (scope.length === 0) {
-        if (root.length > 0) scope = root;
-        else {
-          const firstSeg = perPair.find(m => m.targetRoot.length > 0)!.targetRoot[0];
-          scope = [firstSeg];
-        }
+    if (!origin || (root.length === 0 && !hasPerPairRoot)) continue;
+
+    let commonScope = langCrawlScope(tabPatterns, l);
+    if (commonScope.length === 0) {
+      if (root.length > 0) commonScope = root;
+      else {
+        const firstSeg = perPair.find(m => m.targetRoot.length > 0)!.targetRoot[0];
+        commonScope = [firstSeg];
       }
-      const cacheKey = `${l}:${scope.join("/")}`;
-      if (crawlCache.has(cacheKey)) {
-        inventories[l] = crawlCache.get(cacheKey)!;
-        log(`  ${langLabels[l]} directory cached: ${inventories[l]!.urls.size} URLs`);
-      } else {
-        const uniqueSeeds = Array.from(new Set(seedUrls[l]));
-        log(`  Crawling ${langLabels[l]} directory: /${scope.join("/")}/  (${uniqueSeeds.length} seed URLs incl. source-derived)`);
+    }
+
+    const anchorRoots: string[][] = [];
+    const seenAnchors = new Set<string>();
+    const commonScopePrefix = "/" + commonScope.join("/").toLowerCase();
+    for (const m of perPair) {
+      const norm = normalizeAnchorRoot(m.targetRoot);
+      if (norm.length === 0) continue;
+      const anchorPath = "/" + norm.join("/").toLowerCase();
+      if (anchorPath === commonScopePrefix) continue;
+      if (!anchorPath.startsWith(commonScopePrefix + "/") && commonScopePrefix !== "/") continue;
+      const key = norm.map(s => s.toLowerCase()).join("/");
+      if (seenAnchors.has(key)) continue;
+      seenAnchors.add(key);
+      anchorRoots.push(norm);
+    }
+
+    const allSeeds = Array.from(new Set(seedUrls[l]));
+
+    const commonCacheKey = `${origin}|${l}:${commonScope.join("/")}`;
+    if (crawlCache.has(commonCacheKey)) {
+      const inv = crawlCache.get(commonCacheKey)!;
+      perLangInvs[l].push(inv);
+      log(`  ${langLabels[l]} directory cached: ${inv.urls.size} URLs`);
+    } else {
+      log(`  Crawling ${langLabels[l]} directory: /${commonScope.join("/")}/  (${allSeeds.length} seeds, cap=${crawlPageCap})`);
+      const scopeCopy = commonScope;
+      crawlPromises.push(
+        crawlDirectory(origin, scopeCopy, (c, q) => {
+          if (c % 100 === 0) log(`    ${langLabels[l]} common-scope crawl progress: ${c} pages fetched, ${q} queued`);
+        }, allSeeds, control.signal, crawlPageCap).then(inv => {
+          crawlCache.set(commonCacheKey, inv);
+          perLangInvs[l].push(inv);
+          log(`  ${langLabels[l]} common-scope crawl complete: ${inv.urls.size} URLs, ${inv.titleIndex.size} titled`);
+        })
+      );
+    }
+
+    if (anchorRoots.length > 0) {
+      useMultiAnchor[l] = true;
+      log(`  ${langLabels[l]}: ${anchorRoots.length} additional section anchor(s) detected, crawling each independently`);
+      for (const anchor of anchorRoots) {
+        const cacheKey = `${origin}|${l}:${anchor.join("/")}`;
+        if (crawlCache.has(cacheKey)) {
+          const inv = crawlCache.get(cacheKey)!;
+          perLangInvs[l].push(inv);
+          log(`    [${langLabels[l]}] section /${anchor.join("/")}/ cached: ${inv.urls.size} URLs`);
+          continue;
+        }
+        const anchorScopePrefix = "/" + anchor.join("/");
+        const anchorSeeds = allSeeds.filter(s => {
+          try {
+            const p = new URL(s);
+            return p.origin === origin && p.pathname.toLowerCase().startsWith(anchorScopePrefix.toLowerCase());
+          } catch { return false; }
+        });
+        log(`    [${langLabels[l]}] crawling section /${anchor.join("/")}/ (${anchorSeeds.length} matching seeds, cap=${crawlPageCap})`);
+        const anchorCopy = anchor;
         crawlPromises.push(
-          crawlDirectory(origin, scope, (c, q) => {
-            if (c % 100 === 0) log(`    ${langLabels[l]} crawl progress: ${c} pages fetched, ${q} queued`);
-          }, uniqueSeeds, control.signal, crawlPageCap).then(inv => { inventories[l] = inv; crawlCache.set(cacheKey, inv); log(`  ${langLabels[l]} crawl complete: ${inv.urls.size} URLs discovered (cap=${crawlPageCap})`); })
+          crawlDirectory(origin, anchorCopy, (c, q) => {
+            if (c > 0 && c % 100 === 0) log(`      [${langLabels[l]}] /${anchorCopy.join("/")}/ progress: ${c} pages, ${q} queued`);
+          }, anchorSeeds, control.signal, crawlPageCap).then(inv => {
+            crawlCache.set(cacheKey, inv);
+            perLangInvs[l].push(inv);
+            log(`    [${langLabels[l]}] section /${anchorCopy.join("/")}/ complete: ${inv.urls.size} URLs, ${inv.titleIndex.size} titled`);
+          })
         );
       }
     }
   }
 
   if (crawlPromises.length > 0) await Promise.all(crawlPromises);
+
+  for (const l of langs) {
+    if (perLangInvs[l].length === 0) continue;
+    if (perLangInvs[l].length === 1 && !useMultiAnchor[l]) {
+      inventories[l] = perLangInvs[l][0];
+    } else {
+      const merged = mergeInventories(perLangInvs[l]);
+      inventories[l] = merged;
+      const total = merged?.urls.size ?? 0;
+      const titles = merged?.titleIndex.size ?? 0;
+      log(`  ${langLabels[l]} combined inventory: ${total} URLs (${titles} titled) across ${perLangInvs[l].length} crawl(s)`);
+    }
+  }
 
   for (const ref of tabRefRows) {
     for (const l of langs) {
