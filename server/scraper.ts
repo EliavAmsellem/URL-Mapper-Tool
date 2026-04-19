@@ -754,6 +754,45 @@ export interface CrawlInventory {
   lastSegWordIndex: Map<string, Set<string>>;
 }
 
+export function mergeInventories(invs: (CrawlInventory | null | undefined)[]): CrawlInventory | null {
+  const nonNull = invs.filter((i): i is CrawlInventory => !!i && i.urls.size > 0);
+  if (nonNull.length === 0) return null;
+  if (nonNull.length === 1) return nonNull[0];
+  const merged: CrawlInventory = {
+    urls: new Set(),
+    normalizedIndex: new Map(),
+    tailIndex: new Map(),
+    titleIndex: new Map(),
+    lastSegWordIndex: new Map(),
+  };
+  for (const inv of nonNull) {
+    for (const u of Array.from(inv.urls)) merged.urls.add(u);
+    for (const [k, v] of Array.from(inv.normalizedIndex)) {
+      if (!merged.normalizedIndex.has(k)) merged.normalizedIndex.set(k, v);
+    }
+    for (const [k, list] of Array.from(inv.tailIndex)) {
+      const cur = merged.tailIndex.get(k);
+      if (!cur) {
+        merged.tailIndex.set(k, list.slice());
+      } else {
+        for (const u of list) if (!cur.includes(u)) cur.push(u);
+      }
+    }
+    for (const [k, v] of Array.from(inv.titleIndex)) {
+      if (!merged.titleIndex.has(k)) merged.titleIndex.set(k, v);
+    }
+    for (const [k, set] of Array.from(inv.lastSegWordIndex)) {
+      let cur = merged.lastSegWordIndex.get(k);
+      if (!cur) {
+        cur = new Set<string>();
+        merged.lastSegWordIndex.set(k, cur);
+      }
+      for (const u of Array.from(set)) cur.add(u);
+    }
+  }
+  return merged;
+}
+
 function normalizeUrlPath(url: string): string {
   try {
     const parsed = new URL(url);

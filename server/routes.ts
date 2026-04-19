@@ -35,6 +35,7 @@ import {
   type TabPatterns,
   type CrawlInventory,
   type BatchMatchResult,
+  mergeInventories,
 } from "./scraper";
 import { log } from "./index";
 
@@ -986,6 +987,69 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
   if (!control.cancel) {
     await storage.updateJob(jobId, { currentStep: "ai-matching" });
 
+    const pooledInventory: Record<TargetLang, CrawlInventory | null> = { en: null, fr: null, ru: null, ar: null };
+    for (const l of activeLangs) {
+      const all = Array.from(tabInventories.values()).map(t => t.inventories[l]);
+      pooledInventory[l] = mergeInventories(all);
+    }
+    const pooledSummary = activeLangs.map(l => `${pooledInventory[l]?.urls.size ?? 0} ${l.toUpperCase()}`).join(", ");
+    log(`\nPooled crawl inventory for AI matching: ${pooledSummary}`);
+
+    const langRootCrawled: Record<TargetLang, boolean> = { en: false, fr: false, ru: false, ar: false };
+    for (const l of activeLangs) {
+      if (control.cancel) break;
+      if (pooledInventory[l] && pooledInventory[l]!.urls.size > 0) continue;
+      if (langRootCrawled[l]) continue;
+      let chosenScope: string[] = [];
+      let chosenOrigin = "";
+      for (const t of Array.from(tabInventories.values())) {
+        const r = langRoot(t.tabPatterns, l);
+        if (r.length > 0) {
+          chosenScope = r;
+          for (const td of allTabData) {
+            const ref = td.tabRefRows[0];
+            const url = ref?.[refUrlKey[l]];
+            if (url) {
+              try { chosenOrigin = new URL(url).origin; break; } catch {}
+            }
+          }
+          if (!chosenOrigin) {
+            for (const td of allTabData) {
+              const row = td.allRows.find(r => r.sourceUrl);
+              if (row) {
+                try { chosenOrigin = new URL(row.sourceUrl).origin; break; } catch {}
+              }
+            }
+          }
+          break;
+        }
+      }
+      if (chosenScope.length === 0 || !chosenOrigin) continue;
+      const fallbackKey = `fallback:${l}:${chosenScope.join("/")}`;
+      if (crawlCache.has(fallbackKey)) {
+        pooledInventory[l] = crawlCache.get(fallbackKey)!;
+        log(`  Language-root fallback ${l.toUpperCase()} cached: ${pooledInventory[l]!.urls.size} URLs`);
+        langRootCrawled[l] = true;
+        continue;
+      }
+      log(`  Language-root fallback crawl for ${l.toUpperCase()}: /${chosenScope.join("/")}/  (no per-tab inventory available)`);
+      try {
+        const inv = await crawlDirectory(
+          chosenOrigin,
+          chosenScope,
+          (c, q) => { if (c % 100 === 0) log(`    ${l.toUpperCase()} fallback crawl: ${c} pages, ${q} queued`); },
+          undefined,
+          control.signal,
+        );
+        pooledInventory[l] = inv;
+        crawlCache.set(fallbackKey, inv);
+        log(`  Language-root fallback ${l.toUpperCase()} complete: ${inv.urls.size} URLs`);
+      } catch (e) {
+        log(`  Language-root fallback ${l.toUpperCase()} failed: ${(e as Error).message}`);
+      }
+      langRootCrawled[l] = true;
+    }
+
     for (const tabData of allTabData) {
       if (control.cancel) break;
 
@@ -1038,9 +1102,20 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
 
       if (control.cancel) continue;
 
+      const effectiveInventories: Record<TargetLang, CrawlInventory | null> = { en: null, fr: null, ru: null, ar: null };
+      for (const l of allLangs) {
+        const tabInv = inv.inventories[l];
+        const pooled = pooledInventory[l];
+        if (tabInv && pooled && tabInv !== pooled) {
+          effectiveInventories[l] = mergeInventories([tabInv, pooled]);
+        } else {
+          effectiveInventories[l] = tabInv ?? pooled ?? null;
+        }
+      }
+
       const aiMatches = await aiMatchUnmatched(
         unmatchedForAi,
-        inv.inventories,
+        effectiveInventories,
         inv.tabPatterns,
         matchedExamples,
         allTranslations,
