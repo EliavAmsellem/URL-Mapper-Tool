@@ -551,10 +551,7 @@ async function matchTab(
       crawlScopes = [commonScope];
     }
 
-    const perAnchorCap = Math.max(
-      100,
-      Math.min(crawlPageCap, Math.floor(LANG_PAGE_CEILING / crawlScopes.length))
-    );
+    const perAnchorCap = Math.min(crawlPageCap, Math.max(1, Math.floor(LANG_PAGE_CEILING / crawlScopes.length)));
     log(`  ${langLabels[l]}: crawling ${crawlScopes.length} section anchor(s), cap=${perAnchorCap}/anchor (lang ceiling ${LANG_PAGE_CEILING})`);
 
     const allSeeds = Array.from(new Set(seedUrls[l]));
@@ -595,15 +592,10 @@ async function matchTab(
 
   for (const l of langs) {
     if (perLangInvs[l].length === 0) continue;
-    if (perLangInvs[l].length === 1) {
-      inventories[l] = perLangInvs[l][0];
-    } else {
-      const merged = mergeInventories(perLangInvs[l]);
-      inventories[l] = merged;
-      const total = merged?.urls.size ?? 0;
-      const titles = merged?.titleIndex.size ?? 0;
-      log(`  ${langLabels[l]} combined inventory: ${total} URLs (${titles} titled) across ${perLangInvs[l].length} anchor crawl(s)`);
-    }
+    inventories[l] = perLangInvs[l].length === 1 ? perLangInvs[l][0] : mergeInventories(perLangInvs[l]);
+    const total = inventories[l]?.urls.size ?? 0;
+    const titles = inventories[l]?.titleIndex.size ?? 0;
+    log(`  ${langLabels[l]} inventory total: ${total} URLs (${titles} titled) across ${perLangInvs[l].length} anchor crawl(s)`);
   }
 
   for (const ref of tabRefRows) {
