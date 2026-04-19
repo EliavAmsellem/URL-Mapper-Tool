@@ -430,7 +430,13 @@ async function matchTab(
   const inventories: Record<TargetLang, CrawlInventory | null> = { en: null, fr: null, ru: null, ar: null };
   const usedUrls: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
 
-  const hasAnyRoot = langs.some(l => langRoot(tabPatterns, l).length > 0);
+  const hasAnyRoot = langs.some(l => {
+    if (langRoot(tabPatterns, l).length > 0) return true;
+    const pp = tabPatterns.rootMappings.get(l) || [];
+    if (pp.some(m => m.targetRoot.length > 0)) return true;
+    if (tabPatterns.langSuffixRule[l]) return true;
+    return false;
+  });
   if (needsMatching.length === 0 || !hasAnyRoot) {
     return { matchResults, inventories, tabPatterns, usedUrls };
   }
@@ -479,9 +485,15 @@ async function matchTab(
   const needsKey: Record<TargetLang, keyof RowData> = { en: "needsEn", fr: "needsFr", ru: "needsRu", ar: "needsAr" };
   for (const row of needsMatching) {
     for (const l of langs) {
-      if (row[needsKey[l]] && langRoot(tabPatterns, l).length > 0) {
-        for (const url of constructAllTargetUrls(row.sourceUrl, l, tabPatterns)) {
-          seedUrls[l].push(url);
+      if (row[needsKey[l]]) {
+        const hasAnySource =
+          langRoot(tabPatterns, l).length > 0 ||
+          (tabPatterns.rootMappings.get(l)?.some(m => m.targetRoot.length > 0) ?? false) ||
+          !!tabPatterns.langSuffixRule[l];
+        if (hasAnySource) {
+          for (const url of constructAllTargetUrls(row.sourceUrl, l, tabPatterns)) {
+            seedUrls[l].push(url);
+          }
         }
       }
     }

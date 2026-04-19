@@ -41,59 +41,56 @@ function decodeLowerSegment(seg: string): string {
   catch { return seg.toLowerCase().trim(); }
 }
 
+const SUFFIX_RE = /^(.+?)([_-][a-z]{1,3})$/;
+
 function detectLangSuffixRule(
   pairs: { src: string[]; tgt: string[] }[]
 ): { prefix: string[]; suffix: string; depth: number } | null {
   if (pairs.length < 1) return null;
-  const candidates: { prefix: string[]; suffix: string; depth: number }[] = [];
+
+  type Obs = { prefix: string[]; suffix: string; depth: number };
+  const perPairBest: (Obs | null)[] = [];
+
   for (const { src, tgt } of pairs) {
-    if (src.length === 0 || tgt.length <= src.length) continue;
+    if (src.length === 0 || tgt.length === 0) { perPairBest.push(null); continue; }
     const extra = tgt.length - src.length;
-    if (extra < 1 || extra > 2) continue;
-    const prefix = tgt.slice(0, extra);
-    const aligned = tgt.slice(extra);
-    if (aligned.length !== src.length) continue;
-    let suffixSeg: string | null = null;
-    let depth = -1;
-    let ok = true;
-    for (let i = 0; i < src.length; i++) {
-      const sRaw = decodeLowerSegment(src[i]);
+    if (extra < 0 || extra > 2) { perPairBest.push(null); continue; }
+    const prefix = tgt.slice(0, Math.max(0, extra));
+    const aligned = tgt.slice(Math.max(0, extra));
+    if (aligned.length !== src.length) { perPairBest.push(null); continue; }
+
+    const observations: Obs[] = [];
+    for (let i = 0; i < aligned.length; i++) {
       const tRaw = decodeLowerSegment(aligned[i]);
-      if (sRaw === tRaw) continue;
-      if (tRaw.startsWith(sRaw) && tRaw.length > sRaw.length) {
-        const sfx = tRaw.slice(sRaw.length);
-        if (!sfx.startsWith("_") && !sfx.startsWith("-")) { ok = false; break; }
-        if (sfx.length > 8) { ok = false; break; }
-        if (suffixSeg !== null && (suffixSeg !== sfx || depth !== i)) { ok = false; break; }
-        suffixSeg = sfx;
-        depth = i;
-      } else {
-        ok = false;
-        break;
-      }
+      const m = tRaw.match(SUFFIX_RE);
+      if (!m) continue;
+      observations.push({ prefix, suffix: m[2], depth: i });
     }
-    if (ok && suffixSeg && depth >= 0) {
-      candidates.push({ prefix, suffix: suffixSeg, depth });
-    }
+    if (observations.length === 0) { perPairBest.push(null); continue; }
+    observations.sort((a, b) => a.depth - b.depth);
+    perPairBest.push(observations[0]);
   }
-  if (candidates.length === 0) return null;
-  const key = (c: { prefix: string[]; suffix: string; depth: number }) =>
+
+  const valid = perPairBest.filter((o): o is Obs => o !== null);
+  if (valid.length === 0) return null;
+
+  const key = (c: Obs) =>
     c.prefix.map(p => decodeLowerSegment(p)).join("/") + "|" + c.suffix + "|" + c.depth;
-  const counts = new Map<string, { rule: typeof candidates[0]; count: number }>();
-  for (const c of candidates) {
-    const k = key(c);
-    if (!counts.has(k)) counts.set(k, { rule: c, count: 0 });
+  const counts = new Map<string, { rule: Obs; count: number }>();
+  for (const o of valid) {
+    const k = key(o);
+    if (!counts.has(k)) counts.set(k, { rule: o, count: 0 });
     counts.get(k)!.count++;
   }
+
   const sorted = Array.from(counts.values()).sort((a, b) => b.count - a.count);
-  if (sorted.length === 0) return null;
   const top = sorted[0];
   const second = sorted[1];
-  if (pairs.length < 2) return null;
-  if (pairs.length === 2 && top.count < 2) return null;
-  if (pairs.length >= 3 && top.count < 2) return null;
+  const totalPairs = pairs.length;
+  if (top.count < 2 && totalPairs >= 2) return null;
+  if (totalPairs === 1 && top.count < 1) return null;
   if (second && second.count >= top.count) return null;
-  if (top.count / candidates.length < 0.6) return null;
+  if (top.count / totalPairs < 0.6) return null;
   return top.rule;
 }
 
@@ -1926,7 +1923,8 @@ export async function titleMatchUnmatched(
       if (row.needs[lang] && inv && inv.titleIndex.size > 0 && roots && roots.length > 0) {
         const translated = translations[lang].get(row.title);
         if (translated) {
-          rowMatches[lang] = matchByTitle(translated, inv, 0.60, roots, refDepths?.[lang], sourceSegments);
+          const minSim = (lang === "ru" || lang === "ar") ? 0.55 : 0.60;
+          rowMatches[lang] = matchByTitle(translated, inv, minSim, roots, refDepths?.[lang], sourceSegments);
           if (rowMatches[lang]) hasMatch = true;
         }
       }
