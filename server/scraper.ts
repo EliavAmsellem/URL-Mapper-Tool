@@ -904,8 +904,10 @@ export async function crawlDirectory(
   rootPath: string[],
   onProgress?: (crawled: number, queued: number) => void,
   seedUrls?: string[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  maxPages?: number,
 ): Promise<CrawlInventory> {
+  const pageCap = maxPages && maxPages > 0 ? Math.min(maxPages, CRAWL_MAX_PAGES) : CRAWL_MAX_PAGES;
   const inventory: CrawlInventory = {
     urls: new Set(),
     normalizedIndex: new Map(),
@@ -940,7 +942,7 @@ export async function crawlDirectory(
 
   let crawled = 0;
 
-  while (queue.length > 0 && crawled < CRAWL_MAX_PAGES) {
+  while (queue.length > 0 && crawled < pageCap) {
     if (signal?.aborted) break;
     const batch = queue.splice(0, CRAWL_CONCURRENCY);
     const toFetch = batch.filter((url) => !visited.has(url));

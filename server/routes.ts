@@ -1032,7 +1032,8 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         langRootCrawled[l] = true;
         continue;
       }
-      log(`  Language-root fallback crawl for ${l.toUpperCase()}: /${chosenScope.join("/")}/  (no per-tab inventory available)`);
+      const FALLBACK_MAX_PAGES = 1000;
+      log(`  Language-root fallback crawl for ${l.toUpperCase()}: /${chosenScope.join("/")}/  (no per-tab inventory available, cap ${FALLBACK_MAX_PAGES} pages)`);
       try {
         const inv = await crawlDirectory(
           chosenOrigin,
@@ -1040,6 +1041,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
           (c, q) => { if (c % 100 === 0) log(`    ${l.toUpperCase()} fallback crawl: ${c} pages, ${q} queued`); },
           undefined,
           control.signal,
+          FALLBACK_MAX_PAGES,
         );
         pooledInventory[l] = inv;
         crawlCache.set(fallbackKey, inv);
