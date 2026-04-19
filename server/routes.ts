@@ -520,9 +520,9 @@ async function matchTab(
     return s;
   }
 
+  const LANG_PAGE_CEILING = 50000;
   const crawlPromises: Promise<void>[] = [];
   const perLangInvs: Record<TargetLang, CrawlInventory[]> = { en: [], fr: [], ru: [], ar: [] };
-  const useMultiAnchor: Record<TargetLang, boolean> = { en: false, fr: false, ru: false, ar: false };
 
   for (const l of langs) {
     const root = langRoot(tabPatterns, l);
@@ -530,81 +530,64 @@ async function matchTab(
     const hasPerPairRoot = perPair.some(m => m.targetRoot.length > 0);
     if (!origin || (root.length === 0 && !hasPerPairRoot)) continue;
 
-    let commonScope = langCrawlScope(tabPatterns, l);
-    if (commonScope.length === 0) {
-      if (root.length > 0) commonScope = root;
-      else {
-        const firstSeg = perPair.find(m => m.targetRoot.length > 0)!.targetRoot[0];
-        commonScope = [firstSeg];
-      }
-    }
-
     const anchorRoots: string[][] = [];
     const seenAnchors = new Set<string>();
-    const commonScopePrefix = "/" + commonScope.join("/").toLowerCase();
     for (const m of perPair) {
       const norm = normalizeAnchorRoot(m.targetRoot);
       if (norm.length === 0) continue;
-      const anchorPath = "/" + norm.join("/").toLowerCase();
-      if (anchorPath === commonScopePrefix) continue;
-      if (!anchorPath.startsWith(commonScopePrefix + "/") && commonScopePrefix !== "/") continue;
       const key = norm.map(s => s.toLowerCase()).join("/");
       if (seenAnchors.has(key)) continue;
       seenAnchors.add(key);
       anchorRoots.push(norm);
     }
 
-    const allSeeds = Array.from(new Set(seedUrls[l]));
-
-    const commonCacheKey = `${origin}|${l}:${commonScope.join("/")}`;
-    if (crawlCache.has(commonCacheKey)) {
-      const inv = crawlCache.get(commonCacheKey)!;
-      perLangInvs[l].push(inv);
-      log(`  ${langLabels[l]} directory cached: ${inv.urls.size} URLs`);
+    let crawlScopes: string[][];
+    if (anchorRoots.length > 0) {
+      crawlScopes = anchorRoots;
     } else {
-      log(`  Crawling ${langLabels[l]} directory: /${commonScope.join("/")}/  (${allSeeds.length} seeds, cap=${crawlPageCap})`);
-      const scopeCopy = commonScope;
-      crawlPromises.push(
-        crawlDirectory(origin, scopeCopy, (c, q) => {
-          if (c % 100 === 0) log(`    ${langLabels[l]} common-scope crawl progress: ${c} pages fetched, ${q} queued`);
-        }, allSeeds, control.signal, crawlPageCap).then(inv => {
-          crawlCache.set(commonCacheKey, inv);
-          perLangInvs[l].push(inv);
-          log(`  ${langLabels[l]} common-scope crawl complete: ${inv.urls.size} URLs, ${inv.titleIndex.size} titled`);
-        })
-      );
+      let commonScope = langCrawlScope(tabPatterns, l);
+      if (commonScope.length === 0 && root.length > 0) commonScope = root;
+      if (commonScope.length === 0) continue;
+      crawlScopes = [commonScope];
     }
 
-    if (anchorRoots.length > 0) {
-      useMultiAnchor[l] = true;
-      log(`  ${langLabels[l]}: ${anchorRoots.length} additional section anchor(s) detected, crawling each independently`);
-      for (const anchor of anchorRoots) {
-        const cacheKey = `${origin}|${l}:${anchor.join("/")}`;
-        if (crawlCache.has(cacheKey)) {
-          const inv = crawlCache.get(cacheKey)!;
-          perLangInvs[l].push(inv);
-          log(`    [${langLabels[l]}] section /${anchor.join("/")}/ cached: ${inv.urls.size} URLs`);
-          continue;
-        }
-        const anchorScopePrefix = "/" + anchor.join("/");
-        const anchorSeeds = allSeeds.filter(s => {
-          try {
-            const p = new URL(s);
-            return p.origin === origin && p.pathname.toLowerCase().startsWith(anchorScopePrefix.toLowerCase());
-          } catch { return false; }
-        });
-        log(`    [${langLabels[l]}] crawling section /${anchor.join("/")}/ (${anchorSeeds.length} matching seeds, cap=${crawlPageCap})`);
-        const anchorCopy = anchor;
-        crawlPromises.push(
-          crawlDirectory(origin, anchorCopy, (c, q) => {
-            if (c > 0 && c % 100 === 0) log(`      [${langLabels[l]}] /${anchorCopy.join("/")}/ progress: ${c} pages, ${q} queued`);
-          }, anchorSeeds, control.signal, crawlPageCap).then(inv => {
-            crawlCache.set(cacheKey, inv);
-            perLangInvs[l].push(inv);
-            log(`    [${langLabels[l]}] section /${anchorCopy.join("/")}/ complete: ${inv.urls.size} URLs, ${inv.titleIndex.size} titled`);
-          })
-        );
+    const perAnchorCap = Math.max(
+      100,
+      Math.min(crawlPageCap, Math.floor(LANG_PAGE_CEILING / crawlScopes.length))
+    );
+    log(`  ${langLabels[l]}: crawling ${crawlScopes.length} section anchor(s), cap=${perAnchorCap}/anchor (lang ceiling ${LANG_PAGE_CEILING})`);
+
+    const allSeeds = Array.from(new Set(seedUrls[l]));
+
+    for (const scope of crawlScopes) {
+      const cacheKey = `${origin}|${l}:${scope.join("/")}`;
+      const scopePath = "/" + scope.join("/");
+      if (crawlCache.has(cacheKey)) {
+        const inv = crawlCache.get(cacheKey)!;
+        perLangInvs[l].push(inv);
+        log(`    [${langLabels[l]}] anchor ${scopePath}/ cached: fetched=${inv.urls.size} titled=${inv.titleIndex.size}`);
+        continue;
       }
+      const anchorSeeds = crawlScopes.length === 1
+        ? allSeeds
+        : allSeeds.filter(s => {
+            try {
+              const p = new URL(s);
+              return p.origin === origin && p.pathname.toLowerCase().startsWith(scopePath.toLowerCase());
+            } catch { return false; }
+          });
+      log(`    [${langLabels[l]}] crawling anchor ${scopePath}/ (seeds=${anchorSeeds.length}, cap=${perAnchorCap})`);
+      const scopeCopy = scope;
+      crawlPromises.push(
+        crawlDirectory(origin, scopeCopy, (c, q) => {
+          if (c > 0 && c % 100 === 0) log(`      [${langLabels[l]}] ${scopePath}/ progress: ${c} pages, ${q} queued`);
+        }, anchorSeeds, control.signal, perAnchorCap).then(inv => {
+          crawlCache.set(cacheKey, inv);
+          perLangInvs[l].push(inv);
+          const status = inv.urls.size === 0 ? " (NO PAGES — possible bad anchor)" : "";
+          log(`    [${langLabels[l]}] anchor ${scopePath}/ complete: fetched=${inv.urls.size} titled=${inv.titleIndex.size}${status}`);
+        })
+      );
     }
   }
 
@@ -612,14 +595,14 @@ async function matchTab(
 
   for (const l of langs) {
     if (perLangInvs[l].length === 0) continue;
-    if (perLangInvs[l].length === 1 && !useMultiAnchor[l]) {
+    if (perLangInvs[l].length === 1) {
       inventories[l] = perLangInvs[l][0];
     } else {
       const merged = mergeInventories(perLangInvs[l]);
       inventories[l] = merged;
       const total = merged?.urls.size ?? 0;
       const titles = merged?.titleIndex.size ?? 0;
-      log(`  ${langLabels[l]} combined inventory: ${total} URLs (${titles} titled) across ${perLangInvs[l].length} crawl(s)`);
+      log(`  ${langLabels[l]} combined inventory: ${total} URLs (${titles} titled) across ${perLangInvs[l].length} anchor crawl(s)`);
     }
   }
 
