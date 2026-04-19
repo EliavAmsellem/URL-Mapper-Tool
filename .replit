@@ -43,3 +43,7 @@ waitForPort = 5000
 stack = "MOCKUP_JS"
 mockupState = "FULLSTACK"
 integrations = ["javascript_openai_ai_integrations:2.0.0"]
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 180000
