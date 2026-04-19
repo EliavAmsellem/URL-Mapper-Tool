@@ -2410,6 +2410,8 @@ Return ONLY the JSON array, no other text.`;
               log(`    AI REJECTED (not in inventory): ${l.toUpperCase()} ${suggestedUrl}`);
             } else if (usedUrls[l].has(suggestedUrl)) {
               log(`    AI REJECTED (already used): ${l.toUpperCase()} ${suggestedUrl}`);
+            } else if (!validateSectionContext(suggestedUrl, row.sourceUrl, l, tabPatterns)) {
+              log(`    AI REJECTED (section/category mismatch with source): ${l.toUpperCase()} ${suggestedUrl} ⟵ ${row.sourceUrl}`);
             } else {
               setResultMatch(result, l, suggestedUrl, 82, "ai-match");
               usedUrls[l].add(suggestedUrl);
