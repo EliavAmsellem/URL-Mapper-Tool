@@ -809,7 +809,7 @@ export function batchConstructUrls(
 
 const CRAWL_CONCURRENCY = 30;
 const CRAWL_TIMEOUT = 8000;
-const CRAWL_MAX_PAGES = 3000;
+const CRAWL_MAX_PAGES = 10000;
 
 export interface CrawlInventory {
   urls: Set<string>;
@@ -1117,7 +1117,7 @@ export async function crawlDirectory(
         parts.push(`${r}=${n}${sample}`);
       }
     }
-    log(`    Crawl summary for ${origin}/${rootPath.join("/")} → fetched=${crawled}, queued_remaining=${queue.length}, ${parts.join(", ")}${crawled >= pageCap ? ` (HIT CAP=${pageCap})` : ""}`);
+    log(`    Crawl summary for ${origin}/${rootPath.join("/")} → fetched=${crawled}, queued_remaining=${queue.length}, cap=${pageCap}, ${parts.join(", ")}${crawled >= pageCap ? ` (HIT CAP=${pageCap}; raise crawlPageCap or use Auto for deeper crawl)` : ""}`);
   }
 
   return inventory;

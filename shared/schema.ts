@@ -11,6 +11,7 @@ export const mappingJobs = pgTable("mapping_jobs", {
   processedUrls: integer("processed_urls").notNull().default(0),
   matchedUrls: integer("matched_urls").notNull().default(0),
   targetLanguages: text("target_languages").array().notNull().default(sql`ARRAY['en','fr']`),
+  crawlPageCap: integer("crawl_page_cap").notNull().default(0),
   currentStep: text("current_step").default("idle"),
   createdAt: timestamp("created_at").defaultNow(),
 });

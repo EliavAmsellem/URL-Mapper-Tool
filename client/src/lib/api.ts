@@ -28,10 +28,15 @@ export interface MappingResultRow {
   details: any;
 }
 
-export async function uploadFile(file: File, languages: string[] = ["en", "fr", "ru", "ar"]): Promise<{ jobId: string; totalUrls: number; sheets: string[] }> {
+export async function uploadFile(
+  file: File,
+  languages: string[] = ["en", "fr", "ru", "ar"],
+  crawlPageCap: number | "auto" = "auto",
+): Promise<{ jobId: string; totalUrls: number; sheets: string[] }> {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("languages", languages.join(","));
+  formData.append("crawlPageCap", String(crawlPageCap));
 
   const res = await fetch("/api/upload", { method: "POST", body: formData });
   if (!res.ok) {

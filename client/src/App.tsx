@@ -20,6 +20,7 @@ function App() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedLangs, setSelectedLangs] = useState<Set<string>>(new Set(["en", "fr", "ru", "ar"]));
+  const [crawlPageCap, setCrawlPageCap] = useState<number | "auto">("auto");
 
   const handleFileSelect = (selectedFile: File) => {
     setFile(selectedFile);
@@ -45,7 +46,7 @@ function App() {
 
     try {
       const langs = ALL_LANGS.filter(l => selectedLangs.has(l.code)).map(l => l.code);
-      const result = await uploadFile(file, langs);
+      const result = await uploadFile(file, langs, crawlPageCap);
       setJobId(result.jobId);
       await startJob(result.jobId, 85);
       setAppState("processing");
@@ -65,7 +66,16 @@ function App() {
     setJobId(null);
     setError(null);
     setSelectedLangs(new Set(["en", "fr", "ru", "ar"]));
+    setCrawlPageCap("auto");
   };
+
+  const CAP_OPTIONS: { value: number | "auto"; label: string }[] = [
+    { value: "auto", label: "Auto" },
+    { value: 1000, label: "1k" },
+    { value: 3000, label: "3k" },
+    { value: 6000, label: "6k" },
+    { value: 10000, label: "10k" },
+  ];
 
   const headerLangLabel = ALL_LANGS
     .filter(l => selectedLangs.has(l.code))
@@ -143,6 +153,31 @@ function App() {
                           Select at least one language to continue
                         </p>
                       )}
+                    </div>
+
+                    <div className="bg-card/80 backdrop-blur-sm border border-border rounded-xl p-5 max-w-md mx-auto" data-testid="panel-crawl-cap">
+                      <p className="text-sm font-medium text-foreground mb-1">Crawl depth (pages per section)</p>
+                      <p className="text-xs text-muted-foreground mb-3">Higher = more inventory, slower runs. Auto scales to your file size.</p>
+                      <div className="flex flex-wrap justify-center gap-2">
+                        {CAP_OPTIONS.map(opt => {
+                          const active = crawlPageCap === opt.value;
+                          return (
+                            <button
+                              key={String(opt.value)}
+                              onClick={() => setCrawlPageCap(opt.value)}
+                              data-testid={`toggle-cap-${opt.value}`}
+                              className={cn(
+                                "px-4 py-2 rounded-lg text-sm font-medium border transition-all duration-200",
+                                active
+                                  ? "bg-primary text-primary-foreground border-primary shadow-sm shadow-primary/20"
+                                  : "bg-muted/50 text-muted-foreground border-border hover:border-primary/40 hover:text-foreground"
+                              )}
+                            >
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
                     </div>
                   </div>
                 )}

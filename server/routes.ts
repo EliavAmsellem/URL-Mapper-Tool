@@ -134,6 +134,13 @@ export async function registerRoutes(
       const langStr = typeof req.body?.languages === "string" ? req.body.languages : "";
       const targetLangs = langStr ? langStr.split(",") : ["en", "fr", "ru", "ar"];
 
+      const rawCap = req.body?.crawlPageCap;
+      let crawlPageCap = 0;
+      if (rawCap !== undefined && rawCap !== null && rawCap !== "" && rawCap !== "auto") {
+        const n = parseInt(String(rawCap), 10);
+        if (Number.isFinite(n) && n > 0) crawlPageCap = Math.min(n, 10000);
+      }
+
       const job = await storage.createJob({
         fileName: req.file.originalname,
         status: "pending",
@@ -141,6 +148,7 @@ export async function registerRoutes(
         processedUrls: 0,
         matchedUrls: 0,
         targetLanguages: targetLangs,
+        crawlPageCap,
         currentStep: "idle",
       });
 
@@ -411,6 +419,7 @@ async function matchTab(
   crawlCache: Map<string, CrawlInventory>,
   control: JobControl,
   targetLangs: TargetLang[],
+  crawlPageCap: number,
 ): Promise<{
   matchResults: Map<number, BatchMatchResult>;
   inventories: Record<TargetLang, CrawlInventory | null>;
@@ -524,7 +533,7 @@ async function matchTab(
         crawlPromises.push(
           crawlDirectory(origin, scope, (c, q) => {
             if (c % 100 === 0) log(`    ${langLabels[l]} crawl progress: ${c} pages fetched, ${q} queued`);
-          }, uniqueSeeds, control.signal).then(inv => { inventories[l] = inv; crawlCache.set(cacheKey, inv); log(`  ${langLabels[l]} crawl complete: ${inv.urls.size} URLs discovered`); })
+          }, uniqueSeeds, control.signal, crawlPageCap).then(inv => { inventories[l] = inv; crawlCache.set(cacheKey, inv); log(`  ${langLabels[l]} crawl complete: ${inv.urls.size} URLs discovered (cap=${crawlPageCap})`); })
         );
       }
     }
@@ -837,6 +846,21 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
   const targetLangSet = new Set<TargetLang>(targetLangs.filter((l): l is TargetLang => l === "en" || l === "fr" || l === "ru" || l === "ar"));
   const activeLangs: TargetLang[] = (["en", "fr", "ru", "ar"] as TargetLang[]).filter(l => targetLangSet.has(l));
   log(`Job ${jobId} active target languages: ${activeLangs.map(l => l.toUpperCase()).join(", ") || "(none)"}`);
+
+  const userCap = job.crawlPageCap || 0;
+  const HARD_CAP = 10000;
+  let effectiveCap: number;
+  let capMode: string;
+  if (userCap > 0) {
+    effectiveCap = Math.min(userCap, HARD_CAP);
+    capMode = `user-set (${userCap})`;
+  } else {
+    const totalUrls = job.totalUrls || 0;
+    const scaled = Math.max(1000, totalUrls * 3);
+    effectiveCap = Math.min(scaled, HARD_CAP);
+    capMode = `auto (totalUrls=${totalUrls} → ${effectiveCap})`;
+  }
+  log(`Job ${jobId} per-section crawl page cap: ${effectiveCap} [${capMode}]`);
   let processedCount = 0;
   let matchedCount = 0;
   const startTime = Date.now();
@@ -930,7 +954,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       const stepLabel = pass > 1 ? `pass${pass}:${tabData.sheetName}` : `matching:${tabData.sheetName}`;
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
-      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control, activeLangs);
+      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap);
       tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
 
       if (!globalMatchResults.has(tabData.sheetName)) {
@@ -1032,7 +1056,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         langRootCrawled[l] = true;
         continue;
       }
-      const FALLBACK_MAX_PAGES = 1000;
+      const FALLBACK_MAX_PAGES = Math.max(1000, Math.min(effectiveCap, HARD_CAP));
       log(`  Language-root fallback crawl for ${l.toUpperCase()}: /${chosenScope.join("/")}/  (no per-tab inventory available, cap ${FALLBACK_MAX_PAGES} pages)`);
       try {
         const inv = await crawlDirectory(
