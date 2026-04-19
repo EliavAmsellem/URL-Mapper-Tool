@@ -1123,6 +1123,83 @@ export async function crawlDirectory(
   return inventory;
 }
 
+export interface SeedVerifyStats {
+  checked: number;
+  added: number;
+  skippedKnown: number;
+  failed: number;
+  capped: number;
+}
+
+export async function verifySeedUrls(
+  inventory: CrawlInventory,
+  seeds: string[],
+  signal?: AbortSignal,
+  ceiling: number = 3000,
+): Promise<SeedVerifyStats> {
+  const stats: SeedVerifyStats = { checked: 0, added: 0, skippedKnown: 0, failed: 0, capped: 0 };
+
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const s of seeds) {
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    if (inventory.urls.has(s) || inventory.normalizedIndex.has(normalizeUrlPath(s))) {
+      stats.skippedKnown++;
+      continue;
+    }
+    unique.push(s);
+  }
+
+  if (unique.length > ceiling) {
+    stats.capped = unique.length - ceiling;
+    unique.length = ceiling;
+  }
+
+  for (let i = 0; i < unique.length; i += CRAWL_CONCURRENCY) {
+    if (signal?.aborted) break;
+    const batch = unique.slice(i, i + CRAWL_CONCURRENCY);
+    const results = await Promise.all(batch.map(async (url) => {
+      const outcome = await fetchPageDetailed(url, signal);
+      return { url, outcome };
+    }));
+    for (const { url, outcome } of results) {
+      stats.checked++;
+      if (outcome.reason !== "ok" || !outcome.html) {
+        stats.failed++;
+        continue;
+      }
+      const $ = cheerio.load(outcome.html);
+      const pageTitle = $("title").first().text().trim();
+      const lowerTitle = (pageTitle || "").toLowerCase();
+      const titleIsError = lowerTitle.includes("page not found") ||
+        lowerTitle.includes("404 -") ||
+        lowerTitle.includes("שגיאה") ||
+        lowerTitle.includes("הדף לא נמצא");
+      const htmlSnippet = outcome.html.slice(0, 8000);
+      const spSoftRedirect = /window\.location\.replace\s*\(\s*['"][^'"]*(?:PageNotFoundError|PageNotFound|404)[^'"]*['"]\s*\)/i.test(htmlSnippet) ||
+        /window\.location\.href\s*=\s*['"][^'"]*(?:PageNotFoundError|PageNotFound|404)[^'"]*['"]/i.test(htmlSnippet);
+      const spErrorMeta = !!$('meta[name="SharePointError"], meta[name="sharepointerror"]').length;
+      const robotsMeta = ($('meta[name="Robots"], meta[name="robots"]').attr("content") || "").toUpperCase();
+      const spNoIndex = robotsMeta.includes("NOINDEX");
+      const spMetaError = spErrorMeta || (spNoIndex && lowerTitle === "");
+      if (titleIsError || spSoftRedirect || spMetaError) {
+        stats.failed++;
+        continue;
+      }
+      addToInventory(inventory, url);
+      let effectiveTitle = pageTitle || $("h1").first().text().trim();
+      if (effectiveTitle) {
+        effectiveTitle = effectiveTitle.replace(/\s*\|\s*ביטוח לאומי\s*$/, "").trim();
+        inventory.titleIndex.set(url, effectiveTitle);
+      }
+      stats.added++;
+    }
+  }
+
+  return stats;
+}
+
 function removeFromInventory(inventory: CrawlInventory, url: string) {
   inventory.urls.delete(url);
   const normalized = normalizeUrlPath(url);

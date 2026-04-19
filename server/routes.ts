@@ -36,6 +36,7 @@ import {
   type CrawlInventory,
   type BatchMatchResult,
   mergeInventories,
+  verifySeedUrls,
 } from "./scraper";
 import { log } from "./index";
 
@@ -543,7 +544,20 @@ async function matchTab(
 
     let crawlScopes: string[][];
     if (anchorRoots.length > 0) {
-      crawlScopes = anchorRoots;
+      const sorted = anchorRoots.slice().sort((a, b) => a.length - b.length);
+      const kept: string[][] = [];
+      for (const cand of sorted) {
+        const candPath = cand.map(s => s.toLowerCase()).join("/");
+        const isDescendant = kept.some(anc => {
+          const ancPath = anc.map(s => s.toLowerCase()).join("/");
+          return candPath === ancPath || candPath.startsWith(ancPath + "/");
+        });
+        if (!isDescendant) kept.push(cand);
+      }
+      if (kept.length < anchorRoots.length) {
+        log(`  ${langLabels[l]}: coalesced ${anchorRoots.length} raw anchors → ${kept.length} top-level anchor(s)`);
+      }
+      crawlScopes = kept;
     } else {
       let commonScope = langCrawlScope(tabPatterns, l);
       if (commonScope.length === 0 && root.length > 0) commonScope = root;
@@ -597,6 +611,33 @@ async function matchTab(
     const titles = inventories[l]?.titleIndex.size ?? 0;
     log(`  ${langLabels[l]} inventory total: ${total} URLs (${titles} titled) across ${perLangInvs[l].length} anchor crawl(s)`);
   }
+
+  const SEED_VERIFY_CEILING = 3000;
+  const verifyPromises: Promise<void>[] = [];
+  for (const l of langs) {
+    const inv = inventories[l];
+    if (!inv) continue;
+    const refSeeds: string[] = [];
+    const seenSeed = new Set<string>();
+    for (const ref of tabRefRows) {
+      const url = ref[refUrlKey[l]];
+      if (!url || seenSeed.has(url)) continue;
+      seenSeed.add(url);
+      try {
+        const p = new URL(url);
+        if (p.origin !== origin) continue;
+      } catch { continue; }
+      refSeeds.push(url);
+    }
+    if (refSeeds.length === 0) continue;
+    verifyPromises.push(
+      verifySeedUrls(inv, refSeeds, control.signal, SEED_VERIFY_CEILING).then(stats => {
+        const before = inv.urls.size - stats.added;
+        log(`  ${langLabels[l]} seed verification: checked=${stats.checked}, added=${stats.added}, skipped_known=${stats.skippedKnown}, failed=${stats.failed}${stats.capped ? `, capped_off=${stats.capped}` : ""} (inventory ${before} → ${inv.urls.size})`);
+      })
+    );
+  }
+  if (verifyPromises.length > 0) await Promise.all(verifyPromises);
 
   for (const ref of tabRefRows) {
     for (const l of langs) {
