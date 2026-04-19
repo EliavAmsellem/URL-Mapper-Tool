@@ -172,8 +172,8 @@ async function getCheck(url: string, signal?: AbortSignal): Promise<boolean> {
       method: "GET",
       signal: combined,
       headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; LinguaMap/1.0; URL Mapper Bot)",
-        "Accept": "text/html,application/xhtml+xml",
+        ...BROWSER_HEADERS,
+        "Referer": new URL(url).origin + "/",
         "Range": "bytes=0-2047",
       },
       redirect: "follow",
@@ -198,7 +198,8 @@ async function headCheck(url: string, signal?: AbortSignal): Promise<boolean> {
       method: "HEAD",
       signal: combined,
       headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; LinguaMap/1.0; URL Mapper Bot)",
+        ...BROWSER_HEADERS,
+        "Referer": new URL(url).origin + "/",
       },
       redirect: "follow",
     });
