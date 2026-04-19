@@ -800,9 +800,11 @@ async function matchTab(
         const tUrl = getResultUrl(titleResult, l);
         if (tUrl && !getResultUrl(result, l) && !usedUrls[l].has(tUrl)) {
           const method = getResultMethod(titleResult, l) || "";
-          const taggedMethod = method === "title-match"
-            ? "inventory-title"
-            : (method ? `inventory-${method}` : "inventory-title");
+          let taggedMethod: string;
+          if (method === "title-match" || method === "") taggedMethod = "inventory-title";
+          else if (method === "title-section-match") taggedMethod = "inventory-title+section";
+          else if (method === "title-disambig") taggedMethod = "inventory-title+disambig";
+          else taggedMethod = `inventory-${method}`;
           setResultMatch(result, l, tUrl, getResultConf(titleResult, l) || 0, taggedMethod);
           usedUrls[l].add(tUrl);
           titleAcceptedTotal++;
@@ -811,7 +813,7 @@ async function matchTab(
       }
     }
     const titleSummary = Object.entries(titleMethodCounts).sort((a, b) => b[1] - a[1]).map(([m, c]) => `${m}:${c}`).join(", ");
-    log(`  Inventory title-match: ${titleAcceptedTotal} accepted (${titleSummary || "none"}) — HEAD will skip these rows`);
+    log(`  Inventory title-match: ${titleAcceptedTotal} accepted (${titleSummary || "none"})`);
   }
 
   // ---- HEAD FALLBACK (last-ditch only for rows inventory + title couldn't satisfy) ----
@@ -820,10 +822,9 @@ async function matchTab(
     const result = matchResults.get(u.index);
     return !result || !getResultUrl(result, u.lang);
   });
-  const skippedAfterTitle = unmatchedForHead.length - remainingForHead.length;
-  if (skippedAfterTitle > 0) {
-    log(`  HEAD queue trimmed by ${skippedAfterTitle} URLs (title-match satisfied those rows)`);
-  }
+  const forwardedToHead = remainingForHead.length;
+  const skippedAfterTitle = unmatchedForHead.length - forwardedToHead;
+  log(`  Inventory title-match summary: ${titleAcceptedTotal} accepted (≥threshold), ${forwardedToHead} borderline forwarded to HEAD${skippedAfterTitle > 0 ? ` (${skippedAfterTitle} HEAD candidates dropped because title-match already filled their slot)` : ""}`);
 
   const asciiOnly = remainingForHead.filter(u => {
     try {
