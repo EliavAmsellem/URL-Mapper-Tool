@@ -101,7 +101,16 @@ const upload = multer({
   },
 });
 
-const activeJobs = new Map<string, { cancel: boolean }>();
+interface JobControl {
+  cancel: boolean;
+  abortController: AbortController;
+  signal: AbortSignal;
+}
+const activeJobs = new Map<string, JobControl>();
+function newJobControl(): JobControl {
+  const ac = new AbortController();
+  return { cancel: false, abortController: ac, signal: ac.signal };
+}
 
 export async function registerRoutes(
   httpServer: Server,
@@ -162,12 +171,13 @@ export async function registerRoutes(
         if (existingJobId !== jobId) {
           log(`Cancelling previous job ${existingJobId} before starting new job ${jobId}`);
           existingControl.cancel = true;
+          existingControl.abortController.abort();
           await storage.updateJob(existingJobId, { status: "cancelled", currentStep: "done" });
           activeJobs.delete(existingJobId);
         }
       }
 
-      const control = { cancel: false };
+      const control = newJobControl();
       activeJobs.set(jobId, control);
 
       await storage.updateJob(jobId, { status: "processing", currentStep: "learning" });
@@ -192,10 +202,11 @@ export async function registerRoutes(
       const control = activeJobs.get(jobId);
       if (control) {
         control.cancel = true;
+        control.abortController.abort();
         activeJobs.delete(jobId);
       }
       await storage.updateJob(jobId, { status: "cancelled", currentStep: "done" });
-      log(`Job ${jobId} stopped by user`);
+      log(`Job ${jobId} stopped by user (abort signaled)`);
       res.json({ message: "Job stopped" });
     } catch (error: any) {
       res.status(500).json({ message: error.message });
@@ -397,7 +408,8 @@ function parseSheet(
 async function matchTab(
   tabData: TabData,
   crawlCache: Map<string, CrawlInventory>,
-  control: { cancel: boolean },
+  control: JobControl,
+  targetLangs: TargetLang[],
 ): Promise<{
   matchResults: Map<number, BatchMatchResult>;
   inventories: Record<TargetLang, CrawlInventory | null>;
@@ -405,7 +417,8 @@ async function matchTab(
   usedUrls: Record<TargetLang, Set<string>>;
 }> {
   const { sheetName, allRows, tabRefRows } = tabData;
-  const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
+  const allLangsLocal: TargetLang[] = ["en", "fr", "ru", "ar"];
+  const langs: TargetLang[] = allLangsLocal.filter(l => targetLangs.includes(l));
   const langLabels: Record<TargetLang, string> = { en: "EN", fr: "FR", ru: "RU", ar: "AR" };
   const refUrlKey: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = { en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl" };
 
@@ -489,7 +502,7 @@ async function matchTab(
         crawlPromises.push(
           crawlDirectory(origin, scope, (c, q) => {
             if (c % 100 === 0) log(`    ${langLabels[l]} crawl progress: ${c} pages fetched, ${q} queued`);
-          }, uniqueSeeds).then(inv => { inventories[l] = inv; crawlCache.set(cacheKey, inv); log(`  ${langLabels[l]} crawl complete: ${inv.urls.size} URLs discovered`); })
+          }, uniqueSeeds, control.signal).then(inv => { inventories[l] = inv; crawlCache.set(cacheKey, inv); log(`  ${langLabels[l]} crawl complete: ${inv.urls.size} URLs discovered`); })
         );
       }
     }
@@ -601,7 +614,7 @@ async function matchTab(
       log(`    [HEAD sample] ${asciiOnly[s].sourceUrl} → ${asciiOnly[s].constructedUrl}`);
     }
     const headUrls = asciiOnly.map((u) => u.constructedUrl);
-    const existence = await batchHeadCheck(headUrls);
+    const existence = await batchHeadCheck(headUrls, control.signal);
     const headVerified = Array.from(existence.values()).filter(v => v).length;
     const headFailed = Array.from(existence.values()).filter(v => !v).length;
     log(`  HEAD results: ${headVerified} verified, ${headFailed} failed out of ${existence.size} checked`);
@@ -710,7 +723,7 @@ async function matchTab(
 
     const titleMatches = await titleMatchUnmatched(
       unmatchedForTitle, inventories, storage,
-      allowedRoots, refDepths, knownUrlSets,
+      allowedRoots, refDepths, knownUrlSets, control.signal,
     );
 
     for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
@@ -786,7 +799,7 @@ async function matchTab(
   return { matchResults, inventories, tabPatterns, usedUrls };
 }
 
-async function processJob(jobId: string, _threshold: number, control: { cancel: boolean }) {
+async function processJob(jobId: string, _threshold: number, control: JobControl) {
   const filePath = findJobFile(jobId);
   if (!filePath) {
     throw new Error("Source file not found");
@@ -799,6 +812,9 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
   if (!job) throw new Error("Job not found");
 
   const targetLangs = (job.targetLanguages || ["en", "fr", "ru", "ar"]) as string[];
+  const targetLangSet = new Set<TargetLang>(targetLangs.filter((l): l is TargetLang => l === "en" || l === "fr" || l === "ru" || l === "ar"));
+  const activeLangs: TargetLang[] = (["en", "fr", "ru", "ar"] as TargetLang[]).filter(l => targetLangSet.has(l));
+  log(`Job ${jobId} active target languages: ${activeLangs.map(l => l.toUpperCase()).join(", ") || "(none)"}`);
   let processedCount = 0;
   let matchedCount = 0;
   const startTime = Date.now();
@@ -892,7 +908,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       const stepLabel = pass > 1 ? `pass${pass}:${tabData.sheetName}` : `matching:${tabData.sheetName}`;
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
-      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control);
+      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control, activeLangs);
       tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
 
       if (!globalMatchResults.has(tabData.sheetName)) {
@@ -991,12 +1007,15 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
       const matchedExamples = tabData.tabRefRows.slice(0, 10);
 
       const allTranslations: Record<TargetLang, Map<string, string>> = { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() };
-      for (const l of allLangs) {
+      for (const l of activeLangs) {
+        if (control.cancel) break;
         const titles = unmatchedForAi.filter(r => r.needs[l]).map(r => r.title).filter(Boolean);
         if (titles.length > 0) {
-          allTranslations[l] = await batchTranslate(titles, l, storage);
+          allTranslations[l] = await batchTranslate(titles, l, storage, control.signal);
         }
       }
+
+      if (control.cancel) continue;
 
       const aiMatches = await aiMatchUnmatched(
         unmatchedForAi,
@@ -1005,6 +1024,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
         matchedExamples,
         allTranslations,
         knownUrlSets,
+        control.signal,
       );
 
       if (aiMatches.size > 0) {
@@ -1017,7 +1037,7 @@ async function processJob(jobId: string, _threshold: number, control: { cancel: 
         }
 
         log(`  HEAD-verifying ${aiUrls.length} AI-suggested URLs...`);
-        const existence = await batchHeadCheck(aiUrls);
+        const existence = await batchHeadCheck(aiUrls, control.signal);
 
         const rowSourceMap = new Map<number, string>();
         for (const r of unmatchedForAi) {

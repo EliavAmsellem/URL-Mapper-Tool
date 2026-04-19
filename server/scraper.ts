@@ -29,6 +29,72 @@ export interface TabPatterns {
   segmentMap: Map<string, Map<string, string>>;
   rootMappings: Map<string, Array<{ sourceRoot: string[]; targetRoot: string[] }>>;
   patternValidated: { en: boolean; fr: boolean; ru: boolean; ar: boolean };
+  langSuffixRule: Record<TargetLang, { prefix: string[]; suffix: string; depth: number } | null>;
+}
+
+export function langSuffixRuleFor(tp: TabPatterns, lang: TargetLang): { prefix: string[]; suffix: string; depth: number } | null {
+  return tp.langSuffixRule?.[lang] ?? null;
+}
+
+function decodeLowerSegment(seg: string): string {
+  try { return decodeURIComponent(seg).toLowerCase().trim(); }
+  catch { return seg.toLowerCase().trim(); }
+}
+
+function detectLangSuffixRule(
+  pairs: { src: string[]; tgt: string[] }[]
+): { prefix: string[]; suffix: string; depth: number } | null {
+  if (pairs.length < 1) return null;
+  const candidates: { prefix: string[]; suffix: string; depth: number }[] = [];
+  for (const { src, tgt } of pairs) {
+    if (src.length === 0 || tgt.length <= src.length) continue;
+    const extra = tgt.length - src.length;
+    if (extra < 1 || extra > 2) continue;
+    const prefix = tgt.slice(0, extra);
+    const aligned = tgt.slice(extra);
+    if (aligned.length !== src.length) continue;
+    let suffixSeg: string | null = null;
+    let depth = -1;
+    let ok = true;
+    for (let i = 0; i < src.length; i++) {
+      const sRaw = decodeLowerSegment(src[i]);
+      const tRaw = decodeLowerSegment(aligned[i]);
+      if (sRaw === tRaw) continue;
+      if (tRaw.startsWith(sRaw) && tRaw.length > sRaw.length) {
+        const sfx = tRaw.slice(sRaw.length);
+        if (!sfx.startsWith("_") && !sfx.startsWith("-")) { ok = false; break; }
+        if (sfx.length > 8) { ok = false; break; }
+        if (suffixSeg !== null && (suffixSeg !== sfx || depth !== i)) { ok = false; break; }
+        suffixSeg = sfx;
+        depth = i;
+      } else {
+        ok = false;
+        break;
+      }
+    }
+    if (ok && suffixSeg && depth >= 0) {
+      candidates.push({ prefix, suffix: suffixSeg, depth });
+    }
+  }
+  if (candidates.length === 0) return null;
+  const key = (c: { prefix: string[]; suffix: string; depth: number }) =>
+    c.prefix.map(p => decodeLowerSegment(p)).join("/") + "|" + c.suffix + "|" + c.depth;
+  const counts = new Map<string, { rule: typeof candidates[0]; count: number }>();
+  for (const c of candidates) {
+    const k = key(c);
+    if (!counts.has(k)) counts.set(k, { rule: c, count: 0 });
+    counts.get(k)!.count++;
+  }
+  const sorted = Array.from(counts.values()).sort((a, b) => b.count - a.count);
+  if (sorted.length === 0) return null;
+  const top = sorted[0];
+  const second = sorted[1];
+  if (pairs.length < 2) return null;
+  if (pairs.length === 2 && top.count < 2) return null;
+  if (pairs.length >= 3 && top.count < 2) return null;
+  if (second && second.count >= top.count) return null;
+  if (top.count / candidates.length < 0.6) return null;
+  return top.rule;
 }
 
 export function langRoot(tp: TabPatterns, lang: TargetLang): string[] {
@@ -56,30 +122,67 @@ export function clearAllCaches() {
   translationCache.clear();
 }
 
-async function headCheck(url: string): Promise<boolean> {
+function abortAwareSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    let onAbort: (() => void) | null = null;
+    if (signal) {
+      onAbort = () => { clearTimeout(timer); resolve(); };
+      signal.addEventListener("abort", onAbort);
+    }
+  });
+}
+
+function combineSignals(parent: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let onAbort: (() => void) | null = null;
+  if (parent) {
+    if (parent.aborted) controller.abort();
+    else {
+      onAbort = () => controller.abort();
+      parent.addEventListener("abort", onAbort);
+    }
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timeout);
+      if (parent && onAbort) parent.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+async function headCheck(url: string, signal?: AbortSignal): Promise<boolean> {
   if (urlExistenceCache.has(url)) return urlExistenceCache.get(url)!;
+  if (signal?.aborted) return false;
+  const { signal: combined, cleanup } = combineSignals(signal, HEAD_TIMEOUT);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), HEAD_TIMEOUT);
     const response = await fetch(url, {
       method: "HEAD",
-      signal: controller.signal,
+      signal: combined,
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; LinguaMap/1.0; URL Mapper Bot)",
       },
       redirect: "follow",
     });
-    clearTimeout(timeout);
+    cleanup();
     const exists = response.ok;
     urlExistenceCache.set(url, exists);
     return exists;
   } catch {
+    cleanup();
+    if (signal?.aborted) return false;
     urlExistenceCache.set(url, false);
     return false;
   }
 }
 
-export async function batchHeadCheck(urls: string[]): Promise<Map<string, boolean>> {
+export async function batchHeadCheck(urls: string[], signal?: AbortSignal): Promise<Map<string, boolean>> {
   const results = new Map<string, boolean>();
   const uncached: string[] = [];
   for (const url of urls) {
@@ -90,9 +193,10 @@ export async function batchHeadCheck(urls: string[]): Promise<Map<string, boolea
     }
   }
   for (let i = 0; i < uncached.length; i += HEAD_CONCURRENCY) {
+    if (signal?.aborted) break;
     const batch = uncached.slice(i, i + HEAD_CONCURRENCY);
     const checks = await Promise.all(
-      batch.map(async (url) => ({ url, exists: await headCheck(url) }))
+      batch.map(async (url) => ({ url, exists: await headCheck(url, signal) }))
     );
     for (const { url, exists } of checks) {
       results.set(url, exists);
@@ -155,6 +259,15 @@ export function learnTabPatterns(
     rootMappings.set(l, mappings[l] ? mappings[l]!.perPair : []);
   }
 
+  const langSuffixRule: Record<TargetLang, { prefix: string[]; suffix: string; depth: number } | null> = { en: null, fr: null, ru: null, ar: null };
+  for (const l of langs) {
+    langSuffixRule[l] = detectLangSuffixRule(pairsByLang[l]);
+    if (langSuffixRule[l]) {
+      const r = langSuffixRule[l]!;
+      log(`  ${l.toUpperCase()} suffix rule detected: prefix=/${r.prefix.join("/")}/, suffix=${r.suffix}, depth=${r.depth}`);
+    }
+  }
+
   function computeCrawlScope(lang: string): string[] {
     const pairs = pairsByLang[lang];
     const r = root(lang);
@@ -189,6 +302,7 @@ export function learnTabPatterns(
     segmentMap,
     rootMappings,
     patternValidated: { en: false, fr: false, ru: false, ar: false },
+    langSuffixRule,
   };
 }
 
@@ -469,6 +583,25 @@ export function constructAllTargetUrls(
     } else {
       buildUrl(commonTargetRoot, cleanParts);
     }
+
+    const suffixRule = langSuffixRuleFor(tabPatterns, lang);
+    if (suffixRule && cleanParts.length > suffixRule.depth) {
+      const transformed = cleanParts.map((p, i) => {
+        if (i === suffixRule.depth) return p + suffixRule.suffix;
+        return p;
+      });
+      const candidate = parsed.origin + "/" + [...suffixRule.prefix, ...transformed].join("/");
+      candidates.add(candidate);
+      if (segments) {
+        const translated = transformed.map((part, i) => {
+          if (i === suffixRule.depth) return part;
+          const norm = normalizeSegment(part);
+          return segments.has(norm) ? segments.get(norm)! : part;
+        });
+        const tCandidate = parsed.origin + "/" + [...suffixRule.prefix, ...translated].join("/");
+        if (tCandidate !== candidate) candidates.add(tCandidate);
+      }
+    }
   } catch {}
   return Array.from(candidates);
 }
@@ -620,38 +753,43 @@ const BROWSER_HEADERS = {
   "Pragma": "no-cache",
 };
 
-async function fetchPage(url: string): Promise<string | null> {
+async function fetchPage(url: string, signal?: AbortSignal): Promise<string | null> {
+  if (signal?.aborted) return null;
+  const { signal: combined, cleanup } = combineSignals(signal, CRAWL_TIMEOUT);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), CRAWL_TIMEOUT);
     const response = await fetch(url, {
       method: "GET",
-      signal: controller.signal,
+      signal: combined,
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; LinguaMap/1.0; URL Mapper Bot)",
         "Accept": "text/html",
       },
       redirect: "follow",
     });
-    clearTimeout(timeout);
+    cleanup();
 
     if (response.status === 401) {
-      const controller2 = new AbortController();
-      const timeout2 = setTimeout(() => controller2.abort(), CRAWL_TIMEOUT);
-      const retryResponse = await fetch(url, {
-        method: "GET",
-        signal: controller2.signal,
-        headers: {
-          ...BROWSER_HEADERS,
-          "Referer": new URL(url).origin + "/",
-        },
-        redirect: "follow",
-      });
-      clearTimeout(timeout2);
-      if (!retryResponse.ok) return null;
-      const ct = retryResponse.headers.get("content-type") || "";
-      if (!ct.includes("text/html")) return null;
-      return await retryResponse.text();
+      if (signal?.aborted) return null;
+      const { signal: combined2, cleanup: cleanup2 } = combineSignals(signal, CRAWL_TIMEOUT);
+      try {
+        const retryResponse = await fetch(url, {
+          method: "GET",
+          signal: combined2,
+          headers: {
+            ...BROWSER_HEADERS,
+            "Referer": new URL(url).origin + "/",
+          },
+          redirect: "follow",
+        });
+        cleanup2();
+        if (!retryResponse.ok) return null;
+        const ct = retryResponse.headers.get("content-type") || "";
+        if (!ct.includes("text/html")) return null;
+        return await retryResponse.text();
+      } catch {
+        cleanup2();
+        return null;
+      }
     }
 
     if (!response.ok) return null;
@@ -659,6 +797,7 @@ async function fetchPage(url: string): Promise<string | null> {
     if (!contentType.includes("text/html")) return null;
     return await response.text();
   } catch {
+    cleanup();
     return null;
   }
 }
@@ -692,7 +831,8 @@ export async function crawlDirectory(
   origin: string,
   rootPath: string[],
   onProgress?: (crawled: number, queued: number) => void,
-  seedUrls?: string[]
+  seedUrls?: string[],
+  signal?: AbortSignal
 ): Promise<CrawlInventory> {
   const inventory: CrawlInventory = {
     urls: new Set(),
@@ -729,6 +869,7 @@ export async function crawlDirectory(
   let crawled = 0;
 
   while (queue.length > 0 && crawled < CRAWL_MAX_PAGES) {
+    if (signal?.aborted) break;
     const batch = queue.splice(0, CRAWL_CONCURRENCY);
     const toFetch = batch.filter((url) => !visited.has(url));
     for (const url of toFetch) visited.add(url);
@@ -737,7 +878,7 @@ export async function crawlDirectory(
 
     const results = await Promise.all(
       toFetch.map(async (url) => {
-        const html = await fetchPage(url);
+        const html = await fetchPage(url, signal);
         return { url, html };
       })
     );
@@ -1404,41 +1545,45 @@ function titleSimilarity(a: string, b: string): number {
 }
 
 
-async function translateWithGTX(text: string, source: string, target: string): Promise<string | null> {
+async function translateWithGTX(text: string, source: string, target: string, signal?: AbortSignal): Promise<string | null> {
+  if (signal?.aborted) return null;
+  const { signal: combined, cleanup } = combineSignals(signal, 8000);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
     const encoded = encodeURIComponent(text);
     const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${source}&tl=${target}&dt=t&q=${encoded}`;
     const resp = await fetch(url, {
-      signal: controller.signal,
+      signal: combined,
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
       },
     });
-    clearTimeout(timeout);
+    cleanup();
     if (!resp.ok) return null;
     const data = await resp.json() as any;
     if (Array.isArray(data) && Array.isArray(data[0])) {
       const translated = data[0].map((s: any) => s[0]).join("");
       return translated || null;
     }
-  } catch {}
+  } catch {
+    cleanup();
+  }
   return null;
 }
 
-async function translateText(text: string, targetLang: TargetLang): Promise<string | null> {
+async function translateText(text: string, targetLang: TargetLang, signal?: AbortSignal): Promise<string | null> {
   const cacheKey = `${text}|${targetLang}`;
   if (translationCache.has(cacheKey)) return translationCache.get(cacheKey)!;
 
-  const result = await translateWithGTX(text, "he", targetLang);
+  const result = await translateWithGTX(text, "he", targetLang, signal);
   if (result) {
     translationCache.set(cacheKey, result);
     return result;
   }
+  if (signal?.aborted) return null;
 
-  await new Promise((r) => setTimeout(r, 500));
-  const retry = await translateWithGTX(text, "he", targetLang);
+  await abortAwareSleep(500, signal);
+  if (signal?.aborted) return null;
+  const retry = await translateWithGTX(text, "he", targetLang, signal);
   if (retry) {
     translationCache.set(cacheKey, retry);
     return retry;
@@ -1452,7 +1597,8 @@ const TRANSLATE_CONCURRENCY = 5;
 export async function batchTranslate(
   texts: string[],
   targetLang: TargetLang,
-  dbStorage?: IStorage
+  dbStorage?: IStorage,
+  signal?: AbortSignal
 ): Promise<Map<string, string>> {
   const results = new Map<string, string>();
   const uniqueSet = new Set(texts);
@@ -1493,6 +1639,7 @@ export async function batchTranslate(
   const newTranslations: { sourceText: string; targetLang: string; translatedText: string }[] = [];
 
   for (let i = 0; i < needsTranslation.length; i += TRANSLATE_CONCURRENCY) {
+    if (signal?.aborted) break;
     if (consecutiveFailures >= 8) {
       log(`    [translate] Too many consecutive failures, stopping. Translated ${results.size}/${unique.length}.`);
       break;
@@ -1500,7 +1647,7 @@ export async function batchTranslate(
 
     const batch = needsTranslation.slice(i, i + TRANSLATE_CONCURRENCY);
     const batchResults = await Promise.all(
-      batch.map((text) => translateText(text, targetLang).then((r) => ({ text, result: r })))
+      batch.map((text) => translateText(text, targetLang, signal).then((r) => ({ text, result: r })))
     );
 
     for (const { text, result } of batchResults) {
@@ -1519,7 +1666,7 @@ export async function batchTranslate(
       log(`    [translate] Progress: ${results.size} translated, ${totalProcessed}/${needsTranslation.length} processed`);
     }
 
-    await new Promise((r) => setTimeout(r, 200));
+    await abortAwareSleep(200, signal);
   }
 
   if (dbStorage && newTranslations.length > 0) {
@@ -1689,6 +1836,7 @@ export async function titleMatchUnmatched(
   allowedRoots?: Record<TargetLang, string[]>,
   refDepths?: Record<TargetLang, number[] | undefined>,
   knownUrls?: Record<TargetLang, Set<string>>,
+  signal?: AbortSignal,
 ): Promise<Map<number, BatchMatchResult>> {
   const results = new Map<number, BatchMatchResult>();
   const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
@@ -1708,8 +1856,9 @@ export async function titleMatchUnmatched(
       .filter(r => r.needs[lang] && inv && inv.titleIndex.size > 0 && roots && roots.length > 0)
       .map(r => r.title).filter(Boolean);
     if (titlesNeeded.length > 0) {
+      if (signal?.aborted) break;
       log(`  Translating ${titlesNeeded.length} titles to ${langNames[lang]} for title matching...`);
-      translations[lang] = await batchTranslate(titlesNeeded, lang, dbStorage);
+      translations[lang] = await batchTranslate(titlesNeeded, lang, dbStorage, signal);
       log(`  Translated ${translations[lang].size} titles to ${langNames[lang]}`);
     }
   }
@@ -1804,8 +1953,9 @@ export async function titleMatchUnmatched(
       }
     } else if (matchedLangs.length === 1) {
       const l = matchedLangs[0];
-      if (m[l]!.similarity < 0.65) {
-        log(`    Single-lang ${l.toUpperCase()} REJECTED (similarity ${m[l]!.similarity.toFixed(3)} < 0.65): "${m[l]!.url}"`);
+      const minSim = (l === "ru" || l === "ar") ? 0.55 : 0.65;
+      if (m[l]!.similarity < minSim) {
+        log(`    Single-lang ${l.toUpperCase()} REJECTED (similarity ${m[l]!.similarity.toFixed(3)} < ${minSim}): "${m[l]!.url}"`);
         m[l] = null;
         rejected.crossValidation++;
       }
@@ -1866,6 +2016,7 @@ export async function aiMatchUnmatched(
   matchedExamples: { sourceUrl: string; enUrl?: string; frUrl?: string; ruUrl?: string; arUrl?: string }[],
   allTranslations: Record<TargetLang, Map<string, string>>,
   knownUrls: Record<TargetLang, Set<string>>,
+  signal?: AbortSignal,
 ): Promise<Map<number, BatchMatchResult>> {
   const results = new Map<number, BatchMatchResult>();
   const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
@@ -1925,6 +2076,10 @@ export async function aiMatchUnmatched(
   const langNeedLabel: Record<TargetLang, string> = { en: "English URL", fr: "French URL", ru: "Russian URL", ar: "Arabic URL" };
 
   for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
+    if (signal?.aborted) {
+      log(`  AI matching ABORTED by user before batch ${batchIdx + 1}/${batches.length}`);
+      break;
+    }
     const batch = batches[batchIdx];
 
     const urlsBlock = batch.map(row => {
@@ -1989,6 +2144,7 @@ Return ONLY the JSON array, no other text.`;
       let content: string | null = null;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
+          if (signal?.aborted) { content = null; break; }
           const response = await openai.chat.completions.create({
             model: process.env.OPENAI_API_KEY ? "gpt-4o-mini" : "gpt-5-mini",
             messages: [
@@ -1997,7 +2153,7 @@ Return ONLY the JSON array, no other text.`;
             ],
             response_format: { type: "json_object" },
             max_completion_tokens: 8192,
-          });
+          }, { signal });
           content = response.choices[0]?.message?.content || null;
           consecutiveAuthFailures = 0;
           break;
@@ -2006,7 +2162,8 @@ Return ONLY the JSON array, no other text.`;
           if (status === 401 || status === 429) {
             const delay = (attempt + 1) * 2000;
             log(`    AI batch ${batchIdx + 1}/${batches.length}: ${status} error, retrying in ${delay}ms (attempt ${attempt + 1}/3)`);
-            await new Promise(r => setTimeout(r, delay));
+            await abortAwareSleep(delay, signal);
+            if (signal?.aborted) { content = null; break; }
             continue;
           }
           throw retryErr;
@@ -2074,7 +2231,7 @@ Return ONLY the JSON array, no other text.`;
     }
 
     if (batchIdx < batches.length - 1) {
-      await new Promise(r => setTimeout(r, 500));
+      await abortAwareSleep(500, signal);
     }
   }
 
