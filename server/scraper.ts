@@ -64,6 +64,8 @@ function detectLangSuffixRule(
       const tRaw = decodeLowerSegment(aligned[i]);
       const m = tRaw.match(SUFFIX_RE);
       if (!m) continue;
+      const sRaw = decodeLowerSegment(src[i]);
+      if (sRaw.endsWith(m[2])) continue;
       observations.push({ prefix, suffix: m[2], depth: i });
     }
     if (observations.length === 0) { perPairBest.push(null); continue; }
@@ -510,7 +512,7 @@ export function constructTargetUrl(
 
     const suffixRule = langSuffixRuleFor(tabPatterns, lang);
     const usedPerPair = !!(bestMapping && bestMatchLen > commonSourceRoot.length);
-    if (suffixRule && !usedPerPair && commonSourceRoot.length === 0 && cleanParts.length > suffixRule.depth) {
+    if (suffixRule && !usedPerPair && cleanParts.length > suffixRule.depth) {
       const transformed = cleanParts.map((p, i) => i === suffixRule.depth ? p + suffixRule.suffix : p);
       untranslated = parsed.origin + "/" + [...suffixRule.prefix, ...transformed].join("/");
       const tParts = transformed.map((part, i) => {
