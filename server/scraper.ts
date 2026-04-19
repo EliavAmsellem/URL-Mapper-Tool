@@ -106,18 +106,62 @@ export function langCrawlScope(tp: TabPatterns, lang: TargetLang): string[] {
   return { en: tp.enCrawlScope, fr: tp.frCrawlScope, ru: tp.ruCrawlScope, ar: tp.arCrawlScope }[lang];
 }
 
-const urlExistenceCache = new Map<string, boolean>();
+export interface VerifyResult {
+  ok: boolean;
+  finalUrl: string;
+}
+
+const urlExistenceCache = new Map<string, VerifyResult>();
 const translationCache = new Map<string, string>();
 const HEAD_CONCURRENCY = 10;
 const HEAD_TIMEOUT = 12000;
 const HEAD_BATCH_DELAY = 200;
 let lastHeadGetRescues = 0;
 let lastHeadGetAttempts = 0;
+let lastRedirectAttempts = 0;
+let lastRedirectRescues = 0;
 export function consumeHeadGetRescueStats(): { attempts: number; rescues: number } {
   const v = { attempts: lastHeadGetAttempts, rescues: lastHeadGetRescues };
   lastHeadGetAttempts = 0;
   lastHeadGetRescues = 0;
   return v;
+}
+export function consumeRedirectRescueStats(): { attempts: number; rescues: number } {
+  const v = { attempts: lastRedirectAttempts, rescues: lastRedirectRescues };
+  lastRedirectAttempts = 0;
+  lastRedirectRescues = 0;
+  return v;
+}
+
+function isSafeFinalUrl(originalUrl: string, finalUrl: string): boolean {
+  try {
+    const a = new URL(originalUrl);
+    const b = new URL(finalUrl);
+    if (a.origin !== b.origin) return false;
+    if (!b.pathname || b.pathname === "/" || b.pathname === "") return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pagesDefaultVariant(url: string): string | null {
+  try {
+    const u = new URL(url);
+    const p = u.pathname;
+    if (p.toLowerCase().endsWith("/pages/default.aspx")) return null;
+    if (p.toLowerCase().endsWith(".aspx")) return null;
+    if (p.endsWith("/")) {
+      return u.origin + p + "Pages/default.aspx" + u.search;
+    }
+    const last = p.split("/").pop() || "";
+    if (!last.includes(".")) {
+      return u.origin + p + "/Pages/default.aspx" + u.search;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 export function clearCaches() {
@@ -181,12 +225,12 @@ function buildVerificationHeaders(parsed: URL, extra?: Record<string, string>): 
   return headers;
 }
 
-async function getCheck(url: string, signal?: AbortSignal): Promise<boolean> {
-  if (signal?.aborted) return false;
+async function getCheck(url: string, signal?: AbortSignal): Promise<VerifyResult> {
+  if (signal?.aborted) return { ok: false, finalUrl: url };
   const parsed = parseHttpUrl(url);
   if (!parsed) {
     console.warn(`[scraper] skipped: invalid URL (${url})`);
-    return false;
+    return { ok: false, finalUrl: url };
   }
   const { signal: combined, cleanup } = combineSignals(signal, HEAD_TIMEOUT);
   try {
@@ -198,24 +242,22 @@ async function getCheck(url: string, signal?: AbortSignal): Promise<boolean> {
     });
     try { (response.body as any)?.cancel?.(); } catch {}
     cleanup();
-    return response.ok || response.status === 206;
+    return { ok: response.ok || response.status === 206, finalUrl: response.url || url };
   } catch {
     cleanup();
-    return false;
+    return { ok: false, finalUrl: url };
   }
 }
 
-async function headCheck(url: string, signal?: AbortSignal): Promise<boolean> {
-  if (urlExistenceCache.has(url)) return urlExistenceCache.get(url)!;
-  if (signal?.aborted) return false;
+async function probeOnce(url: string, signal?: AbortSignal): Promise<VerifyResult> {
+  if (signal?.aborted) return { ok: false, finalUrl: url };
   const parsed = parseHttpUrl(url);
   if (!parsed) {
     console.warn(`[scraper] skipped: invalid URL (${url})`);
-    urlExistenceCache.set(url, false);
-    return false;
+    return { ok: false, finalUrl: url };
   }
   const { signal: combined, cleanup } = combineSignals(signal, HEAD_TIMEOUT);
-  let headOk = false;
+  let headResult: VerifyResult | null = null;
   let headFailed = false;
   try {
     const response = await fetch(url, {
@@ -225,53 +267,93 @@ async function headCheck(url: string, signal?: AbortSignal): Promise<boolean> {
       redirect: "follow",
     });
     cleanup();
-    headOk = response.ok;
+    headResult = { ok: response.ok, finalUrl: response.url || url };
     if (!response.ok) headFailed = true;
   } catch {
     cleanup();
-    if (signal?.aborted) return false;
+    if (signal?.aborted) return { ok: false, finalUrl: url };
     headFailed = true;
   }
 
-  if (headOk) {
-    urlExistenceCache.set(url, true);
-    return true;
-  }
+  if (headResult && headResult.ok) return headResult;
 
   if (headFailed) {
     lastHeadGetAttempts++;
-    const getOk = await getCheck(url, signal);
-    if (getOk) {
+    const getResult = await getCheck(url, signal);
+    if (getResult.ok) {
       lastHeadGetRescues++;
-      urlExistenceCache.set(url, true);
-      return true;
+      return getResult;
+    }
+    if (headResult) return headResult;
+    return getResult;
+  }
+
+  return headResult ?? { ok: false, finalUrl: url };
+}
+
+async function headCheck(url: string, signal?: AbortSignal): Promise<VerifyResult> {
+  const cached = urlExistenceCache.get(url);
+  if (cached) return cached;
+  if (signal?.aborted) return { ok: false, finalUrl: url };
+
+  let result = await probeOnce(url, signal);
+
+  const redirected = result.finalUrl !== url;
+  if (redirected) lastRedirectAttempts++;
+
+  // If a redirect chain ended at a non-OK directory-style URL, try the
+  // /Pages/default.aspx variant of that final URL (mirrors the standard
+  // page-shape retry treatment we apply to original candidates).
+  if (!result.ok && redirected && isSafeFinalUrl(url, result.finalUrl)) {
+    const variant = pagesDefaultVariant(result.finalUrl);
+    if (variant) {
+      const variantResult = await probeOnce(variant, signal);
+      if (variantResult.ok && isSafeFinalUrl(url, variantResult.finalUrl)) {
+        result = variantResult;
+      }
     }
   }
 
-  urlExistenceCache.set(url, false);
-  return false;
+  if (result.ok) {
+    if (result.finalUrl !== url) {
+      if (isSafeFinalUrl(url, result.finalUrl)) {
+        lastRedirectRescues++;
+      } else {
+        // Refuse to record an off-origin or root redirect target.
+        result = { ok: result.ok, finalUrl: url };
+      }
+    }
+  } else {
+    result = { ok: false, finalUrl: url };
+  }
+
+  urlExistenceCache.set(url, result);
+  return result;
 }
 
-export async function batchHeadCheck(urls: string[], signal?: AbortSignal): Promise<Map<string, boolean>> {
-  const results = new Map<string, boolean>();
+export async function batchHeadCheck(urls: string[], signal?: AbortSignal): Promise<Map<string, VerifyResult>> {
+  const results = new Map<string, VerifyResult>();
   const uncached: string[] = [];
   for (const url of urls) {
-    if (urlExistenceCache.has(url)) {
-      results.set(url, urlExistenceCache.get(url)!);
+    const cached = urlExistenceCache.get(url);
+    if (cached) {
+      results.set(url, cached);
     } else {
       uncached.push(url);
     }
   }
   const beforeAttempts = lastHeadGetAttempts;
   const beforeRescues = lastHeadGetRescues;
+  const beforeRedirAttempts = lastRedirectAttempts;
+  const beforeRedirRescues = lastRedirectRescues;
   for (let i = 0; i < uncached.length; i += HEAD_CONCURRENCY) {
     if (signal?.aborted) break;
     const batch = uncached.slice(i, i + HEAD_CONCURRENCY);
     const checks = await Promise.all(
-      batch.map(async (url) => ({ url, exists: await headCheck(url, signal) }))
+      batch.map(async (url) => ({ url, result: await headCheck(url, signal) }))
     );
-    for (const { url, exists } of checks) {
-      results.set(url, exists);
+    for (const { url, result } of checks) {
+      results.set(url, result);
     }
     if (i + HEAD_CONCURRENCY < uncached.length) {
       await new Promise(resolve => setTimeout(resolve, HEAD_BATCH_DELAY));
@@ -281,6 +363,11 @@ export async function batchHeadCheck(urls: string[], signal?: AbortSignal): Prom
   const getRescues = lastHeadGetRescues - beforeRescues;
   if (uncached.length > 0 && getAttempts > 0) {
     log(`    HEAD→GET fallback: ${getRescues}/${getAttempts} URLs rescued by GET (out of ${uncached.length} checked)`);
+  }
+  const redirAttempts = lastRedirectAttempts - beforeRedirAttempts;
+  const redirRescues = lastRedirectRescues - beforeRedirRescues;
+  if (uncached.length > 0 && redirAttempts > 0) {
+    log(`    Redirect rescues: ${redirRescues}/${redirAttempts} URLs followed to a verified final URL (out of ${uncached.length} checked)`);
   }
   return results;
 }
@@ -749,7 +836,7 @@ export async function validatePatterns(
   const parts: string[] = [];
   for (const l of langs) {
     let valid = 0;
-    for (const url of samplesByLang[l]) { if (existence.get(url)) valid++; }
+    for (const url of samplesByLang[l]) { if (existence.get(url)?.ok) valid++; }
     result[l] = valid;
     const rate = samplesByLang[l].length > 0 ? valid / samplesByLang[l].length : 0;
     tabPatterns.patternValidated[l] = rate >= 0.3;
@@ -1725,7 +1812,7 @@ export function matchAgainstInventory(
   } catch {}
 
   for (const candidate of allCandidates) {
-    urlExistenceCache.set(candidate, false);
+    urlExistenceCache.set(candidate, { ok: false, finalUrl: candidate });
   }
 
   return null;

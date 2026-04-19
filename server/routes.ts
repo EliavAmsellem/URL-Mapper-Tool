@@ -735,45 +735,51 @@ async function matchTab(
     }
     const headUrls = asciiOnly.map((u) => u.constructedUrl);
     const existence = await batchHeadCheck(headUrls, control.signal);
-    const headVerified = Array.from(existence.values()).filter(v => v).length;
-    const headFailed = Array.from(existence.values()).filter(v => !v).length;
+    const headVerified = Array.from(existence.values()).filter(v => v.ok).length;
+    const headFailed = Array.from(existence.values()).filter(v => !v.ok).length;
     log(`  HEAD results: ${headVerified} verified, ${headFailed} failed out of ${existence.size} checked`);
     let headMatched = 0;
     let headDepthRejected = 0;
+    let headRedirRescued = 0;
 
     for (const item of asciiOnly) {
-      if (existence.get(item.constructedUrl)) {
+      const probe = existence.get(item.constructedUrl);
+      if (probe && probe.ok) {
+        const verifiedUrl = probe.finalUrl || item.constructedUrl;
+        const wasRedirected = verifiedUrl !== item.constructedUrl;
         const srcRoot = langSrcRoot(tabPatterns, item.lang);
         const tgtRoot = langRoot(tabPatterns, item.lang);
 
         try {
           const srcParts = new URL(item.sourceUrl).pathname.split("/").filter(Boolean);
           const srcDepth = srcParts.length - srcRoot.length;
-          const tgtParts = new URL(item.constructedUrl).pathname.split("/").filter(Boolean);
+          const tgtParts = new URL(verifiedUrl).pathname.split("/").filter(Boolean);
           const tgtDepth = tgtParts.length - tgtRoot.length;
           if (srcDepth >= 2 && tgtDepth <= 0) {
-            log(`    HEAD match REJECTED (parent-only): ${item.sourceUrl} -> ${item.constructedUrl}`);
+            log(`    HEAD match REJECTED (parent-only): ${item.sourceUrl} -> ${verifiedUrl}`);
             headDepthRejected++;
             continue;
           }
           if (srcDepth >= 3 && tgtDepth <= 1) {
-            log(`    HEAD match REJECTED (too shallow): ${item.sourceUrl} -> ${item.constructedUrl}`);
+            log(`    HEAD match REJECTED (too shallow): ${item.sourceUrl} -> ${verifiedUrl}`);
             headDepthRejected++;
             continue;
           }
         } catch {}
 
-        if (usedUrls[item.lang].has(item.constructedUrl)) continue;
+        if (usedUrls[item.lang].has(verifiedUrl)) continue;
 
         const result = matchResults.get(item.index);
         if (result && !getResultUrl(result, item.lang)) {
-          setResultMatch(result, item.lang, item.constructedUrl, 90, "pattern+head");
-          usedUrls[item.lang].add(item.constructedUrl);
+          const method = wasRedirected ? "pattern+head+redirect" : "pattern+head";
+          setResultMatch(result, item.lang, verifiedUrl, 90, method);
+          usedUrls[item.lang].add(verifiedUrl);
           headMatched++;
+          if (wasRedirected) headRedirRescued++;
         }
       }
     }
-    log(`  HEAD fallback: ${headMatched}/${asciiOnly.length} verified${headDepthRejected > 0 ? `, ${headDepthRejected} depth-rejected` : ''}`);
+    log(`  HEAD fallback: ${headMatched}/${asciiOnly.length} verified${headDepthRejected > 0 ? `, ${headDepthRejected} depth-rejected` : ''}${headRedirRescued > 0 ? `, ${headRedirRescued} via redirect rescue` : ''}`);
   }
 
   const unmatchedForTitle = needsMatching.filter(row => {
@@ -1272,16 +1278,23 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         let aiAccepted = 0;
         let aiHeadRejected = 0;
         let aiDepthRejected = 0;
+        let aiRedirRescued = 0;
+        const aiVerifiedUrls = new Map<string, string>();
 
         for (const [rowIndex, aiResult] of Array.from(aiMatches.entries())) {
           const srcUrl = rowSourceMap.get(rowIndex) || "";
 
           for (const l of allLangs) {
             const url = getResultUrl(aiResult, l);
-            if (url && !existence.get(url)) {
+            if (!url) continue;
+            const probe = existence.get(url);
+            if (!probe || !probe.ok) {
               log(`    AI HEAD REJECTED: ${l.toUpperCase()} ${url}`);
               clearResultMatch(aiResult, l);
               aiHeadRejected++;
+            } else if (probe.finalUrl && probe.finalUrl !== url) {
+              aiVerifiedUrls.set(`${rowIndex}:${l}`, probe.finalUrl);
+              aiRedirRescued++;
             }
           }
 
@@ -1289,8 +1302,9 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
             const url = getResultUrl(aiResult, l);
             const sr = langSrcRoot(inv.tabPatterns, l);
             if (url && srcUrl && sr.length > 0) {
-              if (!validateDepthMatch(srcUrl, url, sr, langRoot(inv.tabPatterns, l))) {
-                log(`    AI DEPTH REJECTED: ${l.toUpperCase()} ${url}`);
+              const verifiedUrl = aiVerifiedUrls.get(`${rowIndex}:${l}`) || url;
+              if (!validateDepthMatch(srcUrl, verifiedUrl, sr, langRoot(inv.tabPatterns, l))) {
+                log(`    AI DEPTH REJECTED: ${l.toUpperCase()} ${verifiedUrl}`);
                 clearResultMatch(aiResult, l);
                 aiDepthRejected++;
               }
@@ -1306,9 +1320,13 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
             }
             for (const l of allLangs) {
               const url = getResultUrl(aiResult, l);
-              if (url && !getResultUrl(existing, l) && !inv.usedUrls[l].has(url)) {
-                setResultMatch(existing, l, url, getResultConf(aiResult, l) || 0, getResultMethod(aiResult, l) || "");
-                inv.usedUrls[l].add(url);
+              if (!url) continue;
+              const verifiedUrl = aiVerifiedUrls.get(`${rowIndex}:${l}`) || url;
+              if (!getResultUrl(existing, l) && !inv.usedUrls[l].has(verifiedUrl)) {
+                const baseMethod = getResultMethod(aiResult, l) || "";
+                const method = verifiedUrl !== url ? `${baseMethod}+redirect` : baseMethod;
+                setResultMatch(existing, l, verifiedUrl, getResultConf(aiResult, l) || 0, method);
+                inv.usedUrls[l].add(verifiedUrl);
                 aiAccepted++;
               }
             }
@@ -1316,7 +1334,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         }
 
         matchedCount += aiAccepted;
-        log(`  AI results: ${aiAccepted} accepted, ${aiHeadRejected} HEAD-rejected, ${aiDepthRejected} depth-rejected`);
+        log(`  AI results: ${aiAccepted} accepted, ${aiHeadRejected} HEAD-rejected, ${aiDepthRejected} depth-rejected${aiRedirRescued > 0 ? `, ${aiRedirRescued} via redirect rescue` : ''}`);
         await storage.updateJob(jobId, { matchedUrls: matchedCount });
       }
     }
