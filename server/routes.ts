@@ -1219,21 +1219,20 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
     }
   }
 
-  await storage.updateJob(jobId, { currentStep: "saving" });
+  await storage.updateJob(jobId, { currentStep: control.cancel ? "saving-partial" : "saving" });
+  if (control.cancel) {
+    log(`Job ${jobId} cancelled — saving partial results from passes already completed.`);
+  }
 
   await storage.deleteResultsByJob(jobId);
 
   let finalMatchedCount = 0;
 
   for (const tabData of allTabData) {
-    if (control.cancel) break;
-
     const sheetGlobal = globalMatchResults.get(tabData.sheetName) || new Map();
     const resultBatch: any[] = [];
 
     for (const row of tabData.allRows) {
-      if (control.cancel) break;
-
       const match = sheetGlobal.get(row.rowIndex);
       let enUrl: string | null = row.originalEn || null;
       let frUrl: string | null = row.originalFr || null;
