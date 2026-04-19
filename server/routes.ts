@@ -422,8 +422,8 @@ async function matchTab(
   const langLabels: Record<TargetLang, string> = { en: "EN", fr: "FR", ru: "RU", ar: "AR" };
   const refUrlKey: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = { en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl" };
 
-  const tabPatterns = learnTabPatterns(tabRefRows);
-  log(`Tab "${sheetName}": ${tabRefRows.length} reference rows, ${allRows.length} total rows`);
+  const tabPatterns = learnTabPatterns(tabRefRows, langs);
+  log(`Tab "${sheetName}": ${tabRefRows.length} reference rows, ${allRows.length} total rows (active langs: ${langs.map(l => l.toUpperCase()).join(",") || "none"})`);
 
   const needsMatching = allRows.filter((r) => r.needsEn || r.needsFr || r.needsRu || r.needsAr);
   const matchResults = new Map<number, BatchMatchResult>();
@@ -490,8 +490,17 @@ async function matchTab(
   const crawlPromises: Promise<void>[] = [];
   for (const l of langs) {
     const root = langRoot(tabPatterns, l);
-    if (origin && root.length > 0) {
-      const scope = langCrawlScope(tabPatterns, l).length > 0 ? langCrawlScope(tabPatterns, l) : root;
+    const perPair = tabPatterns.rootMappings.get(l) || [];
+    const hasPerPairRoot = perPair.some(m => m.targetRoot.length > 0);
+    if (origin && (root.length > 0 || hasPerPairRoot)) {
+      let scope = langCrawlScope(tabPatterns, l);
+      if (scope.length === 0) {
+        if (root.length > 0) scope = root;
+        else {
+          const firstSeg = perPair.find(m => m.targetRoot.length > 0)!.targetRoot[0];
+          scope = [firstSeg];
+        }
+      }
       const cacheKey = `${l}:${scope.join("/")}`;
       if (crawlCache.has(cacheKey)) {
         inventories[l] = crawlCache.get(cacheKey)!;

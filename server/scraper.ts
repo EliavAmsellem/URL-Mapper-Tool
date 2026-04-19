@@ -214,10 +214,14 @@ export interface RootMapping {
 }
 
 export function learnTabPatterns(
-  rows: { sourceUrl: string; enUrl?: string; frUrl?: string; ruUrl?: string; arUrl?: string }[]
+  rows: { sourceUrl: string; enUrl?: string; frUrl?: string; ruUrl?: string; arUrl?: string }[],
+  activeLangs?: TargetLang[]
 ): TabPatterns {
   const segmentMap = new Map<string, Map<string, string>>();
-  const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
+  const allLangs: TargetLang[] = ["en", "fr", "ru", "ar"];
+  const langs: TargetLang[] = activeLangs && activeLangs.length > 0
+    ? allLangs.filter(l => activeLangs.includes(l))
+    : allLangs;
   for (const l of langs) segmentMap.set(l, new Map());
 
   const pairsByLang: Record<string, { src: string[]; tgt: string[] }[]> = { en: [], fr: [], ru: [], ar: [] };
@@ -230,6 +234,7 @@ export function learnTabPatterns(
 
       const langUrls: [TargetLang, string | undefined][] = [["en", row.enUrl], ["fr", row.frUrl], ["ru", row.ruUrl], ["ar", row.arUrl]];
       for (const [lang, url] of langUrls) {
+        if (!langs.includes(lang)) continue;
         if (url) {
           try {
             const parsed = new URL(url);
@@ -496,7 +501,7 @@ export function constructTargetUrl(
       remaining = cleanParts;
     }
 
-    const untranslated = parsed.origin + "/" + [...targetRoot, ...remaining].join("/");
+    let untranslated = parsed.origin + "/" + [...targetRoot, ...remaining].join("/");
 
     const translatedParts = remaining.map((part) => {
       if (!segments) return part;
@@ -504,7 +509,27 @@ export function constructTargetUrl(
       return segments.has(norm) ? segments.get(norm)! : part;
     });
 
-    const translated = parsed.origin + "/" + [...targetRoot, ...translatedParts].join("/");
+    let translated = parsed.origin + "/" + [...targetRoot, ...translatedParts].join("/");
+
+    const suffixRule = langSuffixRuleFor(tabPatterns, lang);
+    const usedPerPair = !!(bestMapping && bestMatchLen > commonSourceRoot.length);
+    if (suffixRule && !usedPerPair && commonSourceRoot.length === 0 && cleanParts.length > suffixRule.depth) {
+      const transformed = cleanParts.map((p, i) => i === suffixRule.depth ? p + suffixRule.suffix : p);
+      untranslated = parsed.origin + "/" + [...suffixRule.prefix, ...transformed].join("/");
+      const tParts = transformed.map((part, i) => {
+        if (i === suffixRule.depth) {
+          if (segments) {
+            const baseNorm = normalizeSegment(cleanParts[i]);
+            if (segments.has(baseNorm)) return segments.get(baseNorm)! + suffixRule.suffix;
+          }
+          return part;
+        }
+        if (!segments) return part;
+        const norm = normalizeSegment(part);
+        return segments.has(norm) ? segments.get(norm)! : part;
+      });
+      translated = parsed.origin + "/" + [...suffixRule.prefix, ...tParts].join("/");
+    }
 
     return {
       translated: translated !== untranslated ? translated : null,
@@ -593,13 +618,22 @@ export function constructAllTargetUrls(
       const candidate = parsed.origin + "/" + [...suffixRule.prefix, ...transformed].join("/");
       candidates.add(candidate);
       if (segments) {
-        const translated = transformed.map((part, i) => {
+        const translatedKeepDepth = transformed.map((part, i) => {
           if (i === suffixRule.depth) return part;
           const norm = normalizeSegment(part);
           return segments.has(norm) ? segments.get(norm)! : part;
         });
-        const tCandidate = parsed.origin + "/" + [...suffixRule.prefix, ...translated].join("/");
-        if (tCandidate !== candidate) candidates.add(tCandidate);
+        const tCandidate1 = parsed.origin + "/" + [...suffixRule.prefix, ...translatedKeepDepth].join("/");
+        if (tCandidate1 !== candidate) candidates.add(tCandidate1);
+
+        const translatedAll = cleanParts.map((part, i) => {
+          const norm = normalizeSegment(part);
+          const base = segments.has(norm) ? segments.get(norm)! : part;
+          if (i === suffixRule.depth) return base + suffixRule.suffix;
+          return base;
+        });
+        const tCandidate2 = parsed.origin + "/" + [...suffixRule.prefix, ...translatedAll].join("/");
+        if (tCandidate2 !== candidate && tCandidate2 !== tCandidate1) candidates.add(tCandidate2);
       }
     }
   } catch {}
