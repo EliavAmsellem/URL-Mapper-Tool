@@ -213,11 +213,13 @@ export async function registerRoutes(
       if (control) {
         control.cancel = true;
         control.abortController.abort();
-        activeJobs.delete(jobId);
+        await storage.updateJob(jobId, { currentStep: "stopping" });
+        log(`Job ${jobId} stop requested by user (abort signaled, awaiting partial save)`);
+      } else if (job.status === "processing" || job.status === "pending") {
+        await storage.updateJob(jobId, { status: "cancelled", currentStep: "done" });
+        log(`Job ${jobId} marked cancelled (no active control found)`);
       }
-      await storage.updateJob(jobId, { status: "cancelled", currentStep: "done" });
-      log(`Job ${jobId} stopped by user (abort signaled)`);
-      res.json({ message: "Job stopped" });
+      res.json({ message: "Job stop requested" });
     } catch (error: any) {
       res.status(500).json({ message: error.message });
     }

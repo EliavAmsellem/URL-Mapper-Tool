@@ -29,12 +29,19 @@ function parseStep(currentStep: string): { phase: string; tabName: string | null
   if (currentStep === "saving") {
     return { phase: "saving", tabName: null, passNum: null };
   }
+  if (currentStep === "saving-partial") {
+    return { phase: "saving-partial", tabName: null, passNum: null };
+  }
+  if (currentStep === "stopping") {
+    return { phase: "stopping", tabName: null, passNum: null };
+  }
   return { phase: currentStep, tabName: null, passNum: null };
 }
 
 export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
   const [job, setJob] = useState<JobStatus | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
+  const [isStopping, setIsStopping] = useState(false);
   const pollRef = useRef<NodeJS.Timeout | null>(null);
   const prevStepRef = useRef<string>("");
   const prevMatchedRef = useRef<number>(0);
@@ -66,7 +73,15 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
             setLogs(prev => [aiMsg, ...prev].slice(0, 10));
           } else if (phase === "saving") {
             setLogs(prev => ["Saving results to database...", ...prev].slice(0, 10));
+          } else if (phase === "saving-partial") {
+            setLogs(prev => ["Saving partial results...", ...prev].slice(0, 10));
+          } else if (phase === "stopping") {
+            setLogs(prev => ["Stopping job, finalizing partial results...", ...prev].slice(0, 10));
           }
+        }
+
+        if (status.currentStep === "stopping" || status.currentStep === "saving-partial") {
+          setIsStopping(true);
         }
 
         if (status.matchedUrls > prevMatchedRef.current) {
@@ -129,7 +144,7 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
         <div className="flex justify-between text-xs text-muted-foreground font-mono">
           <span data-testid="text-progress">{progress}% Complete</span>
           <span data-testid="text-status">
-            {job?.status === "completed" ? "Done!" : job?.status === "error" ? "Error" : currentTabName ? `Working on: ${currentTabName}` : "Running..."}
+            {job?.status === "completed" ? "Done!" : job?.status === "error" ? "Error" : job?.status === "cancelled" ? "Stopped" : isStopping ? "Stopping..." : currentTabName ? `Working on: ${currentTabName}` : "Running..."}
           </span>
         </div>
       </div>
@@ -190,16 +205,20 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
               {job.status === "processing" && (
                 <button
                   data-testid="button-stop-job"
+                  disabled={isStopping}
                   onClick={async () => {
+                    setIsStopping(true);
                     try {
                       await stopJob(jobId);
                       setLogs(prev => ["Stopping job...", ...prev].slice(0, 10));
-                    } catch {}
+                    } catch {
+                      setIsStopping(false);
+                    }
                   }}
-                  className="px-3 py-1 text-xs font-medium bg-destructive/10 text-destructive border border-destructive/20 rounded-md hover:bg-destructive/20 transition-colors flex items-center gap-1"
+                  className="px-3 py-1 text-xs font-medium bg-destructive/10 text-destructive border border-destructive/20 rounded-md hover:bg-destructive/20 transition-colors flex items-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed"
                 >
-                  <Square className="w-3 h-3" />
-                  Stop
+                  {isStopping ? <Loader2 className="w-3 h-3 animate-spin" /> : <Square className="w-3 h-3" />}
+                  {isStopping ? "Stopping..." : "Stop"}
                 </button>
               )}
             </div>
