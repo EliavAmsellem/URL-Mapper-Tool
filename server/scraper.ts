@@ -2159,28 +2159,24 @@ export function matchByTitle(
       return null;
     }
 
-    if (!sourceSegments || sourceSegments.size === 0) {
-      log(`    Title match REJECTED (no source segments to validate): "${translatedTitle}" -> ${finalMatch.url}`);
-      return null;
-    }
-
-    const allNonLatin = Array.from(sourceSegments).every(seg => /[^\x00-\x7F]/.test(seg));
-
-    if (!allNonLatin) {
-      try {
-        const matchParts = new URL(finalMatch.url).pathname.split("/").filter(Boolean);
-        const matchNorms = matchParts.map(p => normalizeSegment(p));
-        let sharedSegments = 0;
-        for (const seg of matchNorms) {
-          if (sourceSegments.has(seg)) sharedSegments++;
-        }
-        if (sharedSegments === 0 && matchNorms.length > 2) {
-          log(`    Title match REJECTED (no shared segments): "${translatedTitle}" -> ${finalMatch.url}`);
+    if (sourceSegments && sourceSegments.size > 0) {
+      const allNonLatin = Array.from(sourceSegments).every(seg => /[^\x00-\x7F]/.test(seg));
+      if (!allNonLatin) {
+        try {
+          const matchParts = new URL(finalMatch.url).pathname.split("/").filter(Boolean);
+          const matchNorms = matchParts.map(p => normalizeSegment(p));
+          let sharedSegments = 0;
+          for (const seg of matchNorms) {
+            if (sourceSegments.has(seg)) sharedSegments++;
+          }
+          if (sharedSegments === 0 && matchNorms.length > 2 && bestSimilarity < 0.75) {
+            log(`    Title match REJECTED (no shared segments AND sim<0.75): "${translatedTitle}" -> ${finalMatch.url} (sim=${bestSimilarity.toFixed(3)})`);
+            return null;
+          }
+        } catch {
+          log(`    Title match REJECTED (URL parse error): "${translatedTitle}" -> ${finalMatch.url}`);
           return null;
         }
-      } catch {
-        log(`    Title match REJECTED (URL parse error): "${translatedTitle}" -> ${finalMatch.url}`);
-        return null;
       }
     }
   }

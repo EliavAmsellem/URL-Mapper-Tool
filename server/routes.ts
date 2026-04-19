@@ -717,19 +717,127 @@ async function matchTab(
     }
   }
 
-  const asciiOnly = unmatchedForHead.filter(u => {
+  // ---- INVENTORY TITLE-MATCH STAGE (before HEAD) ----
+  // Trust inventory title matches above the configured similarity threshold,
+  // skipping HEAD verification for accepted matches. HEAD becomes a last-ditch
+  // fallback for rows the inventory could not satisfy.
+  const unmatchedForTitle = needsMatching.filter(row => {
+    const m = matchResults.get(row.rowIndex);
+    return row.title && langs.some(l =>
+      row[needsKey[l]] && (!m || !getResultUrl(m, l))
+    );
+  }).map(row => {
+    const m = matchResults.get(row.rowIndex);
+    const needs: Record<TargetLang, boolean> = { en: false, fr: false, ru: false, ar: false };
+    for (const l of langs) {
+      needs[l] = !!(row[needsKey[l]] && (!m || !getResultUrl(m, l)));
+    }
+    return { rowIndex: row.rowIndex, title: row.title, sourceUrl: row.sourceUrl, needs };
+  });
+
+  const hasAnyInventory = langs.some(l => inventories[l] !== null);
+  let titleAcceptedTotal = 0;
+  const titleMethodCounts: Record<string, number> = {};
+  if (unmatchedForTitle.length > 0 && hasAnyInventory) {
+    log(`  Inventory title-match stage: scoring ${unmatchedForTitle.length} unmatched rows against per-lang inventory...`);
+    for (const l of langs) {
+      const inv = inventories[l];
+      log(`    ${langLabels[l]} inventory: ${inv ? `${inv.urls.size} URLs, ${inv.titleIndex.size} titles` : 'null'}`);
+    }
+
+    const allowedRoots: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
+    for (const l of langs) {
+      const rootSet = new Set<string>();
+      const root = langRoot(tabPatterns, l);
+      if (root.length > 0) rootSet.add("/" + root.join("/") + "/");
+      for (const ref of tabRefRows) {
+        const url = ref[refUrlKey[l]];
+        if (url) {
+          try {
+            const parts = new URL(url).pathname.split("/").filter(Boolean);
+            if (parts.length >= 2) rootSet.add("/" + parts.slice(0, 2).join("/") + "/");
+            else if (parts.length >= 1) rootSet.add("/" + parts[0] + "/");
+          } catch {}
+        }
+      }
+      allowedRoots[l] = Array.from(rootSet);
+      if (allowedRoots[l].length > 0) log(`    ${langLabels[l]} allowed roots: ${allowedRoots[l].join(", ")}`);
+      else log(`    ${langLabels[l]} title matching SKIPPED: no allowed roots could be determined`);
+    }
+
+    const refDepths: Record<TargetLang, number[] | undefined> = { en: undefined, fr: undefined, ru: undefined, ar: undefined };
+    const knownUrlSets: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
+    for (const l of langs) {
+      const depths: number[] = [];
+      for (const ref of tabRefRows) {
+        const url = ref[refUrlKey[l]];
+        if (url) {
+          try {
+            depths.push(new URL(url).pathname.split("/").filter(Boolean).length);
+            knownUrlSets[l].add(url);
+          } catch {}
+        }
+      }
+      refDepths[l] = depths.length > 0 ? depths : undefined;
+      for (const [, mr] of Array.from(matchResults.entries())) {
+        const u = getResultUrl(mr, l);
+        if (u) knownUrlSets[l].add(u);
+      }
+    }
+
+    const titleMatches = await titleMatchUnmatched(
+      unmatchedForTitle, inventories, storage,
+      allowedRoots, refDepths, knownUrlSets, control.signal,
+    );
+
+    for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
+      let result = matchResults.get(rowIndex);
+      if (!result) {
+        result = emptyBatchResult();
+        matchResults.set(rowIndex, result);
+      }
+      for (const l of langs) {
+        const tUrl = getResultUrl(titleResult, l);
+        if (tUrl && !getResultUrl(result, l) && !usedUrls[l].has(tUrl)) {
+          const method = getResultMethod(titleResult, l) || "";
+          const taggedMethod = method === "title-match"
+            ? "inventory-title"
+            : (method ? `inventory-${method}` : "inventory-title");
+          setResultMatch(result, l, tUrl, getResultConf(titleResult, l) || 0, taggedMethod);
+          usedUrls[l].add(tUrl);
+          titleAcceptedTotal++;
+          titleMethodCounts[taggedMethod] = (titleMethodCounts[taggedMethod] || 0) + 1;
+        }
+      }
+    }
+    const titleSummary = Object.entries(titleMethodCounts).sort((a, b) => b[1] - a[1]).map(([m, c]) => `${m}:${c}`).join(", ");
+    log(`  Inventory title-match: ${titleAcceptedTotal} accepted (${titleSummary || "none"}) — HEAD will skip these rows`);
+  }
+
+  // ---- HEAD FALLBACK (last-ditch only for rows inventory + title couldn't satisfy) ----
+  // Drop HEAD candidates whose row+lang got filled by the title-match stage above.
+  const remainingForHead = unmatchedForHead.filter(u => {
+    const result = matchResults.get(u.index);
+    return !result || !getResultUrl(result, u.lang);
+  });
+  const skippedAfterTitle = unmatchedForHead.length - remainingForHead.length;
+  if (skippedAfterTitle > 0) {
+    log(`  HEAD queue trimmed by ${skippedAfterTitle} URLs (title-match satisfied those rows)`);
+  }
+
+  const asciiOnly = remainingForHead.filter(u => {
     try {
       const decoded = decodeURIComponent(new URL(u.constructedUrl).pathname);
       return !/[\u0590-\u05FF\u0600-\u06FF\uFB1D-\uFDFF\uFE70-\uFEFF]/.test(decoded);
     } catch { return false; }
   });
-  const skippedNonAscii = unmatchedForHead.length - asciiOnly.length;
+  const skippedNonAscii = remainingForHead.length - asciiOnly.length;
   if (skippedNonAscii > 0) {
     log(`  Skipping ${skippedNonAscii} HEAD candidates with Hebrew/Arabic path segments`);
   }
 
   if (asciiOnly.length > 0) {
-    log(`  Falling back to HEAD checks for ${asciiOnly.length} URLs (timeout: 12s, concurrency: 10)...`);
+    log(`  HEAD last-ditch fallback for ${asciiOnly.length} URLs (timeout: 12s, concurrency: 10)...`);
     for (let s = 0; s < Math.min(5, asciiOnly.length); s++) {
       log(`    [HEAD sample] ${asciiOnly[s].sourceUrl} → ${asciiOnly[s].constructedUrl}`);
     }
@@ -771,7 +879,7 @@ async function matchTab(
 
         const result = matchResults.get(item.index);
         if (result && !getResultUrl(result, item.lang)) {
-          const method = wasRedirected ? "pattern+head+redirect" : "pattern+head";
+          const method = wasRedirected ? "head-verified+redirect" : "head-verified";
           setResultMatch(result, item.lang, verifiedUrl, 90, method);
           usedUrls[item.lang].add(verifiedUrl);
           headMatched++;
@@ -780,92 +888,6 @@ async function matchTab(
       }
     }
     log(`  HEAD fallback: ${headMatched}/${asciiOnly.length} verified${headDepthRejected > 0 ? `, ${headDepthRejected} depth-rejected` : ''}${headRedirRescued > 0 ? `, ${headRedirRescued} via redirect rescue` : ''}`);
-  }
-
-  const unmatchedForTitle = needsMatching.filter(row => {
-    const m = matchResults.get(row.rowIndex);
-    return row.title && langs.some(l =>
-      row[needsKey[l]] && (!m || !getResultUrl(m, l))
-    );
-  }).map(row => {
-    const m = matchResults.get(row.rowIndex);
-    const needs: Record<TargetLang, boolean> = { en: false, fr: false, ru: false, ar: false };
-    for (const l of langs) {
-      needs[l] = !!(row[needsKey[l]] && (!m || !getResultUrl(m, l)));
-    }
-    return { rowIndex: row.rowIndex, title: row.title, sourceUrl: row.sourceUrl, needs };
-  });
-
-  const hasAnyInventory = langs.some(l => inventories[l] !== null);
-  if (unmatchedForTitle.length > 0 && hasAnyInventory) {
-    log(`  Attempting title-based matching for ${unmatchedForTitle.length} unmatched URLs...`);
-    for (const l of langs) {
-      const inv = inventories[l];
-      log(`  ${langLabels[l]} inventory: ${inv ? `${inv.urls.size} URLs, ${inv.titleIndex.size} titles` : 'null'}`);
-    }
-
-    const allowedRoots: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
-    for (const l of langs) {
-      const rootSet = new Set<string>();
-      const root = langRoot(tabPatterns, l);
-      if (root.length > 0) rootSet.add("/" + root.join("/") + "/");
-      for (const ref of tabRefRows) {
-        const url = ref[refUrlKey[l]];
-        if (url) {
-          try {
-            const parts = new URL(url).pathname.split("/").filter(Boolean);
-            if (parts.length >= 2) rootSet.add("/" + parts.slice(0, 2).join("/") + "/");
-            else if (parts.length >= 1) rootSet.add("/" + parts[0] + "/");
-          } catch {}
-        }
-      }
-      allowedRoots[l] = Array.from(rootSet);
-      if (allowedRoots[l].length > 0) log(`  ${langLabels[l]} allowed roots for title matching: ${allowedRoots[l].join(", ")}`);
-      else log(`  ${langLabels[l]} title matching SKIPPED: no allowed roots could be determined`);
-    }
-
-    const refDepths: Record<TargetLang, number[] | undefined> = { en: undefined, fr: undefined, ru: undefined, ar: undefined };
-    const knownUrlSets: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
-    for (const l of langs) {
-      const depths: number[] = [];
-      for (const ref of tabRefRows) {
-        const url = ref[refUrlKey[l]];
-        if (url) {
-          try {
-            depths.push(new URL(url).pathname.split("/").filter(Boolean).length);
-            knownUrlSets[l].add(url);
-          } catch {}
-        }
-      }
-      refDepths[l] = depths.length > 0 ? depths : undefined;
-      for (const [, mr] of Array.from(matchResults.entries())) {
-        const u = getResultUrl(mr, l);
-        if (u) knownUrlSets[l].add(u);
-      }
-      if (depths.length > 0) log(`  ${langLabels[l]} ref depths: min=${Math.min(...depths)} max=${Math.max(...depths)} (${depths.length} refs)`);
-    }
-    const knownSummary = langs.map(l => `${knownUrlSets[l].size} ${langLabels[l]}`).join(", ");
-    log(`  Known URLs to exclude: ${knownSummary}`);
-
-    const titleMatches = await titleMatchUnmatched(
-      unmatchedForTitle, inventories, storage,
-      allowedRoots, refDepths, knownUrlSets, control.signal,
-    );
-
-    for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
-      let result = matchResults.get(rowIndex);
-      if (!result) {
-        result = emptyBatchResult();
-        matchResults.set(rowIndex, result);
-      }
-      for (const l of langs) {
-        const tUrl = getResultUrl(titleResult, l);
-        if (tUrl && !getResultUrl(result, l) && !usedUrls[l].has(tUrl)) {
-          setResultMatch(result, l, tUrl, getResultConf(titleResult, l) || 0, getResultMethod(titleResult, l) || "");
-          usedUrls[l].add(tUrl);
-        }
-      }
-    }
   }
 
   const sourceUrlByRow = new Map<number, string>();
