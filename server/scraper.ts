@@ -111,6 +111,14 @@ const translationCache = new Map<string, string>();
 const HEAD_CONCURRENCY = 10;
 const HEAD_TIMEOUT = 12000;
 const HEAD_BATCH_DELAY = 200;
+let lastHeadGetRescues = 0;
+let lastHeadGetAttempts = 0;
+export function consumeHeadGetRescueStats(): { attempts: number; rescues: number } {
+  const v = { attempts: lastHeadGetAttempts, rescues: lastHeadGetRescues };
+  lastHeadGetAttempts = 0;
+  lastHeadGetRescues = 0;
+  return v;
+}
 
 export function clearCaches() {
   urlExistenceCache.clear();
@@ -156,10 +164,35 @@ function combineSignals(parent: AbortSignal | undefined, timeoutMs: number): { s
   };
 }
 
+async function getCheck(url: string, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return false;
+  const { signal: combined, cleanup } = combineSignals(signal, HEAD_TIMEOUT);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      signal: combined,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; LinguaMap/1.0; URL Mapper Bot)",
+        "Accept": "text/html,application/xhtml+xml",
+        "Range": "bytes=0-2047",
+      },
+      redirect: "follow",
+    });
+    try { (response.body as any)?.cancel?.(); } catch {}
+    cleanup();
+    return response.ok || response.status === 206;
+  } catch {
+    cleanup();
+    return false;
+  }
+}
+
 async function headCheck(url: string, signal?: AbortSignal): Promise<boolean> {
   if (urlExistenceCache.has(url)) return urlExistenceCache.get(url)!;
   if (signal?.aborted) return false;
   const { signal: combined, cleanup } = combineSignals(signal, HEAD_TIMEOUT);
+  let headOk = false;
+  let headFailed = false;
   try {
     const response = await fetch(url, {
       method: "HEAD",
@@ -170,15 +203,31 @@ async function headCheck(url: string, signal?: AbortSignal): Promise<boolean> {
       redirect: "follow",
     });
     cleanup();
-    const exists = response.ok;
-    urlExistenceCache.set(url, exists);
-    return exists;
+    headOk = response.ok;
+    if (!response.ok) headFailed = true;
   } catch {
     cleanup();
     if (signal?.aborted) return false;
-    urlExistenceCache.set(url, false);
-    return false;
+    headFailed = true;
   }
+
+  if (headOk) {
+    urlExistenceCache.set(url, true);
+    return true;
+  }
+
+  if (headFailed) {
+    lastHeadGetAttempts++;
+    const getOk = await getCheck(url, signal);
+    if (getOk) {
+      lastHeadGetRescues++;
+      urlExistenceCache.set(url, true);
+      return true;
+    }
+  }
+
+  urlExistenceCache.set(url, false);
+  return false;
 }
 
 export async function batchHeadCheck(urls: string[], signal?: AbortSignal): Promise<Map<string, boolean>> {
@@ -191,6 +240,8 @@ export async function batchHeadCheck(urls: string[], signal?: AbortSignal): Prom
       uncached.push(url);
     }
   }
+  const beforeAttempts = lastHeadGetAttempts;
+  const beforeRescues = lastHeadGetRescues;
   for (let i = 0; i < uncached.length; i += HEAD_CONCURRENCY) {
     if (signal?.aborted) break;
     const batch = uncached.slice(i, i + HEAD_CONCURRENCY);
@@ -203,6 +254,11 @@ export async function batchHeadCheck(urls: string[], signal?: AbortSignal): Prom
     if (i + HEAD_CONCURRENCY < uncached.length) {
       await new Promise(resolve => setTimeout(resolve, HEAD_BATCH_DELAY));
     }
+  }
+  const getAttempts = lastHeadGetAttempts - beforeAttempts;
+  const getRescues = lastHeadGetRescues - beforeRescues;
+  if (uncached.length > 0 && getAttempts > 0) {
+    log(`    HEAD→GET fallback: ${getRescues}/${getAttempts} URLs rescued by GET (out of ${uncached.length} checked)`);
   }
   return results;
 }
@@ -834,8 +890,10 @@ const BROWSER_HEADERS = {
   "Pragma": "no-cache",
 };
 
-async function fetchPage(url: string, signal?: AbortSignal): Promise<string | null> {
-  if (signal?.aborted) return null;
+type FetchOutcome = { html: string | null; reason: "ok" | "http_4xx" | "http_5xx" | "non_html" | "timeout" | "error" | "aborted"; status?: number };
+
+async function fetchPageDetailed(url: string, signal?: AbortSignal): Promise<FetchOutcome> {
+  if (signal?.aborted) return { html: null, reason: "aborted" };
   const { signal: combined, cleanup } = combineSignals(signal, CRAWL_TIMEOUT);
   try {
     const response = await fetch(url, {
@@ -850,7 +908,7 @@ async function fetchPage(url: string, signal?: AbortSignal): Promise<string | nu
     cleanup();
 
     if (response.status === 401) {
-      if (signal?.aborted) return null;
+      if (signal?.aborted) return { html: null, reason: "aborted" };
       const { signal: combined2, cleanup: cleanup2 } = combineSignals(signal, CRAWL_TIMEOUT);
       try {
         const retryResponse = await fetch(url, {
@@ -863,24 +921,38 @@ async function fetchPage(url: string, signal?: AbortSignal): Promise<string | nu
           redirect: "follow",
         });
         cleanup2();
-        if (!retryResponse.ok) return null;
+        if (!retryResponse.ok) {
+          const r: FetchOutcome["reason"] = retryResponse.status >= 500 ? "http_5xx" : "http_4xx";
+          return { html: null, reason: r, status: retryResponse.status };
+        }
         const ct = retryResponse.headers.get("content-type") || "";
-        if (!ct.includes("text/html")) return null;
-        return await retryResponse.text();
-      } catch {
+        if (!ct.includes("text/html")) return { html: null, reason: "non_html", status: retryResponse.status };
+        return { html: await retryResponse.text(), reason: "ok", status: retryResponse.status };
+      } catch (err: any) {
         cleanup2();
-        return null;
+        if (signal?.aborted) return { html: null, reason: "aborted" };
+        const isTimeout = err?.name === "AbortError";
+        return { html: null, reason: isTimeout ? "timeout" : "error" };
       }
     }
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      const r: FetchOutcome["reason"] = response.status >= 500 ? "http_5xx" : "http_4xx";
+      return { html: null, reason: r, status: response.status };
+    }
     const contentType = response.headers.get("content-type") || "";
-    if (!contentType.includes("text/html")) return null;
-    return await response.text();
-  } catch {
+    if (!contentType.includes("text/html")) return { html: null, reason: "non_html", status: response.status };
+    return { html: await response.text(), reason: "ok", status: response.status };
+  } catch (err: any) {
     cleanup();
-    return null;
+    if (signal?.aborted) return { html: null, reason: "aborted" };
+    const isTimeout = err?.name === "AbortError";
+    return { html: null, reason: isTimeout ? "timeout" : "error" };
   }
+}
+
+async function fetchPage(url: string, signal?: AbortSignal): Promise<string | null> {
+  return (await fetchPageDetailed(url, signal)).html;
 }
 
 function extractLinks(html: string, baseUrl: string, scopePrefix: string): string[] {
@@ -950,6 +1022,8 @@ export async function crawlDirectory(
   }
 
   let crawled = 0;
+  const reasonCounts: Record<string, number> = { ok: 0, http_4xx: 0, http_5xx: 0, non_html: 0, timeout: 0, error: 0, aborted: 0 };
+  const sampleByReason: Record<string, string> = {};
 
   while (queue.length > 0 && crawled < pageCap) {
     if (signal?.aborted) break;
@@ -961,13 +1035,17 @@ export async function crawlDirectory(
 
     const results = await Promise.all(
       toFetch.map(async (url) => {
-        const html = await fetchPage(url, signal);
-        return { url, html };
+        const outcome = await fetchPageDetailed(url, signal);
+        return { url, html: outcome.html, reason: outcome.reason, status: outcome.status };
       })
     );
 
-    for (const { url, html } of results) {
+    for (const { url, html, reason, status } of results) {
       crawled++;
+      reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
+      if (reason !== "ok" && reason !== "aborted" && !sampleByReason[reason]) {
+        sampleByReason[reason] = `${url}${status ? ` (${status})` : ""}`;
+      }
 
       if (html) {
         addToInventory(inventory, url);
@@ -1028,6 +1106,18 @@ export async function crawlDirectory(
     if (onProgress) {
       onProgress(crawled, queue.length);
     }
+  }
+
+  const failed = crawled - (reasonCounts.ok || 0);
+  if (failed > 0 || crawled >= pageCap) {
+    const parts: string[] = [];
+    for (const [r, n] of Object.entries(reasonCounts)) {
+      if (n > 0) {
+        const sample = sampleByReason[r] ? ` [e.g. ${sampleByReason[r]}]` : "";
+        parts.push(`${r}=${n}${sample}`);
+      }
+    }
+    log(`    Crawl summary for ${origin}/${rootPath.join("/")} → fetched=${crawled}, queued_remaining=${queue.length}, ${parts.join(", ")}${crawled >= pageCap ? ` (HIT CAP=${pageCap})` : ""}`);
   }
 
   return inventory;
@@ -2115,9 +2205,17 @@ export async function aiMatchUnmatched(
   });
 
   const inventoryUrls: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
+  const inventoryEntries: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
   const activeLangs: TargetLang[] = [];
   for (const l of langs) {
     inventoryUrls[l] = inventories[l] ? Array.from(inventories[l]!.urls) : [];
+    if (inventories[l]) {
+      const titleIdx = inventories[l]!.titleIndex;
+      inventoryEntries[l] = inventoryUrls[l].map(u => {
+        const t = titleIdx.get(u);
+        return t ? `${u}  |  ${t}` : u;
+      });
+    }
     if (inventoryUrls[l].length > 0) activeLangs.push(l);
   }
 
@@ -2179,10 +2277,11 @@ export async function aiMatchUnmatched(
 
     const inventoryBlocks: string[] = [];
     for (const l of activeLangs) {
-      const list = inventoryUrls[l].length <= 500
-        ? inventoryUrls[l].join("\n")
-        : inventoryUrls[l].slice(0, 500).join("\n") + `\n... (${inventoryUrls[l].length - 500} more)`;
-      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs (pick ONLY from this list):\n${list || `(no ${langLabels[l]} inventory available)`}`);
+      const entries = inventoryEntries[l];
+      const list = entries.length <= 500
+        ? entries.join("\n")
+        : entries.slice(0, 500).join("\n") + `\n... (${entries.length - 500} more)`;
+      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs with page titles (pick ONLY the URL part — text after "  |  " is the page title for context):\n${list || `(no ${langLabels[l]} inventory available)`}`);
     }
 
     const usedBlocks = activeLangs.map(l =>
@@ -2195,12 +2294,13 @@ export async function aiMatchUnmatched(
     const systemPrompt = `You are a URL matching expert for a multilingual government website. Your task is to find the correct ${langListText} equivalent pages for Hebrew source URLs.
 
 CRITICAL RULES:
-1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs.
+1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs. Return only the URL part (text before "  |  ") — the text after "  |  " is the page title given for context.
 2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
 3. Each target URL should only be used ONCE across all matches. Do not assign the same target URL to multiple source URLs.
 4. URLs that are already matched should not appear again. Check the "already used" lists.
-5. Focus on matching the page PURPOSE and CONTENT, not just superficial URL similarity.
-6. Pay attention to the URL path structure - pages in the same section should map to the corresponding section in the target language.
+5. PRIMARY signal: compare the source page title (translated) against the candidate page title shown after "  |  " in the inventory. A match should make sense as a same-topic page in the other language. URL slug similarity is only a secondary hint.
+6. The chosen URL MUST start with the target language section root path shown in WEBSITE STRUCTURE. Cross-section matches (e.g. picking a payroll page for a contact-us source) are forbidden.
+7. If the source title is a generic page like "contact us", "home", or "about", only match it to a clearly equivalent target page (same generic concept). When in doubt, return null.
 
 WEBSITE STRUCTURE:
 ${patternContext.join("\n")}
@@ -2284,9 +2384,29 @@ Return ONLY the JSON array, no other text.`;
         let hasMatch = false;
 
         for (const l of langs) {
-          const suggestedUrl = suggestion[suggestionKeys[l]] as string | null | undefined;
+          let suggestedUrl = suggestion[suggestionKeys[l]] as string | null | undefined;
+          if (suggestedUrl && typeof suggestedUrl === "string") {
+            const sepIdx = suggestedUrl.indexOf("  |  ");
+            if (sepIdx > 0) suggestedUrl = suggestedUrl.slice(0, sepIdx).trim();
+          }
           if (suggestedUrl && row.needs[l]) {
-            if (!inventories[l]?.urls.has(suggestedUrl)) {
+            const rootPath = langRoot(tabPatterns, l);
+            const rootBase = rootPath.length > 0 ? "/" + rootPath.join("/") : "";
+            const rootWithSlash = rootBase ? rootBase + "/" : "";
+            let outsideRoot = false;
+            if (rootBase) {
+              try {
+                const parsed = new URL(suggestedUrl);
+                const p = parsed.pathname.toLowerCase().replace(/\/+$/, "");
+                const base = rootBase.toLowerCase().replace(/\/+$/, "");
+                if (p !== base && !parsed.pathname.toLowerCase().startsWith(rootWithSlash.toLowerCase())) {
+                  outsideRoot = true;
+                }
+              } catch { outsideRoot = true; }
+            }
+            if (outsideRoot) {
+              log(`    AI REJECTED (outside ${l.toUpperCase()} root ${rootBase}): ${suggestedUrl}`);
+            } else if (!inventories[l]?.urls.has(suggestedUrl)) {
               log(`    AI REJECTED (not in inventory): ${l.toUpperCase()} ${suggestedUrl}`);
             } else if (usedUrls[l].has(suggestedUrl)) {
               log(`    AI REJECTED (already used): ${l.toUpperCase()} ${suggestedUrl}`);
