@@ -512,7 +512,12 @@ export function constructTargetUrl(
 
     const suffixRule = langSuffixRuleFor(tabPatterns, lang);
     const usedPerPair = !!(bestMapping && bestMatchLen > commonSourceRoot.length);
-    if (suffixRule && !usedPerPair && cleanParts.length > suffixRule.depth) {
+    if (
+      suffixRule &&
+      !usedPerPair &&
+      cleanParts.length > suffixRule.depth &&
+      !cleanParts[suffixRule.depth].toLowerCase().endsWith(suffixRule.suffix.toLowerCase())
+    ) {
       const transformed = cleanParts.map((p, i) => i === suffixRule.depth ? p + suffixRule.suffix : p);
       untranslated = parsed.origin + "/" + [...suffixRule.prefix, ...transformed].join("/");
       const tParts = transformed.map((part, i) => {
@@ -609,7 +614,11 @@ export function constructAllTargetUrls(
     }
 
     const suffixRule = langSuffixRuleFor(tabPatterns, lang);
-    if (suffixRule && cleanParts.length > suffixRule.depth) {
+    if (
+      suffixRule &&
+      cleanParts.length > suffixRule.depth &&
+      !cleanParts[suffixRule.depth].toLowerCase().endsWith(suffixRule.suffix.toLowerCase())
+    ) {
       const transformed = cleanParts.map((p, i) => {
         if (i === suffixRule.depth) return p + suffixRule.suffix;
         return p;
