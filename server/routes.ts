@@ -496,20 +496,9 @@ async function matchTab(
   }
 
   const needsKey: Record<TargetLang, keyof RowData> = { en: "needsEn", fr: "needsFr", ru: "needsRu", ar: "needsAr" };
-  for (const row of needsMatching) {
-    for (const l of langs) {
-      if (row[needsKey[l]]) {
-        const hasAnySource =
-          langRoot(tabPatterns, l).length > 0 ||
-          (tabPatterns.rootMappings.get(l)?.some(m => m.targetRoot.length > 0) ?? false) ||
-          !!tabPatterns.langSuffixRule[l];
-        if (hasAnySource) {
-          for (const url of constructAllTargetUrls(row.sourceUrl, l, tabPatterns)) {
-            seedUrls[l].push(url);
-          }
-        }
-      }
-    }
+  for (const l of langs) {
+    const uniqueSeedCount = new Set(seedUrls[l]).size;
+    log(`  ${langLabels[l]} reference seeds: ${uniqueSeedCount} unique URLs from ${tabRefRows.length} reference rows`);
   }
 
   function normalizeAnchorRoot(anchor: string[]): string[] {
@@ -974,6 +963,20 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
 
   const allLangs: TargetLang[] = ["en", "fr", "ru", "ar"];
   const existingKey: Record<TargetLang, keyof RowData> = { en: "existingEn", fr: "existingFr", ru: "existingRu", ar: "existingAr" };
+
+  const activeLangsForCount: TargetLang[] = allLangs.filter(l => targetLangs.includes(l));
+  let preExistingMatches = 0;
+  for (const tabData of allTabData) {
+    for (const row of tabData.allRows) {
+      const hasAny = activeLangsForCount.some(l => !!(row[existingKey[l]] as string));
+      if (hasAny) preExistingMatches++;
+    }
+  }
+  if (preExistingMatches > 0) {
+    matchedCount = preExistingMatches;
+    log(`Job ${jobId} found ${preExistingMatches} pre-existing match row(s) in upload (counted toward total)`);
+    await storage.updateJob(jobId, { matchedUrls: matchedCount });
+  }
   const needsKey: Record<TargetLang, keyof RowData> = { en: "needsEn", fr: "needsFr", ru: "needsRu", ar: "needsAr" };
   const refUrlKey: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = { en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl" };
 
@@ -1348,21 +1351,23 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       let matchMethodAr: string | null = row.originalAr ? "existing" : null;
 
       if (match) {
-        let rowHasMatch = false;
         if (match.enUrl && !row.originalEn) {
-          enUrl = match.enUrl; confidenceEn = match.confidenceEn; matchMethodEn = match.matchMethodEn; rowHasMatch = true;
+          enUrl = match.enUrl; confidenceEn = match.confidenceEn; matchMethodEn = match.matchMethodEn;
         }
         if (match.frUrl && !row.originalFr) {
-          frUrl = match.frUrl; confidenceFr = match.confidenceFr; matchMethodFr = match.matchMethodFr; rowHasMatch = true;
+          frUrl = match.frUrl; confidenceFr = match.confidenceFr; matchMethodFr = match.matchMethodFr;
         }
         if (match.ruUrl && !row.originalRu) {
-          ruUrl = match.ruUrl; confidenceRu = match.confidenceRu; matchMethodRu = match.matchMethodRu; rowHasMatch = true;
+          ruUrl = match.ruUrl; confidenceRu = match.confidenceRu; matchMethodRu = match.matchMethodRu;
         }
         if (match.arUrl && !row.originalAr) {
-          arUrl = match.arUrl; confidenceAr = match.confidenceAr; matchMethodAr = match.matchMethodAr; rowHasMatch = true;
+          arUrl = match.arUrl; confidenceAr = match.confidenceAr; matchMethodAr = match.matchMethodAr;
         }
-        if (rowHasMatch) finalMatchedCount++;
       }
+
+      const rowFinalUrls: Record<TargetLang, string | null> = { en: enUrl, fr: frUrl, ru: ruUrl, ar: arUrl };
+      const rowHasAnyActive = activeLangsForCount.some(l => !!rowFinalUrls[l]);
+      if (rowHasAnyActive) finalMatchedCount++;
 
       resultBatch.push({
         jobId,
