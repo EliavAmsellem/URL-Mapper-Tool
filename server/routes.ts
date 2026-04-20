@@ -804,6 +804,8 @@ async function matchTab(
           if (method === "title-match" || method === "") taggedMethod = "inventory-title";
           else if (method === "title-section-match") taggedMethod = "inventory-title+section";
           else if (method === "title-disambig") taggedMethod = "inventory-title+disambig";
+          else if (method === "title-semantic") taggedMethod = "inventory-title-semantic";
+          else if (method === "title-semantic+disambig") taggedMethod = "inventory-title-semantic+disambig";
           else taggedMethod = `inventory-${method}`;
           setResultMatch(result, l, tUrl, getResultConf(titleResult, l) || 0, taggedMethod);
           usedUrls[l].add(tUrl);

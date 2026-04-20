@@ -2598,7 +2598,15 @@ export async function titleMatchUnmatched(
     }
   }
 
+  // Process cheap-bearing candidates BEFORE semantic-only candidates so that
+  // semantic-only matches can never claim a URL that a cheap match needs (which
+  // would silently regress the cheap match via the usedUrls/knownUrls dedup).
+  const hasCheapMatch = (c: typeof candidates[number]) =>
+    langs.some(l => c.matches[l] && !((c.matches[l]!.method || "").includes("semantic")));
   candidates.sort((a, b) => {
+    const aCheap = hasCheapMatch(a) ? 1 : 0;
+    const bCheap = hasCheapMatch(b) ? 1 : 0;
+    if (aCheap !== bCheap) return bCheap - aCheap;
     const aConf = Math.max(...langs.map(l => a.matches[l]?.similarity || 0));
     const bConf = Math.max(...langs.map(l => b.matches[l]?.similarity || 0));
     return bConf - aConf;
