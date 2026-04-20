@@ -2112,7 +2112,7 @@ export function matchByTitleSemantic(
           return {
             url: bestPathUrl,
             confidence: confidenceFor(bestSim),
-            method: "title-semantic-disambig",
+            method: "title-semantic+disambig",
             similarity: bestSim,
           };
         }
