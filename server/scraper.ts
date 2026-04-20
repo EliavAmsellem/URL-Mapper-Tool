@@ -2790,17 +2790,26 @@ export async function aiMatchUnmatched(
     if (inventoryUrls[l].length > 0) activeLangs.push(l);
   }
 
-  const exampleLines = matchedExamples.slice(0, 8).map(ex => {
+  // Filter examples to those that include at least one active target language,
+  // so single-language runs aren't distracted by EN/FR pairs.
+  const activeLangSet = new Set(activeLangs);
+  const exampleHasActive = (ex: typeof matchedExamples[number]) =>
+    (activeLangSet.has("en" as TargetLang) && !!ex.enUrl) ||
+    (activeLangSet.has("fr" as TargetLang) && !!ex.frUrl) ||
+    (activeLangSet.has("ru" as TargetLang) && !!ex.ruUrl) ||
+    (activeLangSet.has("ar" as TargetLang) && !!ex.arUrl);
+  const filteredExamples = matchedExamples.filter(exampleHasActive).slice(0, 8);
+  const exampleLines = filteredExamples.map(ex => {
     const parts = [`  Source: ${ex.sourceUrl}`];
-    if (ex.enUrl) parts.push(`  English: ${ex.enUrl}`);
-    if (ex.frUrl) parts.push(`  French: ${ex.frUrl}`);
-    if (ex.ruUrl) parts.push(`  Russian: ${ex.ruUrl}`);
-    if (ex.arUrl) parts.push(`  Arabic: ${ex.arUrl}`);
+    if (ex.enUrl && activeLangSet.has("en" as TargetLang)) parts.push(`  English: ${ex.enUrl}`);
+    if (ex.frUrl && activeLangSet.has("fr" as TargetLang)) parts.push(`  French: ${ex.frUrl}`);
+    if (ex.ruUrl && activeLangSet.has("ru" as TargetLang)) parts.push(`  Russian: ${ex.ruUrl}`);
+    if (ex.arUrl && activeLangSet.has("ar" as TargetLang)) parts.push(`  Arabic: ${ex.arUrl}`);
     return parts.join("\n");
   }).join("\n---\n");
 
   const patternContext: string[] = [];
-  for (const l of langs) {
+  for (const l of activeLangs) {
     const r = langRoot(tabPatterns, l);
     const sr = langSrcRoot(tabPatterns, l);
     if (r.length > 0) {
@@ -2825,6 +2834,15 @@ export async function aiMatchUnmatched(
   for (const l of langs) { for (const u of knownUrls[l]) usedUrls[l].add(u); }
   let aiMatches = 0;
   let consecutiveAuthFailures = 0;
+
+  // Per-language AI telemetry: counts attempts, accepts, and each rejection reason
+  // so prompt tuning is measurable across runs.
+  const aiStats: Record<TargetLang, { attempted: number; accepted: number; rejNull: number; rejNotInInv: number; rejAlreadyUsed: number; rejOutsideRoot: number; rejSection: number }> = {
+    en: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0 },
+    fr: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0 },
+    ru: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0 },
+    ar: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0 },
+  };
 
   const langNeedLabel: Record<TargetLang, string> = { en: "English URL", fr: "French URL", ru: "Russian URL", ar: "Arabic URL" };
 
@@ -2855,9 +2873,42 @@ export async function aiMatchUnmatched(
       inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs with page titles (pick ONLY the URL part — text after "  |  " is the page title for context):\n${list || `(no ${langLabels[l]} inventory available)`}`);
     }
 
-    const usedBlocks = activeLangs.map(l =>
-      `ALREADY USED ${langLabels[l].toUpperCase()} URLs (do NOT reuse these):\n${Array.from(usedUrls[l]).slice(-50).join("\n") || "(none)"}`
-    ).join("\n\n");
+    // Smarter used-URL list per language: always include every generic
+    // "default.aspx" / index page (these are the URLs the model loves to
+    // re-propose as a fallback), then top up with the most-recent N other
+    // URLs up to a per-language cap. Capped to keep prompt size bounded.
+    const USED_PER_LANG_CAP = 300;
+    const usedBlocks = activeLangs.map(l => {
+      const all = Array.from(usedUrls[l]);
+      const isDefault = (u: string) => {
+        // Compare against the URL pathname so query strings and hash fragments
+        // don't hide a generic index page (e.g. ".../Pages/default.aspx?x=1").
+        let path = u;
+        try { path = new URL(u).pathname; }
+        catch { path = u.split("#")[0].split("?")[0]; }
+        return /\/(default\.aspx|index\.aspx)$/i.test(path) || /\/Pages\/?$/i.test(path);
+      };
+      const defaults = all.filter(isDefault);
+      const others = all.filter(u => !isDefault(u));
+      const recentOthers = others.slice(-Math.max(0, USED_PER_LANG_CAP - defaults.length));
+      const combined = [...defaults, ...recentOthers];
+      const truncatedNote = all.length > combined.length
+        ? `\n... (${all.length - combined.length} more already used; not shown to keep prompt small)`
+        : "";
+      return `ALREADY USED ${langLabels[l].toUpperCase()} URLs (do NOT reuse these — ${all.length} total, showing ${combined.length}):\n${combined.join("\n") || "(none)"}${truncatedNote}`;
+    }).join("\n\n");
+
+    // Russian and Arabic addendum: their URL slugs are Latin transliterations
+    // of Hebrew words, not Russian/Arabic. Slug similarity is misleading; the
+    // page title (after "  |  ") is the only reliable signal.
+    const needsTransliterationNote = activeLangs.includes("ru" as TargetLang) || activeLangs.includes("ar" as TargetLang);
+    const transliterationNote = needsTransliterationNote
+      ? `\n\nIMPORTANT FOR RUSSIAN/ARABIC:
+- The Russian and Arabic URL slugs are LATIN transliterations of Hebrew words (e.g. "HarvotBarzelOuestions", "MankIDudQ"), NOT Russian or Arabic words.
+- Do NOT try to read meaning from the URL slug for these languages — it carries almost no signal.
+- Use the page title shown after "  |  " as your PRIMARY (and effectively only) decision signal. The title is in Cyrillic/Arabic and is the human-readable description of the page.
+- Do NOT invent URLs by completing transliteration patterns you see in the inventory. Copy URLs verbatim from the inventory list.`
+      : "";
 
     const langListText = activeLangs.map(l => langLabels[l]).join(", ");
     const jsonFields = activeLangs.map(l => `- "${suggestionKeys[l]}": the matching ${langLabels[l]} URL from the inventory, or null if no confident match`).join("\n");
@@ -2865,19 +2916,20 @@ export async function aiMatchUnmatched(
     const systemPrompt = `You are a URL matching expert for a multilingual government website. Your task is to find the correct ${langListText} equivalent pages for Hebrew source URLs.
 
 CRITICAL RULES:
-1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs. Return only the URL part (text before "  |  ") — the text after "  |  " is the page title given for context.
+1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs. Return only the URL part (text before "  |  ") — the text after "  |  " is the page title given for context. If a URL you want is not character-for-character in the inventory, return null.
 2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
 3. Each target URL should only be used ONCE across all matches. Do not assign the same target URL to multiple source URLs.
-4. URLs that are already matched should not appear again. Check the "already used" lists.
+4. URLs that are already matched should not appear again. Check the "already used" lists carefully — a URL appearing there must NEVER be returned.
 5. PRIMARY signal: compare the source page title (translated) against the candidate page title shown after "  |  " in the inventory. A match should make sense as a same-topic page in the other language. URL slug similarity is only a secondary hint.
 6. The chosen URL MUST start with the target language section root path shown in WEBSITE STRUCTURE. Cross-section matches (e.g. picking a payroll page for a contact-us source) are forbidden.
 7. If the source title is a generic page like "contact us", "home", or "about", only match it to a clearly equivalent target page (same generic concept). When in doubt, return null.
+8. NEVER fall back to a section's index page (URLs ending in "/Pages/default.aspx", "/default.aspx", or "/Pages/") just because nothing more specific looks plausible. Index pages should only be returned when the SOURCE itself is clearly the section's index page (matching title like "default" / "home" / the section name). Otherwise return null.${transliterationNote}
 
 WEBSITE STRUCTURE:
 ${patternContext.join("\n")}
 
 EXAMPLES OF CORRECTLY MATCHED PAIRS:
-${exampleLines}
+${exampleLines || "(no examples available)"}
 
 ${usedBlocks}`;
 
@@ -2945,6 +2997,17 @@ Return ONLY the JSON array, no other text.`;
       }
 
       let batchMatches = 0;
+
+      // Count attempts up-front from the batch (not from model suggestions),
+      // so rows the model omits entirely are still counted. Track handled
+      // (sourceUrl, lang) keys; anything left unhandled at batch end is a null reject.
+      const handled: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
+      for (const r of batch) {
+        for (const l of langs) {
+          if (r.needs[l]) aiStats[l].attempted++;
+        }
+      }
+
       for (const suggestion of suggestions) {
         if (!suggestion.sourceUrl) continue;
 
@@ -2960,7 +3023,12 @@ Return ONLY the JSON array, no other text.`;
             const sepIdx = suggestedUrl.indexOf("  |  ");
             if (sepIdx > 0) suggestedUrl = suggestedUrl.slice(0, sepIdx).trim();
           }
-          if (suggestedUrl && row.needs[l]) {
+          if (row.needs[l]) {
+            handled[l].add(row.sourceUrl);
+            if (!suggestedUrl) {
+              aiStats[l].rejNull++;
+              continue;
+            }
             const rootPath = langRoot(tabPatterns, l);
             const rootBase = rootPath.length > 0 ? "/" + rootPath.join("/") : "";
             const rootWithSlash = rootBase ? rootBase + "/" : "";
@@ -2977,15 +3045,20 @@ Return ONLY the JSON array, no other text.`;
             }
             if (outsideRoot) {
               log(`    AI REJECTED (outside ${l.toUpperCase()} root ${rootBase}): ${suggestedUrl}`);
+              aiStats[l].rejOutsideRoot++;
             } else if (!inventories[l]?.urls.has(suggestedUrl)) {
               log(`    AI REJECTED (not in inventory): ${l.toUpperCase()} ${suggestedUrl}`);
+              aiStats[l].rejNotInInv++;
             } else if (usedUrls[l].has(suggestedUrl)) {
               log(`    AI REJECTED (already used): ${l.toUpperCase()} ${suggestedUrl}`);
+              aiStats[l].rejAlreadyUsed++;
             } else if (!validateSectionContext(suggestedUrl, row.sourceUrl, l, tabPatterns)) {
               log(`    AI REJECTED (section/category mismatch with source): ${l.toUpperCase()} ${suggestedUrl} ⟵ ${row.sourceUrl}`);
+              aiStats[l].rejSection++;
             } else {
               setResultMatch(result, l, suggestedUrl, 82, "ai-match");
               usedUrls[l].add(suggestedUrl);
+              aiStats[l].accepted++;
               hasMatch = true;
             }
           }
@@ -2997,6 +3070,16 @@ Return ONLY the JSON array, no other text.`;
           if (suggestion.reasoning) {
             const matchSummary = langs.map(l => `${l.toUpperCase()}:${getResultUrl(result, l) || "null"}`).join(" ");
             log(`    AI match: ${row.sourceUrl} -> ${matchSummary} (${suggestion.reasoning})`);
+          }
+        }
+      }
+
+      // Any (row, lang) pair we needed but the model never returned in its
+      // suggestions counts as a null reject (silent omission).
+      for (const r of batch) {
+        for (const l of langs) {
+          if (r.needs[l] && !handled[l].has(r.sourceUrl)) {
+            aiStats[l].rejNull++;
           }
         }
       }
@@ -3013,5 +3096,12 @@ Return ONLY the JSON array, no other text.`;
   }
 
   log(`  AI matching complete: ${aiMatches} total matches from ${unmatchedRows.length} unmatched URLs`);
+  for (const l of activeLangs) {
+    const s = aiStats[l];
+    if (s.attempted === 0) continue;
+    const accountedFor = s.accepted + s.rejNull + s.rejNotInInv + s.rejAlreadyUsed + s.rejOutsideRoot + s.rejSection;
+    const invariantNote = accountedFor === s.attempted ? "" : ` [WARN: counter drift, accounted=${accountedFor} != attempted]`;
+    log(`    AI ${l.toUpperCase()} stats: attempted=${s.attempted} accepted=${s.accepted} | rejected: null=${s.rejNull}, not-in-inv=${s.rejNotInInv}, already-used=${s.rejAlreadyUsed}, outside-root=${s.rejOutsideRoot}, section-mismatch=${s.rejSection}${invariantNote}`);
+  }
   return results;
 }
