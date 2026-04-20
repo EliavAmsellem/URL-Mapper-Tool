@@ -966,6 +966,7 @@ export interface CrawlInventory {
   tailIndex: Map<string, string[]>;
   titleIndex: Map<string, string>;
   lastSegWordIndex: Map<string, Set<string>>;
+  titleEmbeddings?: Map<string, number[]>;
 }
 
 export function mergeInventories(invs: (CrawlInventory | null | undefined)[]): CrawlInventory | null {
@@ -994,6 +995,12 @@ export function mergeInventories(invs: (CrawlInventory | null | undefined)[]): C
     }
     for (const [k, v] of Array.from(inv.titleIndex)) {
       if (!merged.titleIndex.has(k)) merged.titleIndex.set(k, v);
+    }
+    if (inv.titleEmbeddings && inv.titleEmbeddings.size > 0) {
+      if (!merged.titleEmbeddings) merged.titleEmbeddings = new Map();
+      for (const [k, v] of Array.from(inv.titleEmbeddings)) {
+        if (!merged.titleEmbeddings.has(k)) merged.titleEmbeddings.set(k, v);
+      }
     }
     for (const [k, set] of Array.from(inv.lastSegWordIndex)) {
       let cur = merged.lastSegWordIndex.get(k);
@@ -1943,6 +1950,198 @@ function titleSimilarity(a: string, b: string): number {
   return Math.min(jaccard + containsBonus, 1.0);
 }
 
+// ---- Semantic title matching (multilingual embeddings) ----
+const EMBED_MODEL = "text-embedding-3-small";
+const EMBED_BATCH_SIZE = 1024;
+const EMBED_TOTAL_CAP = 50000;
+const EMBED_PRICE_PER_M_TOKENS = 0.02;
+const titleEmbeddingCache = new Map<string, number[]>();
+let _embedClient: OpenAI | null = null;
+let _embedClientChecked = false;
+
+function getEmbedClient(): OpenAI | null {
+  if (_embedClientChecked) return _embedClient;
+  _embedClientChecked = true;
+  const apiKey = process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
+  if (!apiKey) {
+    log(`  [embed] OPENAI_API_KEY missing — semantic title matching disabled`);
+    return null;
+  }
+  _embedClient = new OpenAI({
+    apiKey,
+    ...(process.env.OPENAI_API_KEY ? {} : { baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL }),
+  });
+  return _embedClient;
+}
+
+export function isSemanticEnabled(): boolean {
+  if (process.env.LINGUAMAP_DISABLE_SEMANTIC === "1") return false;
+  return !!(process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY);
+}
+
+export async function embedTitles(
+  texts: string[],
+  signal?: AbortSignal,
+): Promise<{ map: Map<string, number[]>; tokensUsed: number }> {
+  const map = new Map<string, number[]>();
+  const uniq = Array.from(new Set(texts.map(t => t?.trim()).filter((t): t is string => !!t && t.length > 0)));
+  const need: string[] = [];
+  for (const t of uniq) {
+    const cached = titleEmbeddingCache.get(t);
+    if (cached) map.set(t, cached);
+    else need.push(t);
+  }
+  if (need.length === 0) return { map, tokensUsed: 0 };
+  const client = getEmbedClient();
+  if (!client) return { map, tokensUsed: 0 };
+
+  let totalTokens = 0;
+  for (let i = 0; i < need.length; i += EMBED_BATCH_SIZE) {
+    if (signal?.aborted) break;
+    const batch = need.slice(i, i + EMBED_BATCH_SIZE);
+    let attempt = 0;
+    let success = false;
+    while (attempt < 2 && !success) {
+      try {
+        const resp = await client.embeddings.create({ model: EMBED_MODEL, input: batch });
+        for (let k = 0; k < batch.length; k++) {
+          const vec = resp.data[k]?.embedding;
+          if (vec && Array.isArray(vec)) {
+            titleEmbeddingCache.set(batch[k], vec);
+            map.set(batch[k], vec);
+          }
+        }
+        totalTokens += resp.usage?.total_tokens || 0;
+        success = true;
+      } catch (e: any) {
+        attempt++;
+        if (attempt >= 2) {
+          log(`  [embed] batch failed after retry: ${e?.message || e}`);
+          break;
+        }
+        await abortAwareSleep(500, signal);
+      }
+    }
+  }
+  return { map, tokensUsed: totalTokens };
+}
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  const n = Math.min(a.length, b.length);
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < n; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na === 0 || nb === 0) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+export function matchByTitleSemantic(
+  sourceEmbedding: number[],
+  inventory: CrawlInventory,
+  minCosine: number = 0.55,
+  allowedRoots?: string[],
+  refDepths?: number[],
+  sourceSegments?: Set<string>,
+): TitleMatchResult | null {
+  if (!inventory.titleEmbeddings || inventory.titleEmbeddings.size === 0) return null;
+
+  const minDepth = refDepths && refDepths.length > 0 ? Math.min(...refDepths) - 2 : 0;
+  const maxDepth = refDepths && refDepths.length > 0 ? Math.max(...refDepths) + 2 : Infinity;
+
+  let bestUrl: string | null = null;
+  let bestSim = minCosine;
+  let secondBestSim = 0;
+  const scored: Array<{ url: string; sim: number }> = [];
+
+  inventory.titleIndex.forEach((pageTitle, url) => {
+    if (allowedRoots && allowedRoots.length > 0) {
+      try {
+        const urlPath = new URL(url).pathname.toLowerCase();
+        if (!allowedRoots.some(r => urlPath.startsWith(r.toLowerCase()))) return;
+      } catch { return; }
+    }
+    if (refDepths && refDepths.length > 0) {
+      try {
+        const urlParts = new URL(url).pathname.split("/").filter(Boolean);
+        if (urlParts.length < minDepth || urlParts.length > maxDepth) return;
+      } catch { return; }
+    }
+    const vec = inventory.titleEmbeddings!.get(pageTitle);
+    if (!vec) return;
+    const sim = cosineSimilarity(sourceEmbedding, vec);
+    scored.push({ url, sim });
+    if (sim > bestSim) {
+      secondBestSim = bestSim;
+      bestSim = sim;
+      bestUrl = url;
+    } else if (sim > secondBestSim) {
+      secondBestSim = sim;
+    }
+  });
+
+  if (!bestUrl) return null;
+
+  const confidenceFor = (s: number) => Math.min(Math.round(70 + s * 25), 95);
+
+  const gap = bestSim - secondBestSim;
+  if (gap < 0.03 && bestSim < 0.85) {
+    if (sourceSegments && sourceSegments.size > 0) {
+      const close = scored.filter(s => s.sim >= bestSim - 0.03);
+      if (close.length >= 2) {
+        let bestPathScore = -1, bestPathUrl: string | null = null, pathTied = 0;
+        for (const { url } of close) {
+          try {
+            const urlSegs = new Set(new URL(url).pathname.split("/").filter(Boolean).map(s => normalizeSegment(s)));
+            let shared = 0;
+            for (const s of sourceSegments) if (urlSegs.has(s)) shared++;
+            if (shared > bestPathScore) { bestPathScore = shared; bestPathUrl = url; pathTied = 1; }
+            else if (shared === bestPathScore) pathTied++;
+          } catch {}
+        }
+        if (pathTied === 1 && bestPathUrl && bestPathScore > 0) {
+          log(`    Semantic match DISAMBIGUATED (path segments): cos=${bestSim.toFixed(3)} -> ${bestPathUrl} (${bestPathScore} shared segs)`);
+          return {
+            url: bestPathUrl,
+            confidence: confidenceFor(bestSim),
+            method: "title-semantic-disambig",
+            similarity: bestSim,
+          };
+        }
+      }
+    }
+    log(`    Semantic match REJECTED (ambiguous): best=${bestSim.toFixed(3)} second=${secondBestSim.toFixed(3)} gap=${gap.toFixed(3)}`);
+    return null;
+  }
+
+  if (sourceSegments && sourceSegments.size > 0) {
+    const allNonLatin = Array.from(sourceSegments).every(seg => /[^\x00-\x7F]/.test(seg));
+    if (!allNonLatin) {
+      try {
+        const matchParts = new URL(bestUrl).pathname.split("/").filter(Boolean);
+        const matchNorms = matchParts.map(p => normalizeSegment(p));
+        let shared = 0;
+        for (const seg of matchNorms) if (sourceSegments.has(seg)) shared++;
+        if (shared === 0 && matchNorms.length > 2 && bestSim < 0.65) {
+          log(`    Semantic match REJECTED (no shared segments AND cos<0.65): "${bestUrl}" cos=${bestSim.toFixed(3)}`);
+          return null;
+        }
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  return {
+    url: bestUrl,
+    confidence: confidenceFor(bestSim),
+    method: "title-semantic",
+    similarity: bestSim,
+  };
+}
+
 
 async function translateWithGTX(text: string, source: string, target: string, signal?: AbortSignal): Promise<string | null> {
   if (signal?.aborted) return null;
@@ -2258,7 +2457,63 @@ export async function titleMatchUnmatched(
     }
   }
 
+  // ---- Semantic embeddings prep (per-language; pivots through GTX translation) ----
+  // Embed the GTX-translated source title and the inventory titles in the SAME
+  // target language. Same-language cosine is far sharper than cross-lingual
+  // HE↔target (which we measured at ~0.4 even for true matches).
+  const translatedEmbeddings: Record<TargetLang, Map<string, number[]>> = {
+    en: new Map(), fr: new Map(), ru: new Map(), ar: new Map(),
+  };
+  let semanticActive = false;
+  let semanticTokens = 0;
+  if (isSemanticEnabled()) {
+    let inventoryTitleCount = 0;
+    let translatedTitleCount = 0;
+    for (const lang of langs) {
+      const inv = inventories[lang];
+      if (inv && inv.titleIndex.size > 0) inventoryTitleCount += inv.titleIndex.size;
+      translatedTitleCount += new Set(Array.from(translations[lang].values()).filter(Boolean)).size;
+    }
+    // Cumulative job-level guard: titleEmbeddingCache persists across passes/tabs,
+    // so its size is the true cumulative count of titles embedded so far for the
+    // life of the process (covers concurrent passes within one job).
+    const cacheBefore = titleEmbeddingCache.size;
+    if (cacheBefore >= EMBED_TOTAL_CAP) {
+      log(`  Semantic title-match SKIPPED: cumulative embedded titles (${cacheBefore}) reached cap of ${EMBED_TOTAL_CAP}`);
+    } else if (translatedTitleCount + inventoryTitleCount + cacheBefore > EMBED_TOTAL_CAP) {
+      log(`  Semantic title-match SKIPPED: would exceed cumulative cap (have ${cacheBefore}, would add up to ${translatedTitleCount + inventoryTitleCount}, cap ${EMBED_TOTAL_CAP})`);
+    } else {
+      for (const lang of langs) {
+        if (signal?.aborted) break;
+        const inv = inventories[lang];
+        const roots = allowedRoots?.[lang];
+        if (!inv || inv.titleIndex.size === 0 || !roots || roots.length === 0) continue;
+        if (!unmatchedRows.some(r => r.needs[lang])) continue;
+        if (translations[lang].size === 0) continue;
+
+        if (!inv.titleEmbeddings || inv.titleEmbeddings.size === 0) {
+          const titles = Array.from(new Set(Array.from(inv.titleIndex.values())));
+          const invRes = await embedTitles(titles, signal);
+          inv.titleEmbeddings = invRes.map;
+          semanticTokens += invRes.tokensUsed;
+          log(`  Semantic title-match: ${invRes.map.size} ${langNames[lang]} inventory titles embedded`);
+        }
+
+        const translatedTexts = Array.from(new Set(Array.from(translations[lang].values()).filter(Boolean)));
+        if (translatedTexts.length > 0) {
+          const tRes = await embedTitles(translatedTexts, signal);
+          translatedEmbeddings[lang] = tRes.map;
+          semanticTokens += tRes.tokensUsed;
+          log(`  Semantic title-match: ${tRes.map.size} translated ${langNames[lang]} source titles embedded`);
+          if (tRes.map.size > 0) semanticActive = true;
+        }
+      }
+    }
+  }
+
   let titleMatches = 0;
+  let semanticAccepted = 0;
+  let semanticAttempted = 0;
   let rejected = { ambiguous: 0, noSegments: 0, depth: 0, crossValidation: 0, knownUrl: 0 };
   const usedUrls: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
 
@@ -2290,6 +2545,26 @@ export async function titleMatchUnmatched(
           const minSim = (lang === "ru" || lang === "ar") ? 0.55 : 0.60;
           rowMatches[lang] = matchByTitle(translated, inv, minSim, roots, refDepths?.[lang], sourceSegments);
           if (rowMatches[lang]) hasMatch = true;
+        }
+
+        // Semantic fallback: only if cheap pass produced nothing for this row+lang.
+        // Pivot through the GTX translation so cosine is same-language (sharp),
+        // not cross-lingual HE↔target (much weaker).
+        if (!rowMatches[lang] && semanticActive && inv.titleEmbeddings && inv.titleEmbeddings.size > 0 && translated) {
+          const trKey = translated.trim();
+          const trEmb = translatedEmbeddings[lang].get(trKey);
+          if (trEmb) {
+            semanticAttempted++;
+            const minCos = (lang === "ru" || lang === "ar") ? 0.55 : 0.58;
+            const semMatch = matchByTitleSemantic(trEmb, inv, minCos, roots, refDepths?.[lang], sourceSegments);
+            if (semMatch) {
+              rowMatches[lang] = semMatch;
+              hasMatch = true;
+              // Note: semanticAccepted is NOT incremented here — only after the
+              // match survives cross-validation, knownUrl filter, and dedup at
+              // setResultMatch time below.
+            }
+          }
         }
       }
     }
@@ -2332,17 +2607,40 @@ export async function titleMatchUnmatched(
             }
           }
           if (tailOverlap === 0 && tails[la].length > 0 && tails[lb].length > 0) {
-            log(`    Cross-validation REJECTED BOTH: ${la.toUpperCase()} "${m[la]!.url}" vs ${lb.toUpperCase()} "${m[lb]!.url}" (no tail overlap)`);
-            m[la] = null;
-            m[lb] = null;
-            rejected.crossValidation += 2;
+            // Protect cheap-pass matches from being nulled by a newly-added
+            // semantic candidate. Pre-semantic, the cheap match would have
+            // survived alone; adding semantic must not regress it.
+            const aSem = (m[la]!.method || "").includes("semantic");
+            const bSem = (m[lb]!.method || "").includes("semantic");
+            if (aSem && !bSem) {
+              log(`    Cross-validation REJECTED ${la.toUpperCase()} (semantic) vs ${lb.toUpperCase()} (cheap kept): "${m[la]!.url}"`);
+              m[la] = null;
+              rejected.crossValidation++;
+            } else if (bSem && !aSem) {
+              log(`    Cross-validation REJECTED ${lb.toUpperCase()} (semantic) vs ${la.toUpperCase()} (cheap kept): "${m[lb]!.url}"`);
+              m[lb] = null;
+              rejected.crossValidation++;
+            } else {
+              log(`    Cross-validation REJECTED BOTH: ${la.toUpperCase()} "${m[la]!.url}" vs ${lb.toUpperCase()} "${m[lb]!.url}" (no tail overlap)`);
+              m[la] = null;
+              m[lb] = null;
+              rejected.crossValidation += 2;
+            }
           }
         }
       }
 
       for (const l of matchedLangs) {
-        if (m[l] && m[l]!.similarity < 0.60) {
-          log(`    Paired ${l.toUpperCase()} REJECTED (similarity ${m[l]!.similarity.toFixed(3)} < 0.60): "${m[l]!.url}"`);
+        if (!m[l]) continue;
+        const isSem = (m[l]!.method || "").includes("semantic");
+        // Cheap matches that survived their single-lang threshold (e.g. RU>=0.55)
+        // should not be nulled merely because semantic added another language.
+        // Apply the stricter paired threshold only to semantic candidates and to
+        // cheap matches that were already paired with another cheap match.
+        const otherCheapPresent = matchedLangs.some(o => o !== l && m[o] && !((m[o]!.method || "").includes("semantic")));
+        const shouldGate = isSem || (!isSem && otherCheapPresent);
+        if (shouldGate && m[l]!.similarity < 0.60) {
+          log(`    Paired ${l.toUpperCase()} REJECTED (similarity ${m[l]!.similarity.toFixed(3)} < 0.60, method=${m[l]!.method}): "${m[l]!.url}"`);
           m[l] = null;
           rejected.crossValidation++;
         }
@@ -2370,6 +2668,7 @@ export async function titleMatchUnmatched(
           setResultMatch(result, lang, match.url, match.confidence, match.method);
           usedUrls[lang].add(match.url);
           hasResult = true;
+          if ((match.method || "").includes("semantic")) semanticAccepted++;
         }
       }
     }
@@ -2383,6 +2682,10 @@ export async function titleMatchUnmatched(
   const usedSummary = langs.map(l => `${usedUrls[l].size} ${l.toUpperCase()}`).join(", ");
   log(`  Title matching found ${titleMatches} new matches (${usedSummary} unique URLs)`);
   log(`  Title rejections: ambiguous=${rejected.ambiguous}, noSharedSegments=${rejected.noSegments}, crossValidation=${rejected.crossValidation}, knownUrl=${rejected.knownUrl}`);
+  if (semanticActive) {
+    const cost = (semanticTokens / 1_000_000) * EMBED_PRICE_PER_M_TOKENS;
+    log(`  Semantic title-match: ${semanticAccepted} accepted out of ${semanticAttempted} attempted (~${semanticTokens} tokens, ~$${cost.toFixed(4)})`);
+  }
   return results;
 }
 
