@@ -641,8 +641,9 @@ export function constructTargetUrl(
       }
     }
 
-    if (bestMapping && bestMatchLen > commonSourceRoot.length) {
-      targetRoot = bestMapping.targetRoot;
+    const usedPerPair = !!bestMapping;
+    if (usedPerPair) {
+      targetRoot = bestMapping!.targetRoot;
       remaining = cleanParts.slice(bestMatchLen);
       if (targetRoot.length > 0 && targetRoot[targetRoot.length - 1].toLowerCase().endsWith(".aspx") && remaining.length > 0) {
         targetRoot = targetRoot.slice(0, -1);
@@ -676,7 +677,6 @@ export function constructTargetUrl(
     let translated = parsed.origin + "/" + [...targetRoot, ...translatedParts].join("/");
 
     const suffixRule = langSuffixRuleFor(tabPatterns, lang);
-    const usedPerPair = !!(bestMapping && bestMatchLen > commonSourceRoot.length);
     if (
       suffixRule &&
       !usedPerPair &&
