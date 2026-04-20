@@ -2483,10 +2483,11 @@ export async function titleMatchUnmatched(
       log(`  Semantic title-match SKIPPED: OPENAI_API_KEY not configured`);
     }
   } else {
-    // Per-job guard: count only titles NOT already in the cache (i.e., titles
-    // this job would need to embed). This matches "per-job" semantics in the
-    // common case (one job per server lifetime) without spuriously suppressing
-    // later jobs in long-lived processes.
+    // Per-job guard: cap is on titles NEW to this run that we'd need to actually
+    // embed (i.e., titles not already cached). Cached titles cost no API tokens
+    // so they don't count toward the budget. This matches "per-job" semantics
+    // in the common case (one job per server lifetime) without spuriously
+    // suppressing later jobs in long-lived processes that have warm caches.
     let inventoryToEmbed = 0;
     let translatedToEmbed = 0;
     for (const lang of langs) {
