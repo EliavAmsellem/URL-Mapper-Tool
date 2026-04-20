@@ -700,6 +700,13 @@ export function constructTargetUrl(
       translated = parsed.origin + "/" + [...suffixRule.prefix, ...tParts].join("/");
     }
 
+    if (suffixRule) {
+      const suffixed = appendFilenameSuffix(untranslated, suffixRule.suffix);
+      if (suffixed) untranslated = suffixed;
+      const tSuffixed = appendFilenameSuffix(translated, suffixRule.suffix);
+      if (tSuffixed) translated = tSuffixed;
+    }
+
     return {
       translated: translated !== untranslated ? translated : null,
       untranslated,
@@ -707,6 +714,26 @@ export function constructTargetUrl(
   } catch {}
 
   return { translated: null, untranslated: null };
+}
+
+const FILENAME_EXT_RE = /^(.+)\.(aspx|html?|ashx)$/i;
+
+function appendFilenameSuffix(url: string, suffix: string): string | null {
+  try {
+    const u = new URL(url);
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts.length === 0) return null;
+    const last = parts[parts.length - 1];
+    const m = last.match(FILENAME_EXT_RE);
+    if (!m) return null;
+    const stem = m[1];
+    const ext = m[2];
+    if (stem.toLowerCase().endsWith(suffix.toLowerCase())) return null;
+    parts[parts.length - 1] = `${stem}${suffix}.${ext}`;
+    return u.origin + "/" + parts.join("/");
+  } catch {
+    return null;
+  }
 }
 
 export function constructAllTargetUrls(
@@ -750,6 +777,7 @@ export function constructAllTargetUrls(
     };
 
     const pairMappings = tabPatterns.rootMappings.get(lang) || [];
+    let perPairMatched = false;
     for (const mapping of pairMappings) {
       let matchLen = 0;
       for (let i = 0; i < mapping.sourceRoot.length && i < cleanParts.length; i++) {
@@ -761,25 +789,29 @@ export function constructAllTargetUrls(
       }
       if (matchLen === mapping.sourceRoot.length && matchLen >= commonSourceRoot.length) {
         buildUrl(mapping.targetRoot, cleanParts.slice(matchLen));
+        perPairMatched = true;
       }
     }
 
-    if (commonSourceRoot.length > 0) {
-      let matchLen = 0;
-      for (let i = 0; i < commonSourceRoot.length && i < cleanParts.length; i++) {
-        if (normalizeSegment(cleanParts[i]) === normalizeSegment(commonSourceRoot[i])) {
-          matchLen++;
-        } else {
-          break;
+    if (!perPairMatched) {
+      if (commonSourceRoot.length > 0) {
+        let matchLen = 0;
+        for (let i = 0; i < commonSourceRoot.length && i < cleanParts.length; i++) {
+          if (normalizeSegment(cleanParts[i]) === normalizeSegment(commonSourceRoot[i])) {
+            matchLen++;
+          } else {
+            break;
+          }
         }
+        buildUrl(commonTargetRoot, cleanParts.slice(matchLen));
+      } else {
+        buildUrl(commonTargetRoot, cleanParts);
       }
-      buildUrl(commonTargetRoot, cleanParts.slice(matchLen));
-    } else {
-      buildUrl(commonTargetRoot, cleanParts);
     }
 
     const suffixRule = langSuffixRuleFor(tabPatterns, lang);
     if (
+      !perPairMatched &&
       suffixRule &&
       cleanParts.length > suffixRule.depth &&
       !cleanParts[suffixRule.depth].toLowerCase().endsWith(suffixRule.suffix.toLowerCase())
@@ -807,6 +839,14 @@ export function constructAllTargetUrls(
         });
         const tCandidate2 = parsed.origin + "/" + [...suffixRule.prefix, ...translatedAll].join("/");
         if (tCandidate2 !== candidate && tCandidate2 !== tCandidate1) candidates.add(tCandidate2);
+      }
+    }
+
+    if (suffixRule) {
+      const existing = Array.from(candidates);
+      for (const c of existing) {
+        const suffixed = appendFilenameSuffix(c, suffixRule.suffix);
+        if (suffixed) candidates.add(suffixed);
       }
     }
   } catch {}
