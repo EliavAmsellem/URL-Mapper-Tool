@@ -2466,22 +2466,34 @@ export async function titleMatchUnmatched(
   };
   let semanticActive = false;
   let semanticTokens = 0;
-  if (isSemanticEnabled()) {
-    let inventoryTitleCount = 0;
-    let translatedTitleCount = 0;
+  const semAcceptedByLang: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  const semAttemptedByLang: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  if (!isSemanticEnabled()) {
+    if (process.env.LINGUAMAP_DISABLE_SEMANTIC === "1") {
+      log(`  Semantic title-match SKIPPED: LINGUAMAP_DISABLE_SEMANTIC=1`);
+    } else {
+      log(`  Semantic title-match SKIPPED: OPENAI_API_KEY not configured`);
+    }
+  } else {
+    // Per-job guard: count only titles NOT already in the cache (i.e., titles
+    // this job would need to embed). This matches "per-job" semantics in the
+    // common case (one job per server lifetime) without spuriously suppressing
+    // later jobs in long-lived processes.
+    let inventoryToEmbed = 0;
+    let translatedToEmbed = 0;
     for (const lang of langs) {
       const inv = inventories[lang];
-      if (inv && inv.titleIndex.size > 0) inventoryTitleCount += inv.titleIndex.size;
-      translatedTitleCount += new Set(Array.from(translations[lang].values()).filter(Boolean)).size;
+      if (inv && inv.titleIndex.size > 0) {
+        for (const t of new Set(inv.titleIndex.values())) {
+          if (t && !titleEmbeddingCache.has(t.trim())) inventoryToEmbed++;
+        }
+      }
+      for (const t of new Set(Array.from(translations[lang].values()).filter(Boolean))) {
+        if (!titleEmbeddingCache.has(t.trim())) translatedToEmbed++;
+      }
     }
-    // Cumulative job-level guard: titleEmbeddingCache persists across passes/tabs,
-    // so its size is the true cumulative count of titles embedded so far for the
-    // life of the process (covers concurrent passes within one job).
-    const cacheBefore = titleEmbeddingCache.size;
-    if (cacheBefore >= EMBED_TOTAL_CAP) {
-      log(`  Semantic title-match SKIPPED: cumulative embedded titles (${cacheBefore}) reached cap of ${EMBED_TOTAL_CAP}`);
-    } else if (translatedTitleCount + inventoryTitleCount + cacheBefore > EMBED_TOTAL_CAP) {
-      log(`  Semantic title-match SKIPPED: would exceed cumulative cap (have ${cacheBefore}, would add up to ${translatedTitleCount + inventoryTitleCount}, cap ${EMBED_TOTAL_CAP})`);
+    if (inventoryToEmbed + translatedToEmbed > EMBED_TOTAL_CAP) {
+      log(`  Semantic title-match SKIPPED: would embed ${inventoryToEmbed + translatedToEmbed} new titles this job (cap ${EMBED_TOTAL_CAP})`);
     } else {
       for (const lang of langs) {
         if (signal?.aborted) break;
@@ -2555,6 +2567,7 @@ export async function titleMatchUnmatched(
           const trEmb = translatedEmbeddings[lang].get(trKey);
           if (trEmb) {
             semanticAttempted++;
+            semAttemptedByLang[lang]++;
             const minCos = (lang === "ru" || lang === "ar") ? 0.55 : 0.58;
             const semMatch = matchByTitleSemantic(trEmb, inv, minCos, roots, refDepths?.[lang], sourceSegments);
             if (semMatch) {
@@ -2668,7 +2681,10 @@ export async function titleMatchUnmatched(
           setResultMatch(result, lang, match.url, match.confidence, match.method);
           usedUrls[lang].add(match.url);
           hasResult = true;
-          if ((match.method || "").includes("semantic")) semanticAccepted++;
+          if ((match.method || "").includes("semantic")) {
+            semanticAccepted++;
+            semAcceptedByLang[lang]++;
+          }
         }
       }
     }
@@ -2684,7 +2700,11 @@ export async function titleMatchUnmatched(
   log(`  Title rejections: ambiguous=${rejected.ambiguous}, noSharedSegments=${rejected.noSegments}, crossValidation=${rejected.crossValidation}, knownUrl=${rejected.knownUrl}`);
   if (semanticActive) {
     const cost = (semanticTokens / 1_000_000) * EMBED_PRICE_PER_M_TOKENS;
-    log(`  Semantic title-match: ${semanticAccepted} accepted out of ${semanticAttempted} attempted (~${semanticTokens} tokens, ~$${cost.toFixed(4)})`);
+    const perLang = langs
+      .filter(l => semAttemptedByLang[l] > 0)
+      .map(l => `${l.toUpperCase()}=${semAcceptedByLang[l]}/${semAttemptedByLang[l]}`)
+      .join(", ");
+    log(`  Semantic title-match: ${semanticAccepted} accepted out of ${semanticAttempted} attempted [${perLang || "none"}] (~${semanticTokens} tokens, ~$${cost.toFixed(4)})`);
   }
   return results;
 }
