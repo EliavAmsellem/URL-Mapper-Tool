@@ -2474,6 +2474,8 @@ export async function titleMatchUnmatched(
   let semanticTokens = 0;
   const semAcceptedByLang: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
   const semAttemptedByLang: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  const semCosineSumByLang: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  let semRejectedThreshold = 0;
   if (!isSemanticEnabled()) {
     if (process.env.LINGUAMAP_DISABLE_SEMANTIC === "1") {
       log(`  Semantic title-match SKIPPED: LINGUAMAP_DISABLE_SEMANTIC=1`);
@@ -2577,11 +2579,14 @@ export async function titleMatchUnmatched(
             const minCos = (lang === "ru" || lang === "ar") ? 0.55 : 0.58;
             const semMatch = matchByTitleSemantic(trEmb, inv, minCos, roots, refDepths?.[lang], sourceSegments);
             if (semMatch) {
-              rowMatches[lang] = semMatch;
-              hasMatch = true;
               // Note: semanticAccepted is NOT incremented here — only after the
               // match survives cross-validation, knownUrl filter, and dedup at
               // setResultMatch time below.
+              semCosineSumByLang[lang] += semMatch.similarity;
+              rowMatches[lang] = semMatch;
+              hasMatch = true;
+            } else {
+              semRejectedThreshold++;
             }
           }
         }
@@ -2708,9 +2713,15 @@ export async function titleMatchUnmatched(
     const cost = (semanticTokens / 1_000_000) * EMBED_PRICE_PER_M_TOKENS;
     const perLang = langs
       .filter(l => semAttemptedByLang[l] > 0)
-      .map(l => `${l.toUpperCase()}=${semAcceptedByLang[l]}/${semAttemptedByLang[l]}`)
+      .map(l => {
+        const accepted = semAcceptedByLang[l];
+        const attempted = semAttemptedByLang[l];
+        const meanCos = accepted > 0 ? (semCosineSumByLang[l] / accepted).toFixed(3) : "n/a";
+        return `${l.toUpperCase()}=${accepted}/${attempted}(meanCos=${meanCos})`;
+      })
       .join(", ");
-    log(`  Semantic title-match: ${semanticAccepted} accepted out of ${semanticAttempted} attempted [${perLang || "none"}] (~${semanticTokens} tokens, ~$${cost.toFixed(4)})`);
+    const semRejectedDownstream = semanticAttempted - semRejectedThreshold - semanticAccepted;
+    log(`  Semantic title-match: ${semanticAccepted} accepted out of ${semanticAttempted} attempted [${perLang || "none"}] rejected: threshold/ambiguity=${semRejectedThreshold}, downstream(crossVal/known/dedup)=${Math.max(0, semRejectedDownstream)} (~${semanticTokens} tokens, ~$${cost.toFixed(4)})`);
   }
   return results;
 }
