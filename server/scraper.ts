@@ -1952,8 +1952,9 @@ function titleSimilarity(a: string, b: string): number {
 
 // ---- Semantic title matching (multilingual embeddings) ----
 const EMBED_MODEL = "text-embedding-3-small";
-const EMBED_BATCH_SIZE = 1024;
+const EMBED_BATCH_SIZE = 2048;
 const EMBED_TOTAL_CAP = 50000;
+const EMBED_CACHE_MAX = 50000;
 const EMBED_PRICE_PER_M_TOKENS = 0.02;
 const titleEmbeddingCache = new Map<string, number[]>();
 let _embedClient: OpenAI | null = null;
@@ -2007,6 +2008,11 @@ export async function embedTitles(
         for (let k = 0; k < batch.length; k++) {
           const vec = resp.data[k]?.embedding;
           if (vec && Array.isArray(vec)) {
+            // LRU eviction: if at cap, drop oldest entry (Map preserves insertion order)
+            if (titleEmbeddingCache.size >= EMBED_CACHE_MAX && !titleEmbeddingCache.has(batch[k])) {
+              const firstKey = titleEmbeddingCache.keys().next().value;
+              if (firstKey !== undefined) titleEmbeddingCache.delete(firstKey);
+            }
             titleEmbeddingCache.set(batch[k], vec);
             map.set(batch[k], vec);
           }
