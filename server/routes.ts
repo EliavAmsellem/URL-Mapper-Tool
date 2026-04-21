@@ -9,6 +9,8 @@ import fs from "fs";
 import { storage } from "./storage";
 import {
   learnTabPatterns,
+  mergeIntoTabPatterns,
+  summarizeSegmentTranslations,
   batchConstructUrls,
   constructTargetUrl,
   constructAllTargetUrls,
@@ -415,10 +417,12 @@ interface RowData {
   needsAr: boolean;
 }
 
+type TabRefRow = { sourceUrl: string; enUrl?: string; frUrl?: string; ruUrl?: string; arUrl?: string };
+
 interface TabData {
   sheetName: string;
   allRows: RowData[];
-  tabRefRows: { sourceUrl: string; enUrl?: string; frUrl?: string; ruUrl?: string; arUrl?: string }[];
+  tabRefRows: TabRefRow[];
   data: any[][];
 }
 
@@ -511,6 +515,7 @@ async function matchTab(
   crawlPageCap: number,
   seedOverrides?: Partial<Record<TargetLang, string>>,
   alternateLinkCache?: AlternateLinkCache,
+  globalPatterns?: TabPatterns,
 ): Promise<{
   matchResults: Map<number, BatchMatchResult>;
   inventories: Record<TargetLang, CrawlInventory | null>;
@@ -524,6 +529,14 @@ async function matchTab(
   const refUrlKey: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = { en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl" };
 
   const tabPatterns = learnTabPatterns(tabRefRows, langs);
+  if (globalPatterns) {
+    const { addedSegments, addedPairs } = mergeIntoTabPatterns(tabPatterns, globalPatterns, langs);
+    const segParts = langs.map(l => `${addedSegments[l]} ${l.toUpperCase()}`).filter(s => !s.startsWith("0 "));
+    const pairParts = langs.map(l => `${addedPairs[l]} ${l.toUpperCase()}`).filter(s => !s.startsWith("0 "));
+    if (segParts.length > 0 || pairParts.length > 0) {
+      log(`Tab "${sheetName}": merged from global registry — segments[${segParts.join(", ") || "none"}], root mappings[${pairParts.join(", ") || "none"}]`);
+    }
+  }
   log(`Tab "${sheetName}": ${tabRefRows.length} reference rows, ${allRows.length} total rows (active langs: ${langs.map(l => l.toUpperCase()).join(",") || "none"})`);
 
   const needsMatching = allRows.filter((r) => r.needsEn || r.needsFr || r.needsRu || r.needsAr);
@@ -1301,6 +1314,41 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
   // loop re-enters matchTab for the same tab.
   const alternateLinkCache: AlternateLinkCache = new Map();
 
+  // Job-wide pattern registry: pooled from every tab's confirmed source/target
+  // pairs so segment translations and root mappings learned in one tab apply
+  // to all other tabs (recursively, after each tab finishes).
+  const rebuildGlobalRefRows = (): TabRefRow[] => {
+    const rows: TabRefRow[] = [];
+    for (const td of allTabData) {
+      const sheetGlobal = globalMatchResults.get(td.sheetName);
+      for (const row of td.allRows) {
+        const m = sheetGlobal?.get(row.rowIndex);
+        const ref: TabRefRow = { sourceUrl: row.sourceUrl };
+        let any = false;
+        for (const l of allLangs) {
+          const existing = getRowExisting(row, l);
+          const found = m ? getResultUrl(m, l) : null;
+          const url = existing || found || undefined;
+          if (url) {
+            (ref as any)[refUrlKey[l]] = url;
+            any = true;
+          }
+        }
+        if (any) rows.push(ref);
+      }
+    }
+    return rows;
+  };
+
+  let globalRefRows = rebuildGlobalRefRows();
+  let globalPatterns = learnTabPatterns(globalRefRows, activeLangs, { silent: true, label: "[global]" });
+  log(`Job ${jobId}: global pattern registry seeded from ${globalRefRows.length} confirmed pair(s) across ${allTabData.length} tab(s)`);
+  const segLines = summarizeSegmentTranslations(globalPatterns, activeLangs);
+  if (segLines.length > 0) {
+    log(`Job ${jobId}: global segment translations:`);
+    for (const line of segLines) log(line);
+  }
+
   for (let pass = 1; pass <= MAX_PASSES; pass++) {
     if (control.cancel) break;
 
@@ -1331,7 +1379,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       const stepLabel = pass > 1 ? `pass${pass}:${tabData.sheetName}` : `matching:${tabData.sheetName}`;
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
-      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache);
+      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns);
       tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
 
       if (!globalMatchResults.has(tabData.sheetName)) {
@@ -1370,6 +1418,20 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
 
       const tabTime = ((Date.now() - tabStartTime) / 1000).toFixed(1);
       log(`Tab "${tabData.sheetName}" done in ${tabTime}s: ${tabNewMatches} new matches this pass`);
+
+      if (tabNewMatches > 0) {
+        const prevSize = globalRefRows.length;
+        globalRefRows = rebuildGlobalRefRows();
+        const prevSegs: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+        for (const l of activeLangs) prevSegs[l] = globalPatterns.segmentMap.get(l)?.size || 0;
+        globalPatterns = learnTabPatterns(globalRefRows, activeLangs, { silent: true, label: "[global]" });
+        const segDelta = activeLangs
+          .map(l => ({ l, d: (globalPatterns.segmentMap.get(l)?.size || 0) - prevSegs[l] }))
+          .filter(x => x.d > 0)
+          .map(x => `+${x.d} ${x.l.toUpperCase()}`)
+          .join(", ");
+        log(`Global registry refreshed: ${globalRefRows.length} pairs (was ${prevSize})${segDelta ? `, segment translations ${segDelta}` : ""}`);
+      }
     }
 
     const passTime = ((Date.now() - passStartTime) / 1000).toFixed(1);

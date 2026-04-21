@@ -379,8 +379,11 @@ export interface RootMapping {
 
 export function learnTabPatterns(
   rows: { sourceUrl: string; enUrl?: string; frUrl?: string; ruUrl?: string; arUrl?: string }[],
-  activeLangs?: TargetLang[]
+  activeLangs?: TargetLang[],
+  opts?: { silent?: boolean; label?: string }
 ): TabPatterns {
+  const silent = !!opts?.silent;
+  const labelPrefix = opts?.label ? `${opts.label} ` : "";
   const segmentMap = new Map<string, Map<string, string>>();
   const allLangs: TargetLang[] = ["en", "fr", "ru", "ar"];
   const langs: TargetLang[] = activeLangs && activeLangs.length > 0
@@ -431,9 +434,9 @@ export function learnTabPatterns(
   const langSuffixRule: Record<TargetLang, { prefix: string[]; suffix: string; depth: number } | null> = { en: null, fr: null, ru: null, ar: null };
   for (const l of langs) {
     langSuffixRule[l] = detectLangSuffixRule(pairsByLang[l]);
-    if (langSuffixRule[l]) {
+    if (langSuffixRule[l] && !silent) {
       const r = langSuffixRule[l]!;
-      log(`  ${l.toUpperCase()} suffix rule detected: prefix=/${r.prefix.join("/")}/, suffix=${r.suffix}, depth=${r.depth}`);
+      log(`  ${labelPrefix}${l.toUpperCase()} suffix rule detected: prefix=/${r.prefix.join("/")}/, suffix=${r.suffix}, depth=${r.depth}`);
     }
   }
 
@@ -452,17 +455,19 @@ export function learnTabPatterns(
   const ruCrawlScope = computeCrawlScope("ru");
   const arCrawlScope = computeCrawlScope("ar");
 
-  log(`Tab patterns learned:`);
-  for (const l of langs) {
-    const label = l.toUpperCase();
-    if (mappings[l]) log(`  ${label}: /${srcRoot(l).join("/") || "*"}/ → /${root(l).join("/")}/`);
-    const cs = { en: enCrawlScope, fr: frCrawlScope, ru: ruCrawlScope, ar: arCrawlScope }[l];
-    if (cs.length > root(l).length) log(`  ${label} crawl scope: /${cs.join("/")}/`);
-    const pairCount = rootMappings.get(l)?.length || 0;
-    if (pairCount > 1) log(`  ${label} per-pair root mappings: ${pairCount} unique`);
+  if (!silent) {
+    log(`${labelPrefix}Tab patterns learned:`);
+    for (const l of langs) {
+      const label = l.toUpperCase();
+      if (mappings[l]) log(`  ${label}: /${srcRoot(l).join("/") || "*"}/ → /${root(l).join("/")}/`);
+      const cs = { en: enCrawlScope, fr: frCrawlScope, ru: ruCrawlScope, ar: arCrawlScope }[l];
+      if (cs.length > root(l).length) log(`  ${label} crawl scope: /${cs.join("/")}/`);
+      const pairCount = rootMappings.get(l)?.length || 0;
+      if (pairCount > 1) log(`  ${label} per-pair root mappings: ${pairCount} unique`);
+    }
+    const segCounts = langs.map(l => `${segmentMap.get(l)?.size || 0} ${l.toUpperCase()}`).join(", ");
+    log(`  Segment translations: ${segCounts}`);
   }
-  const segCounts = langs.map(l => `${segmentMap.get(l)?.size || 0} ${l.toUpperCase()}`).join(", ");
-  log(`  Segment translations: ${segCounts}`);
 
   return {
     enRoot, frRoot, ruRoot, arRoot,
@@ -473,6 +478,99 @@ export function learnTabPatterns(
     patternValidated: { en: false, fr: false, ru: false, ar: false },
     langSuffixRule,
   };
+}
+
+/**
+ * Merge a job-wide "global" pattern registry into a per-tab TabPatterns.
+ * Per-tab patterns win on conflicts (segment translations and per-pair root
+ * mappings the tab already learned are preserved). Global entries fill in
+ * gaps so a tab benefits from training pairs that live in other tabs.
+ *
+ * Returns counts so callers can log how much the merge contributed.
+ */
+export function mergeIntoTabPatterns(
+  tab: TabPatterns,
+  global: TabPatterns,
+  activeLangs?: TargetLang[],
+): { addedSegments: Record<TargetLang, number>; addedPairs: Record<TargetLang, number> } {
+  const allLangs: TargetLang[] = ["en", "fr", "ru", "ar"];
+  const langs: TargetLang[] = activeLangs && activeLangs.length > 0
+    ? allLangs.filter(l => activeLangs.includes(l))
+    : allLangs;
+
+  const addedSegments: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  const addedPairs: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+
+  const rootKeys: Record<TargetLang, "enRoot" | "frRoot" | "ruRoot" | "arRoot"> =
+    { en: "enRoot", fr: "frRoot", ru: "ruRoot", ar: "arRoot" };
+  const srcRootKeys: Record<TargetLang, "enSrcRoot" | "frSrcRoot" | "ruSrcRoot" | "arSrcRoot"> =
+    { en: "enSrcRoot", fr: "frSrcRoot", ru: "ruSrcRoot", ar: "arSrcRoot" };
+  const scopeKeys: Record<TargetLang, "enCrawlScope" | "frCrawlScope" | "ruCrawlScope" | "arCrawlScope"> =
+    { en: "enCrawlScope", fr: "frCrawlScope", ru: "ruCrawlScope", ar: "arCrawlScope" };
+
+  for (const l of langs) {
+    if (tab[rootKeys[l]].length === 0 && global[rootKeys[l]].length > 0) {
+      tab[rootKeys[l]] = global[rootKeys[l]].slice();
+    }
+    if (tab[srcRootKeys[l]].length === 0 && global[srcRootKeys[l]].length > 0) {
+      tab[srcRootKeys[l]] = global[srcRootKeys[l]].slice();
+    }
+    if (tab[scopeKeys[l]].length === 0 && global[scopeKeys[l]].length > 0) {
+      tab[scopeKeys[l]] = global[scopeKeys[l]].slice();
+    }
+    if (!tab.langSuffixRule[l] && global.langSuffixRule[l]) {
+      tab.langSuffixRule[l] = global.langSuffixRule[l];
+    }
+
+    if (!tab.segmentMap.has(l)) tab.segmentMap.set(l, new Map());
+    const tabSeg = tab.segmentMap.get(l)!;
+    const globalSeg = global.segmentMap.get(l);
+    if (globalSeg) {
+      for (const [k, v] of globalSeg.entries()) {
+        if (!tabSeg.has(k)) {
+          tabSeg.set(k, v);
+          addedSegments[l]++;
+        }
+      }
+    }
+
+    if (!tab.rootMappings.has(l)) tab.rootMappings.set(l, []);
+    const tabPairs = tab.rootMappings.get(l)!;
+    const tabKeys = new Set(tabPairs.map(p =>
+      p.sourceRoot.map(s => normalizeSegment(s)).join("/") + "||" +
+      p.targetRoot.map(s => normalizeSegment(s)).join("/")
+    ));
+    const globalPairs = global.rootMappings.get(l) || [];
+    for (const gp of globalPairs) {
+      const key = gp.sourceRoot.map(s => normalizeSegment(s)).join("/") + "||" +
+                  gp.targetRoot.map(s => normalizeSegment(s)).join("/");
+      if (!tabKeys.has(key)) {
+        tabPairs.push({ sourceRoot: gp.sourceRoot.slice(), targetRoot: gp.targetRoot.slice() });
+        tabKeys.add(key);
+        addedPairs[l]++;
+      }
+    }
+  }
+
+  return { addedSegments, addedPairs };
+}
+
+/** Top-N segment translation samples per language for diagnostic logging. */
+export function summarizeSegmentTranslations(
+  tp: TabPatterns,
+  activeLangs: TargetLang[],
+  topN: number = 12,
+): string[] {
+  const lines: string[] = [];
+  for (const l of activeLangs) {
+    const seg = tp.segmentMap.get(l);
+    if (!seg || seg.size === 0) continue;
+    const entries = Array.from(seg.entries()).slice(0, topN);
+    const sample = entries.map(([k, v]) => `${k}→${v}`).join(", ");
+    const more = seg.size > topN ? `, +${seg.size - topN} more` : "";
+    lines.push(`  ${l.toUpperCase()} (${seg.size}): ${sample}${more}`);
+  }
+  return lines;
 }
 
 function normalizeSegment(seg: string): string {
