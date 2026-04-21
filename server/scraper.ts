@@ -2970,8 +2970,7 @@ export async function aiMatchUnmatched(
 
   // Model selection: gpt-4.1-mini gives us a 1M-token context, removing the
   // 128K bottleneck that was causing every batch to fail with "context length
-  // exceeded". The integrations path falls back to gpt-5-mini which is also
-  // large-context. Used on both the API-key path and the integrations path.
+  // exceeded". Used on both the API-key path and the integrations path.
   const chatModel = "gpt-4.1-mini";
 
   const TITLE_TRUNC = 120;
@@ -3482,7 +3481,16 @@ Return ONLY the JSON array, no other text.`;
     } catch (error: any) {
       const status = error?.status || error?.response?.status;
       const msg = String(error?.message || "");
-      const isContextLen = status === 400 && /context length|maximum context|too many tokens/i.test(msg);
+      const errCode = error?.code || error?.error?.code || error?.response?.data?.error?.code;
+      const errType = error?.type || error?.error?.type || error?.response?.data?.error?.type;
+      const errMsg = error?.error?.message || error?.response?.data?.error?.message || "";
+      const ctxRegex = /context length|maximum context|too many tokens|context_length|context window/i;
+      const isContextLen = status === 400 && (
+        ctxRegex.test(msg) ||
+        ctxRegex.test(String(errMsg)) ||
+        String(errCode || "") === "context_length_exceeded" ||
+        String(errType || "") === "context_length_exceeded"
+      );
       if (isContextLen) {
         log(`  AI batch ${batchIdx + 1}/${batches.length} [${batchSection}] CONTEXT-LENGTH error (${chatModel}): ${msg.substring(0, 200)}`);
         // Treat context-length failures as "0-match completed" batches so the
