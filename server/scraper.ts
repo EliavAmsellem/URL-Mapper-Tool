@@ -1745,7 +1745,10 @@ export interface AlternateLinkHarvestResult {
  * filtering is re-applied each call because inventories can grow between passes.
  */
 export interface AlternateLinkCacheEntry {
-  rawByLang: Partial<Record<TargetLang, string>>;
+  /** All resolved hreflang hrefs per lang, in document order. We keep the full
+   * list (deduped) so the inventory check can fall through to the next
+   * candidate when the first one isn't a canonical inventory URL. */
+  rawByLang: Partial<Record<TargetLang, string[]>>;
   hadAnyAlternate: boolean;
   fetchOk: boolean;
 }
@@ -1784,7 +1787,7 @@ export async function harvestAlternateLinks(
     try { $ = cheerio.load(html); } catch {
       return { rawByLang: {}, hadAnyAlternate: false, fetchOk: true };
     }
-    const rawByLang: Partial<Record<TargetLang, string>> = {};
+    const rawByLang: Partial<Record<TargetLang, string[]>> = {};
     let hadAny = false;
     $('link[rel="alternate"][hreflang], a[hreflang]').each((_, el) => {
       const hrefRaw = $(el).attr("href");
@@ -1793,10 +1796,10 @@ export async function harvestAlternateLinks(
       if (!(["en", "fr", "ru", "ar"] as string[]).includes(hl)) return;
       const lang = hl as TargetLang;
       hadAny = true;
-      if (rawByLang[lang]) return;
       let resolved: string;
       try { resolved = new URL(hrefRaw, sourceUrl).toString(); } catch { return; }
-      rawByLang[lang] = resolved;
+      const list = rawByLang[lang] || (rawByLang[lang] = []);
+      if (!list.includes(resolved)) list.push(resolved);
     });
     return { rawByLang, hadAnyAlternate: hadAny, fetchOk: true };
   };
@@ -1824,11 +1827,15 @@ export async function harvestAlternateLinks(
       const found: Partial<Record<TargetLang, string>> = {};
       for (const lang of ["en", "fr", "ru", "ar"] as TargetLang[]) {
         if (!item.needs[lang]) continue;
-        const resolved = entry.rawByLang[lang];
-        if (!resolved) continue;
-        const matched = checkInventory(lang, resolved);
-        if (matched) {
-          found[lang] = matched;
+        const candidates = entry.rawByLang[lang];
+        if (!candidates || candidates.length === 0) continue;
+        let accepted: string | null = null;
+        for (const cand of candidates) {
+          const matched = checkInventory(lang, cand);
+          if (matched) { accepted = matched; break; }
+        }
+        if (accepted) {
+          found[lang] = accepted;
           perLangAccepted[lang]++;
         } else {
           perLangRejectedNotInInventory[lang]++;
