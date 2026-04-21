@@ -721,9 +721,13 @@ async function matchTab(
       try {
         const p = new URL(url);
         if (p.origin !== origin) continue;
-        if (userScopePath && !p.pathname.toLowerCase().startsWith(userScopePath.toLowerCase())) {
-          droppedOutOfScope++;
-          continue;
+        if (userScopePath) {
+          const pn = p.pathname.toLowerCase();
+          const sc = userScopePath.toLowerCase();
+          if (pn !== sc && !pn.startsWith(sc + "/")) {
+            droppedOutOfScope++;
+            continue;
+          }
         }
       } catch { continue; }
       refSeeds.push(url);
