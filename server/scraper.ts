@@ -3027,6 +3027,18 @@ export async function aiMatchUnmatched(
   for (const l of langs) { for (const u of knownUrls[l]) usedUrls[l].add(u); }
   let aiMatches = 0;
   let consecutiveAuthFailures = 0;
+  let consecutiveZeroBatches = 0;
+  const ZERO_BATCH_EARLY_EXIT = 5;
+
+  // Helper: detect a section's generic index page (the model loves to fall
+  // back to these). Used to keep a small reminder block of taken index pages
+  // even after we filter used URLs out of the visible inventory.
+  const isDefaultIndex = (u: string) => {
+    let path = u;
+    try { path = new URL(u).pathname; }
+    catch { path = u.split("#")[0].split("?")[0]; }
+    return /\/(default\.aspx|index\.aspx)$/i.test(path) || /\/Pages\/?$/i.test(path);
+  };
 
   // Per-language AI telemetry: counts attempts, accepts, and each rejection reason
   // so prompt tuning is measurable across runs.
@@ -3057,39 +3069,44 @@ export async function aiMatchUnmatched(
       return parts.join("\n");
     }).join("\n\n");
 
+    // Filter out already-used URLs from the inventory shown to the model.
+    // The server-side `usedUrls` check below still rejects any leak, but
+    // hiding taken URLs from the prompt prevents the model from wasting
+    // suggestions on URLs we know we won't accept.
+    const INVENTORY_PER_LANG_CAP = 2000;
     const inventoryBlocks: string[] = [];
+    const visibleStats: { lang: TargetLang; total: number; available: number; shown: number }[] = [];
     for (const l of activeLangs) {
-      const entries = inventoryEntries[l];
-      const list = entries.length <= 500
-        ? entries.join("\n")
-        : entries.slice(0, 500).join("\n") + `\n... (${entries.length - 500} more)`;
-      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs with page titles (pick ONLY the URL part — text after "  |  " is the page title for context):\n${list || `(no ${langLabels[l]} inventory available)`}`);
+      const totalCount = inventoryUrls[l].length;
+      const available: string[] = [];
+      for (let i = 0; i < inventoryUrls[l].length; i++) {
+        if (!usedUrls[l].has(inventoryUrls[l][i])) {
+          available.push(inventoryEntries[l][i]);
+        }
+      }
+      const availableCount = available.length;
+      const shown = available.length <= INVENTORY_PER_LANG_CAP
+        ? available
+        : available.slice(0, INVENTORY_PER_LANG_CAP);
+      const truncatedNote = available.length > shown.length
+        ? `\n... (${available.length - shown.length} more available; not shown to keep prompt small)`
+        : "";
+      const list = shown.length > 0
+        ? shown.join("\n") + truncatedNote
+        : `(no ${langLabels[l]} URLs left — all ${totalCount} inventory URLs already matched)`;
+      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs with page titles (${availableCount} unused of ${totalCount} total — pick ONLY the URL part, text after "  |  " is the page title):\n${list}`);
+      visibleStats.push({ lang: l, total: totalCount, available: availableCount, shown: shown.length });
     }
 
-    // Smarter used-URL list per language: always include every generic
-    // "default.aspx" / index page (these are the URLs the model loves to
-    // re-propose as a fallback), then top up with the most-recent N other
-    // URLs up to a per-language cap. Capped to keep prompt size bounded.
-    const USED_PER_LANG_CAP = 300;
-    const usedBlocks = activeLangs.map(l => {
-      const all = Array.from(usedUrls[l]);
-      const isDefault = (u: string) => {
-        // Compare against the URL pathname so query strings and hash fragments
-        // don't hide a generic index page (e.g. ".../Pages/default.aspx?x=1").
-        let path = u;
-        try { path = new URL(u).pathname; }
-        catch { path = u.split("#")[0].split("?")[0]; }
-        return /\/(default\.aspx|index\.aspx)$/i.test(path) || /\/Pages\/?$/i.test(path);
-      };
-      const defaults = all.filter(isDefault);
-      const others = all.filter(u => !isDefault(u));
-      const recentOthers = others.slice(-Math.max(0, USED_PER_LANG_CAP - defaults.length));
-      const combined = [...defaults, ...recentOthers];
-      const truncatedNote = all.length > combined.length
-        ? `\n... (${all.length - combined.length} more already used; not shown to keep prompt small)`
-        : "";
-      return `ALREADY USED ${langLabels[l].toUpperCase()} URLs (do NOT reuse these — ${all.length} total, showing ${combined.length}):\n${combined.join("\n") || "(none)"}${truncatedNote}`;
-    }).join("\n\n");
+    // Tiny reminder block: only the generic /Pages/default.aspx-style index
+    // pages that have already been taken. The model has a strong bias toward
+    // proposing these as a fallback, so keep them explicitly visible even
+    // though we removed them from the inventory above.
+    const usedDefaultsBlock = activeLangs.map(l => {
+      const taken = Array.from(usedUrls[l]).filter(isDefaultIndex);
+      if (taken.length === 0) return "";
+      return `ALREADY-TAKEN ${langLabels[l].toUpperCase()} INDEX PAGES (do NOT propose these — match to a more specific page or return null):\n${taken.join("\n")}`;
+    }).filter(Boolean).join("\n\n");
 
     // Russian and Arabic addendum: their URL slugs are Latin transliterations
     // of Hebrew words, not Russian/Arabic. Slug similarity is misleading; the
@@ -3109,14 +3126,14 @@ export async function aiMatchUnmatched(
     const systemPrompt = `You are a URL matching expert for a multilingual government website. Your task is to find the correct ${langListText} equivalent pages for Hebrew source URLs.
 
 CRITICAL RULES:
-1. You may ONLY select URLs from the provided inventory lists below. NEVER invent or construct URLs. Return only the URL part (text before "  |  ") — the text after "  |  " is the page title given for context. If a URL you want is not character-for-character in the inventory, return null.
+1. You may ONLY select URLs from the provided AVAILABLE inventory lists below. NEVER invent or construct URLs. Return only the URL part (text before "  |  ") — the text after "  |  " is the page title given for context. If a URL you want is not character-for-character in the AVAILABLE list, return null.
 2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
-3. Each target URL should only be used ONCE across all matches. Do not assign the same target URL to multiple source URLs.
-4. URLs that are already matched should not appear again. Check the "already used" lists carefully — a URL appearing there must NEVER be returned.
+3. Each target URL should only be used ONCE across all matches in this batch. Do not assign the same target URL to multiple source URLs.
+4. The AVAILABLE lists already exclude URLs that have been matched in earlier batches — every URL in those lists is fresh and unused. Do not propose a URL that is not in the AVAILABLE list.
 5. PRIMARY signal: compare the source page title (translated) against the candidate page title shown after "  |  " in the inventory. A match should make sense as a same-topic page in the other language. URL slug similarity is only a secondary hint.
 6. The chosen URL MUST start with the target language section root path shown in WEBSITE STRUCTURE. Cross-section matches (e.g. picking a payroll page for a contact-us source) are forbidden.
 7. If the source title is a generic page like "contact us", "home", or "about", only match it to a clearly equivalent target page (same generic concept). When in doubt, return null.
-8. NEVER fall back to a section's index page (URLs ending in "/Pages/default.aspx", "/default.aspx", or "/Pages/") just because nothing more specific looks plausible. Index pages should only be returned when the SOURCE itself is clearly the section's index page (matching title like "default" / "home" / the section name). Otherwise return null.${transliterationNote}
+8. NEVER fall back to a section's index page (URLs ending in "/Pages/default.aspx", "/default.aspx", or "/Pages/") just because nothing more specific looks plausible. Index pages should only be returned when the SOURCE itself is clearly the section's index page (matching title like "default" / "home" / the section name). Otherwise return null. The ALREADY-TAKEN INDEX PAGES block lists index pages that have already been used — never propose those.${transliterationNote}
 
 WEBSITE STRUCTURE:
 ${patternContext.join("\n")}
@@ -3124,7 +3141,7 @@ ${patternContext.join("\n")}
 EXAMPLES OF CORRECTLY MATCHED PAIRS:
 ${exampleLines || "(no examples available)"}
 
-${usedBlocks}`;
+${usedDefaultsBlock}`;
 
     const userPrompt = `Find the matching ${langListText} URLs for each of these Hebrew source URLs.
 
@@ -3173,6 +3190,7 @@ Return ONLY the JSON array, no other text.`;
       if (!content) {
         log(`    AI batch ${batchIdx + 1}/${batches.length}: failed after 3 retries (likely auth/rate-limit issue)`);
         consecutiveAuthFailures++;
+        consecutiveZeroBatches = 0;
         if (consecutiveAuthFailures >= 3) {
           log(`  AI matching ABORTED: ${consecutiveAuthFailures} consecutive batches failed with auth errors. Skipping remaining ${batches.length - batchIdx - 1} batches.`);
           break;
@@ -3186,6 +3204,7 @@ Return ONLY the JSON array, no other text.`;
         suggestions = Array.isArray(parsed) ? parsed : (parsed.matches || parsed.results || parsed.urls || []);
       } catch {
         log(`    AI batch ${batchIdx + 1}/${batches.length}: failed to parse response`);
+        consecutiveZeroBatches = 0;
         continue;
       }
 
@@ -3278,9 +3297,22 @@ Return ONLY the JSON array, no other text.`;
       }
 
       aiMatches += batchMatches;
-      log(`  AI batch ${batchIdx + 1}/${batches.length}: ${batchMatches} matches from ${batch.length} URLs`);
+      const visibleStr = visibleStats.map(v => `${v.lang.toUpperCase()}:${v.shown}/${v.available}`).join(" ");
+      log(`  AI batch ${batchIdx + 1}/${batches.length}: ${batchMatches} matches from ${batch.length} URLs (visible inventory ${visibleStr})`);
+
+      if (batchMatches === 0) {
+        consecutiveZeroBatches++;
+        if (consecutiveZeroBatches >= ZERO_BATCH_EARLY_EXIT && batchIdx < batches.length - 1) {
+          const remaining = batches.length - batchIdx - 1;
+          log(`  AI matching EARLY EXIT: ${consecutiveZeroBatches} consecutive batches yielded 0 matches. Skipping remaining ${remaining} batches.`);
+          break;
+        }
+      } else {
+        consecutiveZeroBatches = 0;
+      }
     } catch (error: any) {
       log(`  AI batch ${batchIdx + 1}/${batches.length} error: ${error?.message?.substring(0, 200)}`);
+      consecutiveZeroBatches = 0;
     }
 
     if (batchIdx < batches.length - 1) {
