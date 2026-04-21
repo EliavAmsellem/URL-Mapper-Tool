@@ -529,13 +529,21 @@ async function matchTab(
   const refUrlKey: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = { en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl" };
 
   const tabPatterns = learnTabPatterns(tabRefRows, langs);
+  const preMergeSegCounts: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  const preMergePairCounts: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  for (const l of langs) {
+    preMergeSegCounts[l] = tabPatterns.segmentMap.get(l)?.size || 0;
+    preMergePairCounts[l] = tabPatterns.rootMappings.get(l)?.length || 0;
+  }
   if (globalPatterns) {
     const { addedSegments, addedPairs } = mergeIntoTabPatterns(tabPatterns, globalPatterns, langs);
-    const segParts = langs.map(l => `${addedSegments[l]} ${l.toUpperCase()}`).filter(s => !s.startsWith("0 "));
-    const pairParts = langs.map(l => `${addedPairs[l]} ${l.toUpperCase()}`).filter(s => !s.startsWith("0 "));
-    if (segParts.length > 0 || pairParts.length > 0) {
-      log(`Tab "${sheetName}": merged from global registry — segments[${segParts.join(", ") || "none"}], root mappings[${pairParts.join(", ") || "none"}]`);
-    }
+    const attribution = langs.map(l => {
+      const totalSeg = tabPatterns.segmentMap.get(l)?.size || 0;
+      const totalPairs = tabPatterns.rootMappings.get(l)?.length || 0;
+      return `${l.toUpperCase()} segments=${preMergeSegCounts[l]} per-tab + ${addedSegments[l]} from global = ${totalSeg}; root maps=${preMergePairCounts[l]} per-tab + ${addedPairs[l]} from global = ${totalPairs}`;
+    });
+    log(`Tab "${sheetName}": pattern source attribution after global merge:`);
+    for (const line of attribution) log(`  ${line}`);
   }
   log(`Tab "${sheetName}": ${tabRefRows.length} reference rows, ${allRows.length} total rows (active langs: ${langs.map(l => l.toUpperCase()).join(",") || "none"})`);
 
@@ -1317,6 +1325,15 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
   // Job-wide pattern registry: pooled from every tab's confirmed source/target
   // pairs so segment translations and root mappings learned in one tab apply
   // to all other tabs (recursively, after each tab finishes).
+  function setRefUrl(ref: TabRefRow, lang: TargetLang, url: string) {
+    switch (lang) {
+      case "en": ref.enUrl = url; break;
+      case "fr": ref.frUrl = url; break;
+      case "ru": ref.ruUrl = url; break;
+      case "ar": ref.arUrl = url; break;
+    }
+  }
+
   const rebuildGlobalRefRows = (): TabRefRow[] => {
     const rows: TabRefRow[] = [];
     for (const td of allTabData) {
@@ -1324,30 +1341,34 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       for (const row of td.allRows) {
         const m = sheetGlobal?.get(row.rowIndex);
         const ref: TabRefRow = { sourceUrl: row.sourceUrl };
-        let any = false;
+        let hasUrl = false;
         for (const l of allLangs) {
           const existing = getRowExisting(row, l);
           const found = m ? getResultUrl(m, l) : null;
           const url = existing || found || undefined;
           if (url) {
-            (ref as any)[refUrlKey[l]] = url;
-            any = true;
+            setRefUrl(ref, l, url);
+            hasUrl = true;
           }
         }
-        if (any) rows.push(ref);
+        if (hasUrl) rows.push(ref);
       }
     }
     return rows;
   };
 
+  const logGlobalRegistrySnapshot = (label: string) => {
+    const seedSummary = activeLangs
+      .map(l => `${globalPatterns.segmentMap.get(l)?.size || 0} ${l.toUpperCase()}`)
+      .join(", ");
+    log(`Job ${jobId} [${label}]: global registry has ${globalRefRows.length} confirmed pair(s); segment translations: ${seedSummary}`);
+    const lines = summarizeSegmentTranslations(globalPatterns, activeLangs);
+    for (const line of lines) log(line);
+  };
+
   let globalRefRows = rebuildGlobalRefRows();
   let globalPatterns = learnTabPatterns(globalRefRows, activeLangs, { silent: true, label: "[global]" });
-  log(`Job ${jobId}: global pattern registry seeded from ${globalRefRows.length} confirmed pair(s) across ${allTabData.length} tab(s)`);
-  const segLines = summarizeSegmentTranslations(globalPatterns, activeLangs);
-  if (segLines.length > 0) {
-    log(`Job ${jobId}: global segment translations:`);
-    for (const line of segLines) log(line);
-  }
+  logGlobalRegistrySnapshot("seed");
 
   for (let pass = 1; pass <= MAX_PASSES; pass++) {
     if (control.cancel) break;
@@ -1359,7 +1380,10 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       log(`\n========== PASS ${pass} ==========`);
       log(`Re-learning patterns from updated reference rows...`);
       updateRowsFromResults(allTabData, globalMatchResults);
+      globalRefRows = rebuildGlobalRefRows();
+      globalPatterns = learnTabPatterns(globalRefRows, activeLangs, { silent: true, label: "[global]" });
     }
+    logGlobalRegistrySnapshot(`pass ${pass} start`);
 
     for (const tabData of allTabData) {
       if (control.cancel) break;
