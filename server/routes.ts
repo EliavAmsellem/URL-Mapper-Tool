@@ -154,7 +154,14 @@ function parseSeedsSheet(ws: ExcelJS.Worksheet, knownSheets: string[]): SeedMap 
 }
 
 function pathToSegments(p: string): string[] {
-  return p.split("/").filter(Boolean).filter(s => !/\.[a-z0-9]{2,5}$/i.test(s));
+  const segs = p.split("/").filter(Boolean);
+  while (segs.length > 0) {
+    const last = segs[segs.length - 1];
+    if (/\.[a-z0-9]{2,5}$/i.test(last)) { segs.pop(); continue; }
+    if (last.toLowerCase() === "pages" || last.toLowerCase() === "forms") { segs.pop(); continue; }
+    break;
+  }
+  return segs;
 }
 
 function findJobFile(jobId: string): string | null {
