@@ -37,6 +37,8 @@ import {
   type BatchMatchResult,
   mergeInventories,
   verifySeedUrls,
+  detectCrossScriptLangs,
+  harvestAlternateLinks,
 } from "./scraper";
 import { log } from "./index";
 
@@ -839,6 +841,79 @@ async function matchTab(
     }
   }
 
+  // ---- CROSS-SCRIPT DETECTION ----
+  // Tabs whose source slugs are in a different script/vocabulary from the
+  // target inventory slugs (e.g. EN sources `/benefits/Disability` vs RU
+  // inventory `/Benefits_ru/Nehut_ru/`) make the title-match "no shared
+  // segments → reject" rail a false-positive generator. Detect once per tab
+  // from reference rows and disable the rail per-lang downstream.
+  const crossScriptLangs = detectCrossScriptLangs(tabRefRows, langs);
+
+  // ---- PASS 1.5: ALTERNATE-LINK HARVEST ----
+  // For rows that Pattern+Crawl couldn't place, fetch the source HTML once
+  // and look for `<link rel="alternate" hreflang>` (and `<a hreflang>`) that
+  // points into our crawled inventory. This is especially valuable on
+  // cross-script tabs where the segment learner has no usable training pairs.
+  // We only run harvest for tabs that have at least one cross-script lang
+  // among the active langs, to bound the cost (one HTTP GET per missed row).
+  const harvestNeeded = langs.some(l => crossScriptLangs[l] && inventories[l]);
+  if (harvestNeeded) {
+    // Group missed rows by sourceUrl so duplicate sources are fetched once and
+    // every row sharing that source benefits from any found alternate links.
+    // The merged `needs` is the union across all rows for that source URL.
+    const sourceToRows = new Map<string, { rowIndexes: number[]; needs: Partial<Record<TargetLang, boolean>> }>();
+    for (const row of needsMatching) {
+      const m = matchResults.get(row.rowIndex);
+      let any = false;
+      const rowNeeds: Partial<Record<TargetLang, boolean>> = {};
+      for (const l of langs) {
+        if (row[needsKey[l]] && (!m || !getResultUrl(m, l)) && inventories[l]) {
+          rowNeeds[l] = true;
+          any = true;
+        }
+      }
+      if (!any) continue;
+      const existing = sourceToRows.get(row.sourceUrl);
+      if (existing) {
+        existing.rowIndexes.push(row.rowIndex);
+        for (const l of langs) if (rowNeeds[l]) existing.needs[l] = true;
+      } else {
+        sourceToRows.set(row.sourceUrl, { rowIndexes: [row.rowIndex], needs: rowNeeds });
+      }
+    }
+    if (sourceToRows.size > 0) {
+      const HARVEST_CAP = 1500;
+      const allEntries = Array.from(sourceToRows.entries());
+      const cappedEntries = allEntries.slice(0, HARVEST_CAP);
+      const capped = cappedEntries.map(([sourceUrl, v]) => ({ sourceUrl, needs: v.needs }));
+      log(`  Pass 1.5 alternate-link harvest: fetching ${capped.length}${allEntries.length > capped.length ? `/${allEntries.length} (capped)` : ""} unique source pages for hreflang links...`);
+      const harvest = await harvestAlternateLinks(capped, inventories, control.signal, 6);
+      let harvestApplied = 0;
+      for (const [sourceUrl, found] of Array.from(harvest.matches.entries())) {
+        const group = sourceToRows.get(sourceUrl);
+        if (!group) continue;
+        for (const rowIndex of group.rowIndexes) {
+          let result = matchResults.get(rowIndex);
+          if (!result) {
+            result = emptyBatchResult();
+            matchResults.set(rowIndex, result);
+          }
+          for (const l of langs) {
+            const url = found[l];
+            if (!url) continue;
+            if (getResultUrl(result, l)) continue;
+            if (usedUrls[l].has(url)) continue;
+            setResultMatch(result, l, url, 95, "alternate-link");
+            usedUrls[l].add(url);
+            harvestApplied++;
+          }
+        }
+      }
+      const perLang = langs.map(l => `${l.toUpperCase()}:${harvest.perLangAccepted[l]}`).join(", ");
+      log(`  Pass 1.5 harvest: ${harvest.fetched} pages fetched, ${harvest.pagesWithLinks} had inventory hreflang links, ${harvestApplied} matches applied to ${needsMatching.length} rows (${perLang})`);
+    }
+  }
+
   // ---- INVENTORY TITLE-MATCH STAGE (before HEAD) ----
   // Trust inventory title matches above the configured similarity threshold,
   // skipping HEAD verification for accepted matches. HEAD becomes a last-ditch
@@ -909,7 +984,7 @@ async function matchTab(
 
     const titleMatches = await titleMatchUnmatched(
       unmatchedForTitle, inventories, storage,
-      allowedRoots, refDepths, knownUrlSets, control.signal,
+      allowedRoots, refDepths, knownUrlSets, control.signal, crossScriptLangs,
     );
 
     for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {

@@ -1666,6 +1666,133 @@ function disambiguateByDepth(
   }
 }
 
+/**
+ * Detect tabs/languages where source URL slugs and target inventory slugs are in
+ * different writing systems / vocabularies (e.g. EN source `/benefits/Disability`
+ * vs RU inventory `/Benefits_ru/Nehut_ru/` — Hebrew transliterations). For these
+ * pairs the standard "no shared path segments → reject" safety rail in title
+ * matching is a false-positive generator. Returns true per lang when fewer than
+ * `threshold` of reference (sourceUrl, targetUrl) pairs share any normalized
+ * path segment, with at least `minPairs` pairs to be statistically meaningful.
+ */
+export function detectCrossScriptLangs(
+  refRows: { sourceUrl: string; enUrl?: string; frUrl?: string; ruUrl?: string; arUrl?: string }[],
+  langs: TargetLang[],
+  minPairs: number = 5,
+  threshold: number = 0.30,
+): Record<TargetLang, boolean> {
+  const result: Record<TargetLang, boolean> = { en: false, fr: false, ru: false, ar: false };
+  const refUrlKey: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = {
+    en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl",
+  };
+  for (const lang of langs) {
+    const pairs: Array<{ s: Set<string>; t: Set<string> }> = [];
+    for (const ref of refRows) {
+      const tgt = ref[refUrlKey[lang]];
+      if (!tgt) continue;
+      try {
+        const sParts = new URL(ref.sourceUrl).pathname.split("/").filter(Boolean);
+        const tParts = new URL(tgt).pathname.split("/").filter(Boolean);
+        const sSet = new Set(
+          sParts.map(s => normalizeSegment(s)).filter(s => s && s !== "pages" && s !== "default.aspx"),
+        );
+        const tSet = new Set(
+          tParts.map(s => normalizeSegment(s)).filter(s => s && s !== "pages" && s !== "default.aspx"),
+        );
+        if (sSet.size > 0 && tSet.size > 0) pairs.push({ s: sSet, t: tSet });
+      } catch {}
+    }
+    if (pairs.length < minPairs) continue;
+    let withOverlap = 0;
+    for (const { s, t } of pairs) {
+      let shared = false;
+      for (const seg of s) { if (t.has(seg)) { shared = true; break; } }
+      if (shared) withOverlap++;
+    }
+    const overlapFrac = withOverlap / pairs.length;
+    if (overlapFrac < threshold) {
+      result[lang] = true;
+      log(`  [cross-script] ${lang.toUpperCase()}: ${withOverlap}/${pairs.length} ref pairs share path segments (${(overlapFrac * 100).toFixed(0)}%) — relaxing title-match segment-overlap rail for this lang`);
+    }
+  }
+  return result;
+}
+
+/**
+ * Pass 1.5 — alternate-link harvest. For source URLs that Pass 1 (pattern+crawl)
+ * could not place, fetch the source HTML once and look for `<link rel="alternate"
+ * hreflang="…">` tags (and `<a hreflang="…">` switcher links). Resolved hrefs
+ * are validated against the target-language inventory; only inventory hits are
+ * returned. Cheap, deterministic, and especially valuable on cross-script tabs
+ * where Pass 1's segment translator is starved of training pairs.
+ */
+export interface AlternateLinkHarvestResult {
+  matches: Map<string, Partial<Record<TargetLang, string>>>;
+  fetched: number;
+  pagesWithLinks: number;
+  perLangAccepted: Record<TargetLang, number>;
+}
+
+export async function harvestAlternateLinks(
+  sources: { sourceUrl: string; needs: Partial<Record<TargetLang, boolean>> }[],
+  inventories: Record<TargetLang, CrawlInventory | null>,
+  signal?: AbortSignal,
+  concurrency: number = 6,
+): Promise<AlternateLinkHarvestResult> {
+  const matches = new Map<string, Partial<Record<TargetLang, string>>>();
+  const perLangAccepted: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  let fetched = 0;
+  let pagesWithLinks = 0;
+
+  const checkInventory = (lang: TargetLang, candidate: string): string | null => {
+    const inv = inventories[lang];
+    if (!inv) return null;
+    let url: URL;
+    try { url = new URL(candidate); } catch { return null; }
+    url.hash = ""; url.search = "";
+    const cleaned = url.toString();
+    if (inv.urls.has(cleaned)) return cleaned;
+    const norm = normalizeUrlPath(cleaned);
+    return inv.normalizedIndex.get(norm) || null;
+  };
+
+  for (let i = 0; i < sources.length; i += concurrency) {
+    if (signal?.aborted) break;
+    const batch = sources.slice(i, i + concurrency);
+    await Promise.all(batch.map(async (item) => {
+      if (signal?.aborted) return;
+      const outcome = await fetchPageDetailed(item.sourceUrl, signal);
+      fetched++;
+      if (!outcome.html) return;
+      let $: cheerio.CheerioAPI;
+      try { $ = cheerio.load(outcome.html); } catch { return; }
+      const found: Partial<Record<TargetLang, string>> = {};
+      $('link[rel="alternate"][hreflang], a[hreflang]').each((_, el) => {
+        const hrefRaw = $(el).attr("href");
+        const hl = ($(el).attr("hreflang") || "").toLowerCase().split("-")[0];
+        if (!hrefRaw || !hl) return;
+        if (!(["en", "fr", "ru", "ar"] as string[]).includes(hl)) return;
+        const lang = hl as TargetLang;
+        if (!item.needs[lang]) return;
+        if (found[lang]) return;
+        let resolved: string;
+        try { resolved = new URL(hrefRaw, item.sourceUrl).toString(); } catch { return; }
+        const matched = checkInventory(lang, resolved);
+        if (matched) {
+          found[lang] = matched;
+          perLangAccepted[lang]++;
+        }
+      });
+      if (Object.keys(found).length > 0) {
+        pagesWithLinks++;
+        matches.set(item.sourceUrl, found);
+      }
+    }));
+    await abortAwareSleep(150, signal);
+  }
+  return { matches, fetched, pagesWithLinks, perLangAccepted };
+}
+
 export function matchAgainstInventory(
   sourceUrl: string,
   lang: TargetLang,
@@ -2051,6 +2178,7 @@ export function matchByTitleSemantic(
   allowedRoots?: string[],
   refDepths?: number[],
   sourceSegments?: Set<string>,
+  disableSegmentRail: boolean = false,
 ): TitleMatchResult | null {
   if (!inventory.titleEmbeddings || inventory.titleEmbeddings.size === 0) return null;
 
@@ -2122,7 +2250,7 @@ export function matchByTitleSemantic(
     return null;
   }
 
-  if (sourceSegments && sourceSegments.size > 0) {
+  if (sourceSegments && sourceSegments.size > 0 && !disableSegmentRail) {
     const allNonLatin = Array.from(sourceSegments).every(seg => /[^\x00-\x7F]/.test(seg));
     if (!allNonLatin) {
       try {
@@ -2299,6 +2427,7 @@ export function matchByTitle(
   allowedRoots?: string[],
   refDepths?: number[],
   sourceSegments?: Set<string>,
+  disableSegmentRail: boolean = false,
 ): TitleMatchResult | null {
   let bestMatch: TitleMatchResult | null = null;
   let bestSimilarity = minSimilarity;
@@ -2404,7 +2533,7 @@ export function matchByTitle(
       return null;
     }
 
-    if (sourceSegments && sourceSegments.size > 0) {
+    if (sourceSegments && sourceSegments.size > 0 && !disableSegmentRail) {
       const allNonLatin = Array.from(sourceSegments).every(seg => /[^\x00-\x7F]/.test(seg));
       if (!allNonLatin) {
         try {
@@ -2437,10 +2566,12 @@ export async function titleMatchUnmatched(
   refDepths?: Record<TargetLang, number[] | undefined>,
   knownUrls?: Record<TargetLang, Set<string>>,
   signal?: AbortSignal,
+  crossScriptLangs?: Record<TargetLang, boolean>,
 ): Promise<Map<number, BatchMatchResult>> {
   const results = new Map<number, BatchMatchResult>();
   const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
   const langNames: Record<TargetLang, string> = { en: "English", fr: "French", ru: "Russian", ar: "Arabic" };
+  const isCrossScript: Record<TargetLang, boolean> = crossScriptLangs ?? { en: false, fr: false, ru: false, ar: false };
 
   if (unmatchedRows.length === 0) return results;
 
@@ -2564,7 +2695,7 @@ export async function titleMatchUnmatched(
         const translated = translations[lang].get(row.title);
         if (translated) {
           const minSim = (lang === "ru" || lang === "ar") ? 0.55 : 0.60;
-          rowMatches[lang] = matchByTitle(translated, inv, minSim, roots, refDepths?.[lang], sourceSegments);
+          rowMatches[lang] = matchByTitle(translated, inv, minSim, roots, refDepths?.[lang], sourceSegments, isCrossScript[lang]);
           if (rowMatches[lang]) hasMatch = true;
         }
 
@@ -2578,7 +2709,7 @@ export async function titleMatchUnmatched(
             semanticAttempted++;
             semAttemptedByLang[lang]++;
             const minCos = (lang === "ru" || lang === "ar") ? 0.55 : 0.58;
-            const semMatch = matchByTitleSemantic(trEmb, inv, minCos, roots, refDepths?.[lang], sourceSegments);
+            const semMatch = matchByTitleSemantic(trEmb, inv, minCos, roots, refDepths?.[lang], sourceSegments, isCrossScript[lang]);
             if (semMatch) {
               // Note: semanticAccepted is NOT incremented here — only after the
               // match survives cross-validation, knownUrl filter, and dedup at
