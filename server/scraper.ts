@@ -2968,6 +2968,16 @@ export async function aiMatchUnmatched(
     ...(process.env.OPENAI_API_KEY ? {} : { baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL }),
   });
 
+  // Model selection: gpt-4.1-mini gives us a 1M-token context, removing the
+  // 128K bottleneck that was causing every batch to fail with "context length
+  // exceeded". The integrations path falls back to gpt-5-mini which is also
+  // large-context.
+  const chatModel = process.env.OPENAI_API_KEY ? "gpt-4.1-mini" : "gpt-5-mini";
+
+  const TITLE_TRUNC = 120;
+  const truncTitle = (t: string) =>
+    t && t.length > TITLE_TRUNC ? t.slice(0, TITLE_TRUNC) + "…" : t;
+
   const inventoryUrls: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
   const inventoryEntries: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
   const activeLangs: TargetLang[] = [];
@@ -2977,11 +2987,69 @@ export async function aiMatchUnmatched(
       const titleIdx = inventories[l]!.titleIndex;
       inventoryEntries[l] = inventoryUrls[l].map(u => {
         const t = titleIdx.get(u);
-        return t ? `${u}  |  ${t}` : u;
+        return t ? `${u}  |  ${truncTitle(t)}` : u;
       });
     }
     if (inventoryUrls[l].length > 0) activeLangs.push(l);
   }
+
+  // Per-language section buckets: section-segment -> indices into
+  // inventoryUrls[l]. The "section" is the first path segment after the
+  // language target root, normalized. URLs whose section can't be inferred
+  // (e.g. URLs at the section root, or URLs whose path doesn't actually
+  // start with the learned root) go into the "__no_section__" bucket and
+  // are always available as a fallback.
+  const NO_SECTION = "__no_section__";
+  const sectionBuckets: Record<TargetLang, Map<string, number[]>> = { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() };
+  for (const l of activeLangs) {
+    const targetRoot = langRoot(tabPatterns, l);
+    const targetRootNorm = targetRoot.map(s => normalizeSegment(s));
+    for (let i = 0; i < inventoryUrls[l].length; i++) {
+      const u = inventoryUrls[l][i];
+      let bucket = NO_SECTION;
+      try {
+        const parts = new URL(u).pathname.split("/").filter(Boolean);
+        const cleanParts = stripSuffix(parts);
+        // Only strip the root if the URL actually starts with it; otherwise
+        // we'd misread a deeper segment as the section.
+        let after: string[] = cleanParts;
+        if (targetRootNorm.length > 0) {
+          let matches = true;
+          for (let r = 0; r < targetRootNorm.length; r++) {
+            if (normalizeSegment(cleanParts[r] || "") !== targetRootNorm[r]) { matches = false; break; }
+          }
+          after = matches ? cleanParts.slice(targetRootNorm.length) : [];
+        }
+        if (after.length > 0) {
+          const seg = normalizeSegment(after[0]);
+          if (seg && seg !== "pages" && seg !== "default.aspx" && seg.length > 2) {
+            bucket = seg;
+          }
+        }
+      } catch {}
+      const arr = sectionBuckets[l].get(bucket) || [];
+      arr.push(i);
+      sectionBuckets[l].set(bucket, arr);
+    }
+  }
+
+  // For a given source section (a Hebrew slug), figure out what target-lang
+  // section bucket(s) to look in. We try the segment-translation map first
+  // (Hebrew→target word) and also the literal source section as a fallback
+  // (sections often share the same key across languages on this site).
+  const targetSectionsForSource = (srcSection: string, l: TargetLang): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const push = (s: string | null | undefined) => {
+      if (!s) return;
+      const k = normalizeSegment(s);
+      if (k && !seen.has(k)) { seen.add(k); out.push(k); }
+    };
+    const segs = tabPatterns.segmentMap.get(l);
+    if (segs && segs.has(srcSection)) push(segs.get(srcSection));
+    push(srcSection);
+    return out;
+  };
 
   // Filter examples to those that include at least one active target language,
   // so single-language runs aren't distracted by EN/FR pairs.
@@ -3015,13 +3083,67 @@ export async function aiMatchUnmatched(
     }
   }
 
-  const batches: AiMatchInput[][] = [];
-  for (let i = 0; i < unmatchedRows.length; i += AI_BATCH_SIZE) {
-    batches.push(unmatchedRows.slice(i, i + AI_BATCH_SIZE));
+  // Group unmatched rows by their source section (the first path segment of
+  // the Hebrew source URL after the source root). Batches are then formed
+  // *within* each section, so each prompt sees only the inventory slice that
+  // belongs to that section. This sharply reduces prompt size and stops the
+  // model from being distracted by cross-section URLs.
+  //
+  // Per-language source roots can differ when root learning produced
+  // different roots for different langs. For each row, try every active
+  // lang's source root and pick the one that actually prefixes the URL with
+  // the longest match. Fall back to NO_SECTION if none match.
+  const activeSrcRoots = activeLangs.map(l => langSrcRoot(tabPatterns, l));
+  const sectionForSource = (sourceUrl: string): string => {
+    let best: string | null = null;
+    let bestLen = -1;
+    let pathParts: string[] | null = null;
+    try {
+      pathParts = stripSuffix(new URL(sourceUrl).pathname.split("/").filter(Boolean));
+    } catch { return NO_SECTION; }
+    for (const root of activeSrcRoots) {
+      const rootNorm = root.map(s => normalizeSegment(s));
+      // Verify this root is actually a prefix of the URL.
+      if (rootNorm.length > pathParts.length) continue;
+      let matches = true;
+      for (let r = 0; r < rootNorm.length; r++) {
+        if (normalizeSegment(pathParts[r] || "") !== rootNorm[r]) { matches = false; break; }
+      }
+      if (!matches) continue;
+      if (rootNorm.length <= bestLen) continue;
+      const seg = getSourceSectionSegment(sourceUrl, root);
+      if (seg) { best = seg; bestLen = rootNorm.length; }
+    }
+    // Fallback: try with empty root so we still extract *some* segment for
+    // URLs whose root isn't yet learned.
+    if (!best) {
+      const seg = getSourceSectionSegment(sourceUrl, []);
+      if (seg) best = seg;
+    }
+    return best || NO_SECTION;
+  };
+
+  const rowsBySection = new Map<string, AiMatchInput[]>();
+  for (const row of unmatchedRows) {
+    const seg = sectionForSource(row.sourceUrl);
+    const arr = rowsBySection.get(seg) || [];
+    arr.push(row);
+    rowsBySection.set(seg, arr);
+  }
+
+  type SectionBatch = { section: string; rows: AiMatchInput[] };
+  const batches: SectionBatch[] = [];
+  // Iterate sections in deterministic order (largest first, then alpha) so logs are stable
+  const sectionOrder = Array.from(rowsBySection.entries())
+    .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+  for (const [section, rows] of sectionOrder) {
+    for (let i = 0; i < rows.length; i += AI_BATCH_SIZE) {
+      batches.push({ section, rows: rows.slice(i, i + AI_BATCH_SIZE) });
+    }
   }
 
   const invSummary = langs.map(l => `${inventoryUrls[l].length} ${l.toUpperCase()}`).join(", ");
-  log(`  AI matching: ${unmatchedRows.length} unmatched URLs in ${batches.length} batches (inventory: ${invSummary})`);
+  log(`  AI matching: ${unmatchedRows.length} unmatched URLs in ${batches.length} batches across ${rowsBySection.size} sections using ${chatModel} (inventory: ${invSummary})`);
 
   const usedUrls: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
   for (const l of langs) { for (const u of knownUrls[l]) usedUrls[l].add(u); }
@@ -3056,7 +3178,9 @@ export async function aiMatchUnmatched(
       log(`  AI matching ABORTED by user before batch ${batchIdx + 1}/${batches.length}`);
       break;
     }
-    const batch = batches[batchIdx];
+    const batchEntry = batches[batchIdx];
+    const batch = batchEntry.rows;
+    const batchSection = batchEntry.section;
 
     const urlsBlock = batch.map(row => {
       const parts = [`- Source URL: ${row.sourceUrl}`];
@@ -3069,17 +3193,38 @@ export async function aiMatchUnmatched(
       return parts.join("\n");
     }).join("\n\n");
 
-    // Filter out already-used URLs from the inventory shown to the model.
-    // The server-side `usedUrls` check below still rejects any leak, but
-    // hiding taken URLs from the prompt prevents the model from wasting
-    // suggestions on URLs we know we won't accept.
+    // Build the visible inventory from this batch's section bucket only.
+    // For each language we look up the section's URLs (mapping the source
+    // section through the segment translation map when present), then drop
+    // any already-used URLs. If the section bucket is empty for a language,
+    // we fall back to the full pool so we never hand the model an empty
+    // candidate list.
     const INVENTORY_PER_LANG_CAP = 2000;
     const inventoryBlocks: string[] = [];
-    const visibleStats: { lang: TargetLang; total: number; available: number; shown: number }[] = [];
+    const visibleStats: { lang: TargetLang; total: number; available: number; shown: number; scoped: boolean }[] = [];
     for (const l of activeLangs) {
       const totalCount = inventoryUrls[l].length;
+
+      // Pick candidate indices for this section; fall back to all indices if
+      // the section bucket is missing or empty after used-URL filtering.
+      let candidateIndices: number[] = [];
+      let scoped = false;
+      if (batchSection !== NO_SECTION) {
+        const targetSecs = targetSectionsForSource(batchSection, l);
+        const seen = new Set<number>();
+        for (const ts of targetSecs) {
+          const arr = sectionBuckets[l].get(ts);
+          if (!arr) continue;
+          for (const idx of arr) if (!seen.has(idx)) { seen.add(idx); candidateIndices.push(idx); }
+        }
+        if (candidateIndices.length > 0) scoped = true;
+      }
+      if (candidateIndices.length === 0) {
+        candidateIndices = Array.from({ length: inventoryUrls[l].length }, (_, i) => i);
+      }
+
       const available: string[] = [];
-      for (let i = 0; i < inventoryUrls[l].length; i++) {
+      for (const i of candidateIndices) {
         if (!usedUrls[l].has(inventoryUrls[l][i])) {
           available.push(inventoryEntries[l][i]);
         }
@@ -3091,11 +3236,12 @@ export async function aiMatchUnmatched(
       const truncatedNote = available.length > shown.length
         ? `\n... (${available.length - shown.length} more available; not shown to keep prompt small)`
         : "";
+      const scopeLabel = scoped ? `section "${batchSection}"` : `all sections (no scoped candidates for "${batchSection}")`;
       const list = shown.length > 0
         ? shown.join("\n") + truncatedNote
-        : `(no ${langLabels[l]} URLs left — all ${totalCount} inventory URLs already matched)`;
-      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs with page titles (${availableCount} unused of ${totalCount} total — pick ONLY the URL part, text after "  |  " is the page title):\n${list}`);
-      visibleStats.push({ lang: l, total: totalCount, available: availableCount, shown: shown.length });
+        : `(no ${langLabels[l]} URLs left in ${scopeLabel} — all candidates already matched)`;
+      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs in ${scopeLabel} with page titles (${availableCount} unused of ${totalCount} total — pick ONLY the URL part, text after "  |  " is the page title):\n${list}`);
+      visibleStats.push({ lang: l, total: totalCount, available: availableCount, shown: shown.length, scoped });
     }
 
     // Tiny reminder block: only the generic /Pages/default.aspx-style index
@@ -3163,7 +3309,7 @@ Return ONLY the JSON array, no other text.`;
         try {
           if (signal?.aborted) { content = null; break; }
           const response = await openai.chat.completions.create({
-            model: process.env.OPENAI_API_KEY ? "gpt-4o-mini" : "gpt-5-mini",
+            model: chatModel,
             messages: [
               { role: "system", content: systemPrompt },
               { role: "user", content: userPrompt },
@@ -3297,8 +3443,8 @@ Return ONLY the JSON array, no other text.`;
       }
 
       aiMatches += batchMatches;
-      const visibleStr = visibleStats.map(v => `${v.lang.toUpperCase()}:${v.shown}/${v.available}`).join(" ");
-      log(`  AI batch ${batchIdx + 1}/${batches.length}: ${batchMatches} matches from ${batch.length} URLs (visible inventory ${visibleStr})`);
+      const visibleStr = visibleStats.map(v => `${v.lang.toUpperCase()}:${v.shown}/${v.available}${v.scoped ? "" : "*"}`).join(" ");
+      log(`  AI batch ${batchIdx + 1}/${batches.length} [${batchSection}] (${chatModel}): ${batchMatches} matches from ${batch.length} URLs (visible inventory ${visibleStr})`);
 
       if (batchMatches === 0) {
         consecutiveZeroBatches++;
@@ -3319,8 +3465,29 @@ Return ONLY the JSON array, no other text.`;
         consecutiveZeroBatches = 0;
       }
     } catch (error: any) {
-      log(`  AI batch ${batchIdx + 1}/${batches.length} error: ${error?.message?.substring(0, 200)}`);
-      consecutiveZeroBatches = 0;
+      const status = error?.status || error?.response?.status;
+      const msg = String(error?.message || "");
+      const isContextLen = status === 400 && /context length|maximum context|too many tokens/i.test(msg);
+      if (isContextLen) {
+        log(`  AI batch ${batchIdx + 1}/${batches.length} [${batchSection}] CONTEXT-LENGTH error (${chatModel}): ${msg.substring(0, 200)}`);
+        // Treat context-length failures as "0-match completed" batches so the
+        // existing early-exit kicks in if they keep happening — otherwise a
+        // mis-sized prompt would silently burn through every batch.
+        consecutiveZeroBatches++;
+        const minBatchesBeforeEarlyExit = Math.max(8, Math.floor(batches.length / 3));
+        if (
+          consecutiveZeroBatches >= ZERO_BATCH_EARLY_EXIT &&
+          batchIdx + 1 >= minBatchesBeforeEarlyExit &&
+          batchIdx < batches.length - 1
+        ) {
+          const remaining = batches.length - batchIdx - 1;
+          log(`  AI matching EARLY EXIT: ${consecutiveZeroBatches} consecutive batches yielded 0 matches (incl. context-length errors) after ${batchIdx + 1}/${batches.length}. Skipping remaining ${remaining} batches.`);
+          break;
+        }
+      } else {
+        log(`  AI batch ${batchIdx + 1}/${batches.length} [${batchSection}] error: ${msg.substring(0, 200)}`);
+        consecutiveZeroBatches = 0;
+      }
     }
 
     if (batchIdx < batches.length - 1) {
