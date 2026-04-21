@@ -3302,9 +3302,17 @@ Return ONLY the JSON array, no other text.`;
 
       if (batchMatches === 0) {
         consecutiveZeroBatches++;
-        if (consecutiveZeroBatches >= ZERO_BATCH_EARLY_EXIT && batchIdx < batches.length - 1) {
+        // Guard: don't early-exit too soon. Require we've already worked
+        // through at least 1/3 of the planned batches (or 8, whichever is
+        // larger), so a slow start on a long run doesn't bail prematurely.
+        const minBatchesBeforeEarlyExit = Math.max(8, Math.floor(batches.length / 3));
+        if (
+          consecutiveZeroBatches >= ZERO_BATCH_EARLY_EXIT &&
+          batchIdx + 1 >= minBatchesBeforeEarlyExit &&
+          batchIdx < batches.length - 1
+        ) {
           const remaining = batches.length - batchIdx - 1;
-          log(`  AI matching EARLY EXIT: ${consecutiveZeroBatches} consecutive batches yielded 0 matches. Skipping remaining ${remaining} batches.`);
+          log(`  AI matching EARLY EXIT: ${consecutiveZeroBatches} consecutive batches yielded 0 matches after ${batchIdx + 1}/${batches.length} batches. Skipping remaining ${remaining} batches.`);
           break;
         }
       } else {
