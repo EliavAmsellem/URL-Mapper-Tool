@@ -51,5 +51,20 @@ The system supports multi-pass processing, where newly matched URLs in each pass
 -   HTTP HEAD requests are made to verify the existence of constructed target URLs.
 -   Google Translate (GTX endpoint) is used for Hebrew→EN/FR/RU/AR title translations.
 
+### Optional `Seeds` sheet
+Workbooks may include an extra sheet named `Seeds` (or `Seed`, case-insensitive) to override the per-tab crawl anchor for any target language. This is useful when the data sheet has zero reference rows for that language (the planner would otherwise skip the tab) or when the auto-derived anchors leak into unrelated sections.
+
+Layout:
+- Row 1 = header. Recognized columns: `Tab` (or `Sheet`/`Name`), `EN`, `FR`, `RU`, `AR`. If headers are missing, columns are read positionally as `Tab, EN, FR, RU, AR`.
+- One row per data tab. Cells may contain a full URL or a path; both are normalized to a path. Empty cells = no override.
+
+Example:
+| Tab | EN | RU |
+|---|---|---|
+| BTL About | | /RussianHomePage/Odot_ru/ |
+| BTL war updates | | /RussianHomePage/Odot_ru/mitsuiZchuyot/IruimBeChaim/HaravotBarzel1/ |
+
+When a `(tab, lang)` cell is filled, that path becomes the **sole** crawl anchor for that tab + language; auto-inferred anchors falling outside it are dropped (no cross-tab leakage), and the "no learned root → skip whole tab" early-return is bypassed. Empty cells fall back to today's auto-derivation. Tab names that don't match any data sheet are warned about and ignored. If the `Seeds` sheet is absent, the workbook works exactly as before.
+
 ### Target Languages
 The system supports four target languages: English (EN), French (FR), Russian (RU), and Arabic (AR). Source language is always Hebrew. Excel columns: 0=Title, 1=Source, 2=EN, 3=FR, 4=RU, 5=AR. The `TargetLang` type alias (`"en" | "fr" | "ru" | "ar"`) and helper functions (`langRoot`, `langSrcRoot`, `langCrawlScope`, `getResultUrl`, `getResultConf`, `getResultMethod`, `setResultMatch`, `clearResultMatch`, `emptyBatchResult`) centralize language-specific access to pattern data and match results, avoiding duplicated EN/FR ternaries.

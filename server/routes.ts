@@ -82,6 +82,81 @@ async function readWorkbook(filePath: string, originalName?: string): Promise<Ex
   return wb;
 }
 
+const SEEDS_SHEET_NAMES = new Set(["seeds", "seed"]);
+function isSeedsSheet(name: string): boolean {
+  return SEEDS_SHEET_NAMES.has(name.trim().toLowerCase());
+}
+
+export type SeedMap = Map<string, Partial<Record<TargetLang, string>>>;
+
+function normalizeSeedToPath(raw: string): string | null {
+  const v = raw.trim();
+  if (!v) return null;
+  let p: string;
+  if (/^https?:\/\//i.test(v)) {
+    try { p = new URL(v).pathname; } catch { return null; }
+  } else {
+    p = v.startsWith("/") ? v : "/" + v;
+  }
+  if (!p.endsWith("/")) {
+    const last = p.split("/").pop() || "";
+    if (!/\.[a-z0-9]{2,5}$/i.test(last)) p += "/";
+  }
+  return p;
+}
+
+function parseSeedsSheet(ws: ExcelJS.Worksheet, knownSheets: string[]): SeedMap {
+  const result: SeedMap = new Map();
+  const data = worksheetToAoa(ws);
+  if (data.length === 0) return result;
+  const headerRowCells = data[0].map(c => (c || "").toString().trim().toLowerCase());
+
+  let tabCol = 0;
+  const langCol: Partial<Record<TargetLang, number>> = {};
+  let headerDetected = false;
+  for (let i = 0; i < headerRowCells.length; i++) {
+    const h = headerRowCells[i];
+    if (h === "tab" || h === "sheet" || h === "name" || h === "tab name" || h === "sheet name") { tabCol = i; headerDetected = true; }
+    else if (h === "en" || h === "english") { langCol.en = i; headerDetected = true; }
+    else if (h === "fr" || h === "french") { langCol.fr = i; headerDetected = true; }
+    else if (h === "ru" || h === "russian") { langCol.ru = i; headerDetected = true; }
+    else if (h === "ar" || h === "arabic") { langCol.ar = i; headerDetected = true; }
+  }
+  if (!headerDetected) {
+    langCol.en = 1; langCol.fr = 2; langCol.ru = 3; langCol.ar = 4;
+  }
+  const startRow = headerDetected ? 1 : 0;
+  if (data.length <= startRow) return result;
+
+  const knownLower = new Map<string, string>();
+  for (const s of knownSheets) knownLower.set(s.toLowerCase(), s);
+
+  for (let r = startRow; r < data.length; r++) {
+    const row = data[r];
+    const tabRaw = (row[tabCol] || "").toString().trim();
+    if (!tabRaw) continue;
+    const matched = knownLower.get(tabRaw.toLowerCase());
+    if (!matched) {
+      log(`Seeds sheet: tab "${tabRaw}" (row ${r + 1}) does not match any data sheet — ignoring`);
+      continue;
+    }
+    const entry: Partial<Record<TargetLang, string>> = {};
+    for (const l of ["en", "fr", "ru", "ar"] as TargetLang[]) {
+      const ci = langCol[l];
+      if (ci === undefined) continue;
+      const cell = (row[ci] || "").toString();
+      const seg = normalizeSeedToPath(cell);
+      if (seg) entry[l] = seg;
+    }
+    if (Object.keys(entry).length > 0) result.set(matched, entry);
+  }
+  return result;
+}
+
+function pathToSegments(p: string): string[] {
+  return p.split("/").filter(Boolean).filter(s => !/\.[a-z0-9]{2,5}$/i.test(s));
+}
+
 function findJobFile(jobId: string): string | null {
   for (const ext of [".xlsx", ".xls", ".csv"]) {
     const p = `/tmp/uploads/${jobId}${ext}`;
@@ -129,6 +204,7 @@ export async function registerRoutes(
       let totalUrls = 0;
 
       for (const worksheet of workbook.worksheets) {
+        if (isSeedsSheet(worksheet.name)) continue;
         totalUrls += Math.max(0, worksheet.rowCount - 1);
       }
 
@@ -162,7 +238,7 @@ export async function registerRoutes(
       fs.copyFileSync(req.file.path, savedPath);
       fs.unlinkSync(req.file.path);
 
-      res.json({ jobId: job.id, totalUrls, sheets: workbook.worksheets.map(ws => ws.name) });
+      res.json({ jobId: job.id, totalUrls, sheets: workbook.worksheets.filter(ws => !isSeedsSheet(ws.name)).map(ws => ws.name) });
     } catch (error: any) {
       log(`Upload error: ${error.message}`);
       res.status(500).json({ message: error.message });
@@ -423,6 +499,7 @@ async function matchTab(
   control: JobControl,
   targetLangs: TargetLang[],
   crawlPageCap: number,
+  seedOverrides?: Partial<Record<TargetLang, string>>,
 ): Promise<{
   matchResults: Map<number, BatchMatchResult>;
   inventories: Record<TargetLang, CrawlInventory | null>;
@@ -443,7 +520,19 @@ async function matchTab(
   const inventories: Record<TargetLang, CrawlInventory | null> = { en: null, fr: null, ru: null, ar: null };
   const usedUrls: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
 
+  const userSeedSegs: Partial<Record<TargetLang, string[]>> = {};
+  if (seedOverrides) {
+    for (const l of langs) {
+      const p = seedOverrides[l];
+      if (p) {
+        const segs = pathToSegments(p);
+        if (segs.length > 0) userSeedSegs[l] = segs;
+      }
+    }
+  }
+
   const hasAnyRoot = langs.some(l => {
+    if (userSeedSegs[l]) return true;
     if (langRoot(tabPatterns, l).length > 0) return true;
     const pp = tabPatterns.rootMappings.get(l) || [];
     if (pp.some(m => m.targetRoot.length > 0)) return true;
@@ -455,7 +544,7 @@ async function matchTab(
   }
 
   for (const l of langs) {
-    if (langRoot(tabPatterns, l).length > 0) tabPatterns.patternValidated[l] = true;
+    if (langRoot(tabPatterns, l).length > 0 || userSeedSegs[l]) tabPatterns.patternValidated[l] = true;
   }
 
   const origin = (() => {
@@ -520,7 +609,9 @@ async function matchTab(
     const root = langRoot(tabPatterns, l);
     const perPair = tabPatterns.rootMappings.get(l) || [];
     const hasPerPairRoot = perPair.some(m => m.targetRoot.length > 0);
-    if (!origin || (root.length === 0 && !hasPerPairRoot)) continue;
+    const userSeed = userSeedSegs[l];
+    if (!origin) continue;
+    if (!userSeed && root.length === 0 && !hasPerPairRoot) continue;
 
     const anchorRoots: string[][] = [];
     const seenAnchors = new Set<string>();
@@ -534,7 +625,15 @@ async function matchTab(
     }
 
     let crawlScopes: string[][];
-    if (anchorRoots.length > 0) {
+    if (userSeed) {
+      const userPath = userSeed.map(s => s.toLowerCase()).join("/");
+      const droppedAuto = anchorRoots.filter(a => {
+        const ap = a.map(s => s.toLowerCase()).join("/");
+        return !(ap === userPath || ap.startsWith(userPath + "/"));
+      }).length;
+      log(`  ${langLabels[l]}: anchor source=user-provided /${userSeed.join("/")}/ (${anchorRoots.length} auto-anchors considered, ${droppedAuto} outside user scope dropped)`);
+      crawlScopes = [userSeed];
+    } else if (anchorRoots.length > 0) {
       const sorted = anchorRoots.slice().sort((a, b) => a.length - b.length);
       const kept: string[][] = [];
       for (const cand of sorted) {
@@ -548,11 +647,13 @@ async function matchTab(
       if (kept.length < anchorRoots.length) {
         log(`  ${langLabels[l]}: coalesced ${anchorRoots.length} raw anchors → ${kept.length} top-level anchor(s)`);
       }
+      log(`  ${langLabels[l]}: anchor source=auto-inferred (${kept.length} anchor(s))`);
       crawlScopes = kept;
     } else {
       let commonScope = langCrawlScope(tabPatterns, l);
       if (commonScope.length === 0 && root.length > 0) commonScope = root;
       if (commonScope.length === 0) continue;
+      log(`  ${langLabels[l]}: anchor source=auto-inferred (fallback to common scope /${commonScope.join("/")}/)`);
       crawlScopes = [commonScope];
     }
 
@@ -608,8 +709,11 @@ async function matchTab(
   for (const l of langs) {
     const inv = inventories[l];
     if (!inv) continue;
+    const userSeed = userSeedSegs[l];
+    const userScopePath = userSeed ? "/" + userSeed.join("/") : null;
     const refSeeds: string[] = [];
     const seenSeed = new Set<string>();
+    let droppedOutOfScope = 0;
     for (const ref of tabRefRows) {
       const url = ref[refUrlKey[l]];
       if (!url || seenSeed.has(url)) continue;
@@ -617,8 +721,15 @@ async function matchTab(
       try {
         const p = new URL(url);
         if (p.origin !== origin) continue;
+        if (userScopePath && !p.pathname.toLowerCase().startsWith(userScopePath.toLowerCase())) {
+          droppedOutOfScope++;
+          continue;
+        }
       } catch { continue; }
       refSeeds.push(url);
+    }
+    if (userScopePath && droppedOutOfScope > 0) {
+      log(`  ${langLabels[l]} seed verification: dropped ${droppedOutOfScope} ref URL(s) outside user-provided scope ${userScopePath}/`);
     }
     if (refSeeds.length === 0) continue;
     verifyPromises.push(
@@ -987,9 +1098,31 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
   const crawlCache = new Map<string, CrawlInventory>();
 
   const allTabData: TabData[] = [];
+  let seedsSheet: ExcelJS.Worksheet | null = null;
   for (const worksheet of workbook.worksheets) {
+    if (isSeedsSheet(worksheet.name)) {
+      seedsSheet = worksheet;
+      continue;
+    }
     const td = parseSheet(worksheet.name, worksheet, targetLangs);
     if (td) allTabData.push(td);
+  }
+
+  const seedMap: SeedMap = seedsSheet
+    ? parseSeedsSheet(seedsSheet, allTabData.map(t => t.sheetName))
+    : new Map();
+  if (seedsSheet) {
+    if (seedMap.size === 0) {
+      log(`Job ${jobId}: Seeds sheet found but no usable rows`);
+    } else {
+      const summary: string[] = [];
+      for (const [tab, entry] of Array.from(seedMap.entries())) {
+        const langs = (Object.keys(entry) as TargetLang[]).filter(l => entry[l]);
+        const parts = langs.map(l => `${l.toUpperCase()}=${entry[l]}`).join(", ");
+        summary.push(`"${tab}" {${parts}}`);
+      }
+      log(`Job ${jobId}: Seeds sheet provides overrides for ${seedMap.size} tab(s): ${summary.join("; ")}`);
+    }
   }
 
   const allLangs: TargetLang[] = ["en", "fr", "ru", "ar"];
@@ -1088,7 +1221,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       const stepLabel = pass > 1 ? `pass${pass}:${tabData.sheetName}` : `matching:${tabData.sheetName}`;
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
-      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap);
+      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName));
       tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
 
       if (!globalMatchResults.has(tabData.sheetName)) {
