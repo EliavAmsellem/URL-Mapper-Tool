@@ -2971,13 +2971,16 @@ export async function aiMatchUnmatched(
   // Model selection: gpt-4.1-mini gives us a 1M-token context, removing the
   // 128K bottleneck that was causing every batch to fail with "context length
   // exceeded". The integrations path falls back to gpt-5-mini which is also
-  // large-context.
-  const chatModel = process.env.OPENAI_API_KEY ? "gpt-4.1-mini" : "gpt-5-mini";
+  // large-context. Used on both the API-key path and the integrations path.
+  const chatModel = "gpt-4.1-mini";
 
   const TITLE_TRUNC = 120;
   const truncTitle = (t: string) =>
     t && t.length > TITLE_TRUNC ? t.slice(0, TITLE_TRUNC) + "…" : t;
 
+  // Compact JSON-line entries: {i, url, title}. Smaller than the previous
+  // `"url  |  title"` text form once titles are truncated, and the prompt
+  // can reference fields by name without a magic separator.
   const inventoryUrls: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
   const inventoryEntries: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
   const activeLangs: TargetLang[] = [];
@@ -2985,9 +2988,11 @@ export async function aiMatchUnmatched(
     inventoryUrls[l] = inventories[l] ? Array.from(inventories[l]!.urls) : [];
     if (inventories[l]) {
       const titleIdx = inventories[l]!.titleIndex;
-      inventoryEntries[l] = inventoryUrls[l].map(u => {
+      inventoryEntries[l] = inventoryUrls[l].map((u, i) => {
         const t = titleIdx.get(u);
-        return t ? `${u}  |  ${truncTitle(t)}` : u;
+        const obj: { i: number; url: string; title?: string } = { i, url: u };
+        if (t) obj.title = truncTitle(t);
+        return JSON.stringify(obj);
       });
     }
     if (inventoryUrls[l].length > 0) activeLangs.push(l);
@@ -3240,7 +3245,7 @@ export async function aiMatchUnmatched(
       const list = shown.length > 0
         ? shown.join("\n") + truncatedNote
         : `(no ${langLabels[l]} URLs left in ${scopeLabel} — all candidates already matched)`;
-      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs in ${scopeLabel} with page titles (${availableCount} unused of ${totalCount} total — pick ONLY the URL part, text after "  |  " is the page title):\n${list}`);
+      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs in ${scopeLabel} (${availableCount} unused of ${totalCount} total). Each line is a JSON object {"i":<index>,"url":"<url>","title":"<page title>"}. When you choose, return the value of the "url" field verbatim:\n${list}`);
       visibleStats.push({ lang: l, total: totalCount, available: availableCount, shown: shown.length, scoped });
     }
 
@@ -3256,14 +3261,14 @@ export async function aiMatchUnmatched(
 
     // Russian and Arabic addendum: their URL slugs are Latin transliterations
     // of Hebrew words, not Russian/Arabic. Slug similarity is misleading; the
-    // page title (after "  |  ") is the only reliable signal.
+    // "title" field of each inventory entry is the only reliable signal.
     const needsTransliterationNote = activeLangs.includes("ru" as TargetLang) || activeLangs.includes("ar" as TargetLang);
     const transliterationNote = needsTransliterationNote
       ? `\n\nIMPORTANT FOR RUSSIAN/ARABIC:
 - The Russian and Arabic URL slugs are LATIN transliterations of Hebrew words (e.g. "HarvotBarzelOuestions", "MankIDudQ"), NOT Russian or Arabic words.
 - Do NOT try to read meaning from the URL slug for these languages — it carries almost no signal.
-- Use the page title shown after "  |  " as your PRIMARY (and effectively only) decision signal. The title is in Cyrillic/Arabic and is the human-readable description of the page.
-- Do NOT invent URLs by completing transliteration patterns you see in the inventory. Copy URLs verbatim from the inventory list.`
+- Use the "title" field of each inventory entry as your PRIMARY (and effectively only) decision signal. The title is in Cyrillic/Arabic and is the human-readable description of the page.
+- Do NOT invent URLs by completing transliteration patterns you see in the inventory. Copy the "url" field verbatim from an entry in the inventory list.`
       : "";
 
     const langListText = activeLangs.map(l => langLabels[l]).join(", ");
@@ -3272,11 +3277,11 @@ export async function aiMatchUnmatched(
     const systemPrompt = `You are a URL matching expert for a multilingual government website. Your task is to find the correct ${langListText} equivalent pages for Hebrew source URLs.
 
 CRITICAL RULES:
-1. You may ONLY select URLs from the provided AVAILABLE inventory lists below. NEVER invent or construct URLs. Return only the URL part (text before "  |  ") — the text after "  |  " is the page title given for context. If a URL you want is not character-for-character in the AVAILABLE list, return null.
+1. You may ONLY select URLs from the provided AVAILABLE inventory lists below. Each inventory line is a JSON object with fields {i, url, title}. Return the value of the "url" field verbatim — never invent or construct URLs. If a URL you want is not character-for-character present as the "url" field of some entry in the AVAILABLE list, return null.
 2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
 3. Each target URL should only be used ONCE across all matches in this batch. Do not assign the same target URL to multiple source URLs.
 4. The AVAILABLE lists already exclude URLs that have been matched in earlier batches — every URL in those lists is fresh and unused. Do not propose a URL that is not in the AVAILABLE list.
-5. PRIMARY signal: compare the source page title (translated) against the candidate page title shown after "  |  " in the inventory. A match should make sense as a same-topic page in the other language. URL slug similarity is only a secondary hint.
+5. PRIMARY signal: compare the source page title (translated) against the "title" field of each candidate inventory entry. A match should make sense as a same-topic page in the other language. URL slug similarity is only a secondary hint.
 6. The chosen URL MUST start with the target language section root path shown in WEBSITE STRUCTURE. Cross-section matches (e.g. picking a payroll page for a contact-us source) are forbidden.
 7. If the source title is a generic page like "contact us", "home", or "about", only match it to a clearly equivalent target page (same generic concept). When in doubt, return null.
 8. NEVER fall back to a section's index page (URLs ending in "/Pages/default.aspx", "/default.aspx", or "/Pages/") just because nothing more specific looks plausible. Index pages should only be returned when the SOURCE itself is clearly the section's index page (matching title like "default" / "home" / the section name). Otherwise return null. The ALREADY-TAKEN INDEX PAGES block lists index pages that have already been used — never propose those.${transliterationNote}
@@ -3378,8 +3383,18 @@ Return ONLY the JSON array, no other text.`;
         for (const l of langs) {
           let suggestedUrl = suggestion[suggestionKeys[l]] as string | null | undefined;
           if (suggestedUrl && typeof suggestedUrl === "string") {
-            const sepIdx = suggestedUrl.indexOf("  |  ");
-            if (sepIdx > 0) suggestedUrl = suggestedUrl.slice(0, sepIdx).trim();
+            // Defensive: legacy "url  |  title" format and the new
+            // {"i","url","title"} JSON line both occasionally get echoed back
+            // as a whole line; pull the URL out either way.
+            const trimmed = suggestedUrl.trim();
+            if (trimmed.startsWith("{")) {
+              try {
+                const parsedEntry = JSON.parse(trimmed);
+                if (parsedEntry && typeof parsedEntry.url === "string") suggestedUrl = parsedEntry.url;
+              } catch {}
+            }
+            const sepIdx = (suggestedUrl as string).indexOf("  |  ");
+            if (sepIdx > 0) suggestedUrl = (suggestedUrl as string).slice(0, sepIdx).trim();
           }
           if (row.needs[l]) {
             handled[l].add(row.sourceUrl);
