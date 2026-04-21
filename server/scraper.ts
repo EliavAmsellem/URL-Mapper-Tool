@@ -1728,21 +1728,44 @@ export function detectCrossScriptLangs(
  */
 export interface AlternateLinkHarvestResult {
   matches: Map<string, Partial<Record<TargetLang, string>>>;
+  attempted: number;
   fetched: number;
-  pagesWithLinks: number;
+  cacheHits: number;
+  pagesWithAnyAlternate: number;
+  pagesWithInventoryHit: number;
   perLangAccepted: Record<TargetLang, number>;
+  perLangRejectedNotInInventory: Record<TargetLang, number>;
 }
+
+/**
+ * Per-source-URL cache of parsed alternate-link results. Shared across multi-pass
+ * reruns within the same job so identical source pages are not re-fetched.
+ * Cached value is the *raw* per-lang resolved-href map (before inventory check)
+ * plus a flag for "page had at least one alternate tag at all". Inventory
+ * filtering is re-applied each call because inventories can grow between passes.
+ */
+export interface AlternateLinkCacheEntry {
+  rawByLang: Partial<Record<TargetLang, string>>;
+  hadAnyAlternate: boolean;
+  fetchOk: boolean;
+}
+export type AlternateLinkCache = Map<string, AlternateLinkCacheEntry>;
 
 export async function harvestAlternateLinks(
   sources: { sourceUrl: string; needs: Partial<Record<TargetLang, boolean>> }[],
   inventories: Record<TargetLang, CrawlInventory | null>,
   signal?: AbortSignal,
   concurrency: number = 6,
+  cache?: AlternateLinkCache,
 ): Promise<AlternateLinkHarvestResult> {
   const matches = new Map<string, Partial<Record<TargetLang, string>>>();
   const perLangAccepted: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  const perLangRejectedNotInInventory: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  let attempted = 0;
   let fetched = 0;
-  let pagesWithLinks = 0;
+  let cacheHits = 0;
+  let pagesWithAnyAlternate = 0;
+  let pagesWithInventoryHit = 0;
 
   const checkInventory = (lang: TargetLang, candidate: string): string | null => {
     const inv = inventories[lang];
@@ -1756,41 +1779,73 @@ export async function harvestAlternateLinks(
     return inv.normalizedIndex.get(norm) || null;
   };
 
+  const parsePage = (html: string, sourceUrl: string): AlternateLinkCacheEntry => {
+    let $: cheerio.CheerioAPI;
+    try { $ = cheerio.load(html); } catch {
+      return { rawByLang: {}, hadAnyAlternate: false, fetchOk: true };
+    }
+    const rawByLang: Partial<Record<TargetLang, string>> = {};
+    let hadAny = false;
+    $('link[rel="alternate"][hreflang], a[hreflang]').each((_, el) => {
+      const hrefRaw = $(el).attr("href");
+      const hl = ($(el).attr("hreflang") || "").toLowerCase().split("-")[0];
+      if (!hrefRaw || !hl) return;
+      if (!(["en", "fr", "ru", "ar"] as string[]).includes(hl)) return;
+      const lang = hl as TargetLang;
+      hadAny = true;
+      if (rawByLang[lang]) return;
+      let resolved: string;
+      try { resolved = new URL(hrefRaw, sourceUrl).toString(); } catch { return; }
+      rawByLang[lang] = resolved;
+    });
+    return { rawByLang, hadAnyAlternate: hadAny, fetchOk: true };
+  };
+
   for (let i = 0; i < sources.length; i += concurrency) {
     if (signal?.aborted) break;
     const batch = sources.slice(i, i + concurrency);
     await Promise.all(batch.map(async (item) => {
       if (signal?.aborted) return;
-      const outcome = await fetchPageDetailed(item.sourceUrl, signal);
-      fetched++;
-      if (!outcome.html) return;
-      let $: cheerio.CheerioAPI;
-      try { $ = cheerio.load(outcome.html); } catch { return; }
+      attempted++;
+      let entry = cache?.get(item.sourceUrl);
+      if (entry) {
+        cacheHits++;
+      } else {
+        const outcome = await fetchPageDetailed(item.sourceUrl, signal);
+        fetched++;
+        if (!outcome.html) {
+          entry = { rawByLang: {}, hadAnyAlternate: false, fetchOk: false };
+        } else {
+          entry = parsePage(outcome.html, item.sourceUrl);
+        }
+        cache?.set(item.sourceUrl, entry);
+      }
+      if (entry.hadAnyAlternate) pagesWithAnyAlternate++;
       const found: Partial<Record<TargetLang, string>> = {};
-      $('link[rel="alternate"][hreflang], a[hreflang]').each((_, el) => {
-        const hrefRaw = $(el).attr("href");
-        const hl = ($(el).attr("hreflang") || "").toLowerCase().split("-")[0];
-        if (!hrefRaw || !hl) return;
-        if (!(["en", "fr", "ru", "ar"] as string[]).includes(hl)) return;
-        const lang = hl as TargetLang;
-        if (!item.needs[lang]) return;
-        if (found[lang]) return;
-        let resolved: string;
-        try { resolved = new URL(hrefRaw, item.sourceUrl).toString(); } catch { return; }
+      for (const lang of ["en", "fr", "ru", "ar"] as TargetLang[]) {
+        if (!item.needs[lang]) continue;
+        const resolved = entry.rawByLang[lang];
+        if (!resolved) continue;
         const matched = checkInventory(lang, resolved);
         if (matched) {
           found[lang] = matched;
           perLangAccepted[lang]++;
+        } else {
+          perLangRejectedNotInInventory[lang]++;
         }
-      });
+      }
       if (Object.keys(found).length > 0) {
-        pagesWithLinks++;
+        pagesWithInventoryHit++;
         matches.set(item.sourceUrl, found);
       }
     }));
     await abortAwareSleep(150, signal);
   }
-  return { matches, fetched, pagesWithLinks, perLangAccepted };
+  return {
+    matches, attempted, fetched, cacheHits,
+    pagesWithAnyAlternate, pagesWithInventoryHit,
+    perLangAccepted, perLangRejectedNotInInventory,
+  };
 }
 
 export function matchAgainstInventory(

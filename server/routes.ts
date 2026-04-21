@@ -39,6 +39,7 @@ import {
   verifySeedUrls,
   detectCrossScriptLangs,
   harvestAlternateLinks,
+  type AlternateLinkCache,
 } from "./scraper";
 import { log } from "./index";
 
@@ -509,6 +510,7 @@ async function matchTab(
   targetLangs: TargetLang[],
   crawlPageCap: number,
   seedOverrides?: Partial<Record<TargetLang, string>>,
+  alternateLinkCache?: AlternateLinkCache,
 ): Promise<{
   matchResults: Map<number, BatchMatchResult>;
   inventories: Record<TargetLang, CrawlInventory | null>;
@@ -886,19 +888,34 @@ async function matchTab(
       const allEntries = Array.from(sourceToRows.entries());
       const cappedEntries = allEntries.slice(0, HARVEST_CAP);
       const capped = cappedEntries.map(([sourceUrl, v]) => ({ sourceUrl, needs: v.needs }));
-      log(`  Pass 1.5 alternate-link harvest: fetching ${capped.length}${allEntries.length > capped.length ? `/${allEntries.length} (capped)` : ""} unique source pages for hreflang links...`);
-      const harvest = await harvestAlternateLinks(capped, inventories, control.signal, 6);
+      log(`  Pass 1.5 alternate-link harvest: ${capped.length}${allEntries.length > capped.length ? `/${allEntries.length} (capped)` : ""} unique source pages, scanning for hreflang links${alternateLinkCache ? " (with per-job cache)" : ""}...`);
+      // Per-row needs are carried into the apply phase so a row that doesn't need
+      // a given lang cannot accidentally consume the inventory URL via usedUrls
+      // and starve a sibling row that does need it.
+      const rowNeedsByIndex = new Map<number, Partial<Record<TargetLang, boolean>>>();
+      for (const row of needsMatching) {
+        const m = matchResults.get(row.rowIndex);
+        const rn: Partial<Record<TargetLang, boolean>> = {};
+        for (const l of langs) {
+          if (row[needsKey[l]] && (!m || !getResultUrl(m, l)) && inventories[l]) rn[l] = true;
+        }
+        rowNeedsByIndex.set(row.rowIndex, rn);
+      }
+      const harvest = await harvestAlternateLinks(capped, inventories, control.signal, 6, alternateLinkCache);
       let harvestApplied = 0;
       for (const [sourceUrl, found] of Array.from(harvest.matches.entries())) {
         const group = sourceToRows.get(sourceUrl);
         if (!group) continue;
         for (const rowIndex of group.rowIndexes) {
+          const rowNeeds = rowNeedsByIndex.get(rowIndex);
+          if (!rowNeeds) continue;
           let result = matchResults.get(rowIndex);
           if (!result) {
             result = emptyBatchResult();
             matchResults.set(rowIndex, result);
           }
           for (const l of langs) {
+            if (!rowNeeds[l]) continue;
             const url = found[l];
             if (!url) continue;
             if (getResultUrl(result, l)) continue;
@@ -909,8 +926,10 @@ async function matchTab(
           }
         }
       }
-      const perLang = langs.map(l => `${l.toUpperCase()}:${harvest.perLangAccepted[l]}`).join(", ");
-      log(`  Pass 1.5 harvest: ${harvest.fetched} pages fetched, ${harvest.pagesWithLinks} had inventory hreflang links, ${harvestApplied} matches applied to ${needsMatching.length} rows (${perLang})`);
+      const perLangAcc = langs.map(l => `${l.toUpperCase()}:${harvest.perLangAccepted[l]}`).join(", ");
+      const perLangRej = langs.map(l => `${l.toUpperCase()}:${harvest.perLangRejectedNotInInventory[l]}`).join(", ");
+      log(`  Pass 1.5 harvest: attempted=${harvest.attempted}, fetched=${harvest.fetched}, cacheHits=${harvest.cacheHits}, pagesWithAnyAlternate=${harvest.pagesWithAnyAlternate}, pagesWithInventoryHit=${harvest.pagesWithInventoryHit}`);
+      log(`  Pass 1.5 harvest: accepted (${perLangAcc}), rejected-not-in-inventory (${perLangRej}), applied=${harvestApplied} match(es) across ${needsMatching.length} unmatched rows`);
     }
   }
 
@@ -1277,6 +1296,11 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
     }
   }
 
+  // Per-job alternate-link cache. Shared across all passes within this job so
+  // identical source URLs are fetched at most once even when the multi-pass
+  // loop re-enters matchTab for the same tab.
+  const alternateLinkCache: AlternateLinkCache = new Map();
+
   for (let pass = 1; pass <= MAX_PASSES; pass++) {
     if (control.cancel) break;
 
@@ -1307,7 +1331,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       const stepLabel = pass > 1 ? `pass${pass}:${tabData.sheetName}` : `matching:${tabData.sheetName}`;
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
-      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName));
+      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache);
       tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
 
       if (!globalMatchResults.has(tabData.sheetName)) {
