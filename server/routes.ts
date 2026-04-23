@@ -633,6 +633,136 @@ async function matchTab(
     return s;
   }
 
+  // ---- PRE-CRAWL SEED DISCOVERY ----
+  // Pass 1: For every source URL the workbook references, construct the
+  // predicted target URLs (the same "8 candidates per source" the AI step
+  // uses), HEAD-probe them concurrently, and feed surviving (200 OK) URLs
+  // into the crawl seed list. This guarantees the AI sees pages that the
+  // auto-inferred anchor scope would otherwise have missed entirely (e.g. RU
+  // FAQ subtree).
+  // Pass 2 (HE sibling expansion): When pass 1 finds a `…/Pages/default.aspx`
+  // URL alive in the target language, invert the rootMapping to derive the
+  // corresponding HE section, gather every HE source row in that section
+  // from the workbook, construct each one's target URL by prefix
+  // substitution, and probe those too. This catches HE-side siblings whose
+  // own row's predicted candidates didn't survive (e.g. because the per-row
+  // mapping was learned from a different root pair).
+  const PROBE_CAP_PER_LANG = 1000;
+
+  // Group HE source rows by section path (path up to but not including
+  // `/Pages/`) for fast lookup during sibling expansion.
+  const heSectionToRows = new Map<string, { slugTail: string[] }[]>();
+  for (const row of allRows) {
+    try {
+      const p = new URL(row.sourceUrl);
+      if (origin && p.origin !== origin) continue;
+      const parts = p.pathname.split("/").filter(Boolean);
+      const pagesIdx = parts.findIndex(s => s.toLowerCase() === "pages");
+      if (pagesIdx < 1) continue;
+      const sectionKey = parts.slice(0, pagesIdx).map(s => s.toLowerCase()).join("/");
+      const slugTail = parts.slice(pagesIdx);
+      if (!heSectionToRows.has(sectionKey)) heSectionToRows.set(sectionKey, []);
+      heSectionToRows.get(sectionKey)!.push({ slugTail });
+    } catch {}
+  }
+
+  const aliveByLang: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
+
+  const probePromises: Promise<void>[] = [];
+  for (const l of langs) {
+    if (langRoot(tabPatterns, l).length === 0 && !userSeedSegs[l]) continue;
+    const candidateSet = new Set<string>();
+    for (const row of allRows) {
+      const cs = constructAllTargetUrls(row.sourceUrl, l, tabPatterns);
+      for (const c of cs) {
+        try {
+          const p = new URL(c);
+          if (origin && p.origin !== origin) continue;
+        } catch { continue; }
+        candidateSet.add(c);
+        if (candidateSet.size >= PROBE_CAP_PER_LANG) break;
+      }
+      if (candidateSet.size >= PROBE_CAP_PER_LANG) break;
+    }
+    if (candidateSet.size === 0) continue;
+    const candidates = Array.from(candidateSet);
+    log(`  ${langLabels[l]} pre-crawl seed discovery: HEAD-probing ${candidates.length} predicted target URL(s)...`);
+    probePromises.push(
+      batchHeadCheck(candidates, control.signal).then(results => {
+        let alive = 0;
+        let aliveDefaults = 0;
+        for (const [u, r] of Array.from(results.entries())) {
+          if (r.ok) {
+            seedUrls[l].push(u);
+            aliveByLang[l].add(u);
+            alive++;
+            if (/\/Pages\/default\.aspx$/i.test(u)) aliveDefaults++;
+          }
+        }
+        log(`  ${langLabels[l]} pre-crawl seed discovery: ${alive}/${candidates.length} alive (added to crawl seeds; ${aliveDefaults} section roots)`);
+      })
+    );
+  }
+  if (probePromises.length > 0) await Promise.all(probePromises);
+
+  // Pass 2: sibling expansion from alive `…/Pages/default.aspx` URLs.
+  for (const l of langs) {
+    const pairMappings = tabPatterns.rootMappings.get(l) || [];
+    if (pairMappings.length === 0) continue;
+    const aliveDefaults: string[] = [];
+    for (const u of Array.from(aliveByLang[l])) {
+      if (/\/Pages\/default\.aspx$/i.test(u)) aliveDefaults.push(u);
+    }
+    if (aliveDefaults.length === 0) continue;
+
+    const siblingCandidates = new Set<string>();
+    let rootsExpanded = 0;
+    let capped = false;
+    outer: for (const u of aliveDefaults) {
+      let parsed: URL;
+      try { parsed = new URL(u); } catch { continue; }
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      const pagesIdx = parts.findIndex(s => s.toLowerCase() === "pages");
+      if (pagesIdx < 1) continue;
+      const targetSectionParts = parts.slice(0, pagesIdx);
+      const targetSectionLower = targetSectionParts.map(s => s.toLowerCase());
+
+      for (const m of pairMappings) {
+        if (m.targetRoot.length === 0 || m.targetRoot.length > targetSectionLower.length) continue;
+        let prefixOk = true;
+        for (let i = 0; i < m.targetRoot.length; i++) {
+          if (m.targetRoot[i].toLowerCase() !== targetSectionLower[i]) { prefixOk = false; break; }
+        }
+        if (!prefixOk) continue;
+        const tail = targetSectionParts.slice(m.targetRoot.length);
+        const heSectionParts = [...m.sourceRoot, ...tail];
+        const heSectionKey = heSectionParts.map(s => s.toLowerCase()).join("/");
+        const heRows = heSectionToRows.get(heSectionKey);
+        if (!heRows || heRows.length === 0) continue;
+        rootsExpanded++;
+        for (const r of heRows) {
+          const sib = parsed.origin + "/" + [...targetSectionParts, ...r.slugTail].join("/");
+          if (aliveByLang[l].has(sib) || siblingCandidates.has(sib)) continue;
+          siblingCandidates.add(sib);
+          if (siblingCandidates.size >= PROBE_CAP_PER_LANG) { capped = true; break outer; }
+        }
+      }
+    }
+    if (siblingCandidates.size === 0) continue;
+    const sibList = Array.from(siblingCandidates);
+    log(`  ${langLabels[l]} sibling expansion: ${aliveDefaults.length} alive section root(s), ${rootsExpanded} root→HE-section expansion(s) → probing ${sibList.length} HE-sibling candidate(s)${capped ? " (capped)" : ""}`);
+    const sibResults = await batchHeadCheck(sibList, control.signal);
+    let sibAlive = 0;
+    for (const [u, r] of Array.from(sibResults.entries())) {
+      if (r.ok) {
+        seedUrls[l].push(u);
+        aliveByLang[l].add(u);
+        sibAlive++;
+      }
+    }
+    log(`  ${langLabels[l]} sibling expansion: ${sibAlive}/${sibList.length} alive (added to crawl seeds)`);
+  }
+
   const LANG_PAGE_CEILING = 50000;
   const crawlPromises: Promise<void>[] = [];
   const perLangInvs: Record<TargetLang, CrawlInventory[]> = { en: [], fr: [], ru: [], ar: [] };
@@ -657,16 +787,15 @@ async function matchTab(
     }
 
     let crawlScopes: string[][];
+    const combinedAnchors: string[][] = anchorRoots.slice();
     if (userSeed) {
-      const userPath = userSeed.map(s => s.toLowerCase()).join("/");
-      const droppedAuto = anchorRoots.filter(a => {
-        const ap = a.map(s => s.toLowerCase()).join("/");
-        return !(ap === userPath || ap.startsWith(userPath + "/"));
-      }).length;
-      log(`  ${langLabels[l]}: anchor source=user-provided /${userSeed.join("/")}/ (${anchorRoots.length} auto-anchors considered, ${droppedAuto} outside user scope dropped)`);
-      crawlScopes = [userSeed];
-    } else if (anchorRoots.length > 0) {
-      const sorted = anchorRoots.slice().sort((a, b) => a.length - b.length);
+      const userKey = userSeed.map(s => s.toLowerCase()).join("/");
+      if (!combinedAnchors.some(a => a.map(s => s.toLowerCase()).join("/") === userKey)) {
+        combinedAnchors.push(userSeed);
+      }
+    }
+    if (combinedAnchors.length > 0) {
+      const sorted = combinedAnchors.slice().sort((a, b) => a.length - b.length);
       const kept: string[][] = [];
       for (const cand of sorted) {
         const candPath = cand.map(s => s.toLowerCase()).join("/");
@@ -676,10 +805,8 @@ async function matchTab(
         });
         if (!isDescendant) kept.push(cand);
       }
-      if (kept.length < anchorRoots.length) {
-        log(`  ${langLabels[l]}: coalesced ${anchorRoots.length} raw anchors → ${kept.length} top-level anchor(s)`);
-      }
-      log(`  ${langLabels[l]}: anchor source=auto-inferred (${kept.length} anchor(s))`);
+      const userPart = userSeed ? `user-seed /${userSeed.join("/")}/ + ` : "";
+      log(`  ${langLabels[l]}: anchor source=${userPart}${anchorRoots.length} auto-inferred, coalesced to ${kept.length} top-level anchor(s)`);
       crawlScopes = kept;
     } else {
       let commonScope = langCrawlScope(tabPatterns, l);
@@ -734,6 +861,48 @@ async function matchTab(
     const total = inventories[l]?.urls.size ?? 0;
     const titles = inventories[l]?.titleIndex.size ?? 0;
     log(`  ${langLabels[l]} inventory total: ${total} URLs (${titles} titled) across ${perLangInvs[l].length} anchor crawl(s)`);
+  }
+
+  // ---- COVERAGE DIAGNOSTIC ----
+  // Per-language: of the predicted target URLs constructed from every source
+  // row, how many are actually present in the crawled inventory? Surface this
+  // BEFORE the AI step so a future inventory regression is obvious in 30
+  // seconds rather than after a full AI run.
+  for (const l of langs) {
+    const inv = inventories[l];
+    if (!inv) continue;
+    const predictedSet = new Set<string>();
+    let rowsContributing = 0;
+    for (const row of allRows) {
+      const cs = constructAllTargetUrls(row.sourceUrl, l, tabPatterns);
+      if (cs.length === 0) continue;
+      rowsContributing++;
+      for (const c of cs) predictedSet.add(c);
+    }
+    if (predictedSet.size === 0) continue;
+    let present = 0;
+    const missingByPrefix = new Map<string, number>();
+    for (const c of Array.from(predictedSet)) {
+      if (inv.urls.has(c)) {
+        present++;
+      } else {
+        try {
+          const parts = new URL(c).pathname.split("/").filter(Boolean);
+          const stripped = parts.filter(p => !/\.aspx$/i.test(p) && p.toLowerCase() !== "pages");
+          const key = stripped.slice(0, 3).join("/");
+          if (key) missingByPrefix.set(key, (missingByPrefix.get(key) || 0) + 1);
+        } catch {}
+      }
+    }
+    const pct = predictedSet.size > 0 ? (present / predictedSet.size * 100).toFixed(1) : "0.0";
+    log(`  ${langLabels[l]} coverage: predicted ${predictedSet.size} target URLs from ${rowsContributing} source rows, ${present} present in inventory (${present}/${predictedSet.size} = ${pct}%)`);
+    const missingTotal = predictedSet.size - present;
+    if (missingTotal > 0 && missingByPrefix.size > 0) {
+      const top = Array.from(missingByPrefix.entries()).sort((a, b) => b[1] - a[1]).slice(0, 5);
+      for (const [prefix, count] of top) {
+        log(`    ${langLabels[l]} missing subtree: /${prefix}/: ${count} URLs`);
+      }
+    }
   }
 
   const SEED_VERIFY_CEILING = 3000;
