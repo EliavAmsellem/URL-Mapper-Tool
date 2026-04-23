@@ -3095,6 +3095,27 @@ export async function aiMatchUnmatched(
     if (inventoryUrls[l].length > 0) activeLangs.push(l);
   }
 
+  // Inventory-title health log: how many inventory URLs actually carry a
+  // non-empty title. If this number is low for a language, the model has
+  // almost no signal to match on (the URL slug is Latin transliteration for
+  // RU/AR), and that — not the prompt or the gates — is the real bottleneck.
+  for (const l of activeLangs) {
+    const total = inventoryUrls[l].length;
+    if (total === 0) continue;
+    const titleIdx = inventories[l]!.titleIndex;
+    let withTitle = 0;
+    let firstSampleTitle: string | undefined;
+    for (const u of inventoryUrls[l]) {
+      const t = titleIdx.get(u);
+      if (t && t.trim().length > 0) {
+        withTitle++;
+        if (!firstSampleTitle) firstSampleTitle = t.trim().slice(0, 80);
+      }
+    }
+    const sample = firstSampleTitle ? ` | sample: "${firstSampleTitle}"` : "";
+    log(`    [diag] ${l.toUpperCase()} inventory titles populated: ${withTitle}/${total}${sample}`);
+  }
+
   // Per-language section buckets: section-segment -> indices into
   // inventoryUrls[l]. The "section" is the first path segment after the
   // language target root, normalized. URLs whose section can't be inferred
@@ -3254,6 +3275,11 @@ export async function aiMatchUnmatched(
   let consecutiveZeroBatches = 0;
   const ZERO_BATCH_EARLY_EXIT = 5;
 
+  // One-shot prompt dump (env-controlled). Set AI_PROMPT_DUMP=1 in the
+  // environment to write the very first batch's full system + user prompt to
+  // a timestamped file in /tmp for manual inspection. Off by default.
+  let promptDumped = false;
+
   // Helper: detect a section's generic index page (the model loves to fall
   // back to these). Used to keep a small reminder block of taken index pages
   // even after we filter used URLs out of the visible inventory.
@@ -3402,6 +3428,39 @@ ${jsonFields}
 - "reasoning": a brief explanation of why you matched these URLs (or why no match was found)
 
 Return ONLY the JSON array, no other text.`;
+
+    // Per-batch translation spot-check: log the first source row's Hebrew
+    // title alongside the translated form the model will see, so we can
+    // confirm at a glance whether translations are in the right script
+    // (Cyrillic for RU, Arabic for AR) and not stale English from a prior run.
+    if (batch.length > 0) {
+      const sampleRow = batch[0];
+      const heb = (sampleRow.title || "").trim().slice(0, 60);
+      const xlated = activeLangs.map(l => {
+        const t = allTranslations[l].get(sampleRow.title);
+        return `${l}="${(t || "").slice(0, 60)}"`;
+      }).join(" ");
+      log(`    [diag] batch ${batchIdx + 1}/${batches.length} sample: heb="${heb}" ${xlated}`);
+    }
+
+    // One-shot prompt dump for manual inspection.
+    if (process.env.AI_PROMPT_DUMP === "1" && !promptDumped) {
+      try {
+        const fs = await import("fs/promises");
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        const dumpPath = `/tmp/ai_prompt_dump_${ts}.txt`;
+        const dumpContent =
+          `=== AI PROMPT DUMP ===\nbatch=${batchIdx + 1}/${batches.length} section=${batchSection} ` +
+          `langs=${activeLangs.join(",")} visible=${visibleStats.map(v => `${v.lang}:${v.shown}/${v.available}(hint=${v.sectionHint})`).join(" ")}\n\n` +
+          `--- SYSTEM PROMPT ---\n${systemPrompt}\n\n--- USER PROMPT ---\n${userPrompt}\n`;
+        await fs.writeFile(dumpPath, dumpContent, "utf8");
+        log(`    [diag] AI prompt dumped to ${dumpPath} (${dumpContent.length} chars)`);
+        promptDumped = true;
+      } catch (e: any) {
+        log(`    [diag] prompt dump failed: ${e?.message?.substring(0, 120)}`);
+        promptDumped = true; // do not retry every batch
+      }
+    }
 
     try {
       let content: string | null = null;
