@@ -602,10 +602,15 @@ export function mineSegmentsFromInventory(
   }
 
   const votes = new Map<string, Map<string, number>>();
+  // Dedup pairings by (sourceInner, targetInner) signature so that two
+  // distinct unmatched HE URLs sharing the same inner-path don't double-count
+  // the same target inner-path as independent evidence.
+  const seenPairSig = new Set<string>();
   let pairings = 0;
   outer: for (const heUrl of unmatchedSources) {
     const inner = innerOf(heUrl, srcRoot);
     if (!inner) continue;
+    const heSig = inner.map(s => normalizeSegment(s)).join("/");
     const candidateIdxs = new Set<number>();
     for (let p = 0; p < inner.length; p++) {
       const k = `${inner.length}|${p}|${normalizeSegment(inner[p])}`;
@@ -614,6 +619,10 @@ export function mineSegmentsFromInventory(
     }
     for (const idx of Array.from(candidateIdxs)) {
       const candInner = invInners[idx];
+      const tgtSig = candInner.map(s => normalizeSegment(s)).join("/");
+      const pairSig = `${heSig}=>${tgtSig}`;
+      if (seenPairSig.has(pairSig)) continue;
+      seenPairSig.add(pairSig);
       pairings++;
       for (let p = 0; p < inner.length; p++) {
         const sNorm = normalizeSegment(inner[p]);

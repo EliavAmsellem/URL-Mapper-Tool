@@ -671,14 +671,21 @@ async function matchTab(
       feedbackProbePromises.push(
         batchHeadCheck(probes, control.signal).then(results => {
           let alive = 0;
+          const adoptedPaths: string[] = [];
+          const seenAdopted = new Set<string>();
           for (const [u, r] of Array.from(results.entries())) {
             if (r.ok) {
               seedUrls[l].push(u);
               feedbackAliveByLang[l].add(u);
               alive++;
+              try {
+                const p = new URL(u).pathname.replace(/\/Pages\/default\.aspx$/i, "/").replace(/\/+$/, "/");
+                if (!seenAdopted.has(p)) { seenAdopted.add(p); adoptedPaths.push(p); }
+              } catch {}
             }
           }
-          log(`  ${langLabels[l]} feedback anchors: ${alive}/${probes.length} alive (added to crawl seeds)`);
+          const top5 = adoptedPaths.slice(0, 5).join(", ");
+          log(`  ${langLabels[l]} feedback anchors: ${alive}/${probes.length} alive (added to crawl seeds)${top5 ? ` — top: ${top5}` : ""}`);
         })
       );
     }
