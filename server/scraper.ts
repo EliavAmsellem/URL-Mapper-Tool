@@ -2200,7 +2200,12 @@ function parseTitle(title: string): ParsedTitle {
   if (parts.length <= 1) {
     return { pageName: full, parents: [], full };
   }
-  return { pageName: parts[0], parents: parts.slice(1), full };
+  // BTL title format is "<H1> - <ImmediateParent> - <OutermostSection>",
+  // i.e. parts[0] is the page name and the breadcrumb walks INWARD-to-OUTWARD
+  // as the title is read. The contract for `parents` is outermost-first
+  // (top section first, immediate parent last) so downstream consumers can
+  // treat parents[0] as "the section". Hence the reverse here.
+  return { pageName: parts[0], parents: parts.slice(1).reverse(), full };
 }
 
 /** @deprecated Use parseTitle. The original name and labels were inverted (it
@@ -3278,10 +3283,16 @@ export async function aiMatchUnmatched(
       let bucket = NO_SECTION;
 
       // Breadcrumb bucket: index by EVERY parent label in the title's
-      // breadcrumb tail. Done OUTSIDE the URL-section try/catch so it runs
-      // for every URL, regardless of whether URL-path section extraction
-      // succeeds. (Earlier placement after the `continue` below meant only
-      // no-section URLs were indexed — silent breadcrumb bucket emptiness.)
+      // breadcrumb tail (not only the outermost parent). The spec suggested
+      // keying by the last/outermost parent only, but indexing every level
+      // gives strictly broader RECALL — when the source-section translation
+      // matches an immediate-parent label rather than an outermost one we
+      // still get a hint. Hints are SOFT (the model still sees the full
+      // unused inventory after the hint block), so broader recall is the
+      // right tradeoff: false positives only re-order the prompt, false
+      // negatives lose the signal entirely. Done OUTSIDE the URL-section
+      // try/catch so it runs for every URL, regardless of whether URL-path
+      // section extraction succeeds.
       if (titleIdx) {
         const t = titleIdx.get(u);
         if (t) {
