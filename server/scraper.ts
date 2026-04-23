@@ -2787,7 +2787,15 @@ export function matchByTitle(
         const allMatches = Array.from(inventory.urls).filter(url => {
           const pageTitle = inventory.titleIndex.get(url);
           if (!pageTitle) return false;
-          const sim = wordSetSimilarity(translatedTitle, pageTitle);
+          // Same H1-only comparison as the main scorer above — keep
+          // breadcrumb noise out of the disambiguation branch too so a
+          // tied page-name match isn't broken by accidental parent-label
+          // overlap.
+          const targetParts = parseTitle(pageTitle);
+          const sim = wordSetSimilarity(
+            translatedParts.pageName || translatedTitle,
+            targetParts.pageName || pageTitle,
+          );
           return sim >= bestSimilarity - 0.05;
         });
         if (allMatches.length >= 2) {
@@ -3692,7 +3700,7 @@ export async function aiMatchUnmatched(
     const systemPrompt = `You are a URL matching expert for a multilingual government website. Your task is to find the correct ${langListText} equivalent pages for Hebrew source URLs.
 
 CRITICAL RULES:
-1. You may ONLY select URLs from the provided AVAILABLE inventory lists below. Each inventory line is a JSON object with fields {i, url, title}. Return the value of the "url" field verbatim — never invent or construct URLs. If a URL you want is not character-for-character present as the "url" field of some entry in the AVAILABLE list, return null.
+1. You may ONLY select URLs from the provided AVAILABLE inventory lists below. Each inventory line is a JSON object with fields {i, url, title} (and an optional "parents" array). Return the value of the "url" field verbatim — never invent or construct URLs. If a URL you want is not character-for-character present as the "url" field of some entry in the AVAILABLE list, return null.
 2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
 3. Each target URL should only be used ONCE across all matches in this batch. Do not assign the same target URL to multiple source URLs.
 4. The AVAILABLE lists already exclude URLs that have been matched in earlier batches — every URL in those lists is fresh and unused. Do not propose a URL that is not in the AVAILABLE list.
