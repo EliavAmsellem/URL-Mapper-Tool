@@ -3276,6 +3276,31 @@ export async function aiMatchUnmatched(
     for (let i = 0; i < inventoryUrls[l].length; i++) {
       const u = inventoryUrls[l][i];
       let bucket = NO_SECTION;
+
+      // Breadcrumb bucket: index by EVERY parent label in the title's
+      // breadcrumb tail. Done OUTSIDE the URL-section try/catch so it runs
+      // for every URL, regardless of whether URL-path section extraction
+      // succeeds. (Earlier placement after the `continue` below meant only
+      // no-section URLs were indexed — silent breadcrumb bucket emptiness.)
+      if (titleIdx) {
+        const t = titleIdx.get(u);
+        if (t) {
+          const parsed = parseTitle(t);
+          if (parsed.parents.length > 0) {
+            breadcrumbCount[l]++;
+            const seenParent = new Set<string>();
+            for (const parent of parsed.parents) {
+              const key = normalizeTitle(parent);
+              if (!key || seenParent.has(key)) continue;
+              seenParent.add(key);
+              const barr = breadcrumbBuckets[l].get(key) || [];
+              barr.push(i);
+              breadcrumbBuckets[l].set(key, barr);
+            }
+          }
+        }
+      }
+
       try {
         const parts = new URL(u).pathname.split("/").filter(Boolean);
         const cleanParts = stripSuffix(parts);
@@ -3316,29 +3341,6 @@ export async function aiMatchUnmatched(
       const arr = sectionBuckets[l].get(bucket) || [];
       arr.push(i);
       sectionBuckets[l].set(bucket, arr);
-
-      // Breadcrumb bucket: index by EVERY parent label in the title's
-      // breadcrumb tail (immediate parent gets the strongest signal but
-      // grandparents help for deeply nested sections too). Skip entries
-      // with no breadcrumb (most EN/FR titles, short RU titles).
-      if (titleIdx) {
-        const t = titleIdx.get(u);
-        if (t) {
-          const parsed = parseTitle(t);
-          if (parsed.parents.length > 0) {
-            breadcrumbCount[l]++;
-            const seenParent = new Set<string>();
-            for (const parent of parsed.parents) {
-              const key = normalizeTitle(parent);
-              if (!key || seenParent.has(key)) continue;
-              seenParent.add(key);
-              const barr = breadcrumbBuckets[l].get(key) || [];
-              barr.push(i);
-              breadcrumbBuckets[l].set(key, barr);
-            }
-          }
-        }
-      }
     }
     const top = Array.from(sectionBuckets[l].entries())
       .sort((a, b) => b[1].length - a[1].length)
@@ -3733,7 +3735,7 @@ Return ONLY the JSON array, no other text.`;
         const dumpPath = `/tmp/ai_prompt_dump_${ts}.txt`;
         const dumpContent =
           `=== AI PROMPT DUMP ===\nbatch=${batchIdx + 1}/${batches.length} section=${batchSection} ` +
-          `langs=${activeLangs.join(",")} visible=${visibleStats.map(v => `${v.lang}:${v.shown}/${v.available}(hint=${v.sectionHint})`).join(" ")}\n\n` +
+          `langs=${activeLangs.join(",")} visible=${visibleStats.map(v => `${v.lang}:${v.shown}/${v.available}(hint=${v.sectionHint} urlBucket=${v.urlBucket} breadcrumbBucket=${v.breadcrumbBucket} both=${v.both})`).join(" ")}\n\n` +
           `--- SYSTEM PROMPT ---\n${systemPrompt}\n\n--- USER PROMPT ---\n${userPrompt}\n`;
         await fs.writeFile(dumpPath, dumpContent, "utf8");
         log(`    [diag] AI prompt dumped to ${dumpPath} (${dumpContent.length} chars)`);
@@ -3908,7 +3910,7 @@ Return ONLY the JSON array, no other text.`;
       }
 
       aiMatches += batchMatches;
-      const visibleStr = visibleStats.map(v => `${v.lang.toUpperCase()}:${v.shown}/${v.available}(hint=${v.sectionHint})`).join(" ");
+      const visibleStr = visibleStats.map(v => `${v.lang.toUpperCase()}:${v.shown}/${v.available}(hint=${v.sectionHint} urlBucket=${v.urlBucket} breadcrumbBucket=${v.breadcrumbBucket} both=${v.both})`).join(" ");
       log(`  AI batch ${batchIdx + 1}/${batches.length} [${batchSection}] (${chatModel}): ${batchMatches} matches from ${batch.length} URLs (visible inventory ${visibleStr})`);
 
       if (batchMatches === 0) {
