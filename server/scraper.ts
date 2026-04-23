@@ -2452,6 +2452,71 @@ export function matchByTitleSemantic(
 }
 
 
+const URL_CONTEXT_TRANSLATION_ENABLED = process.env.LINGUAMAP_URL_CONTEXT_TRANSLATION !== "0";
+
+function isShortHebrewText(text: string): boolean {
+  if (!text) return false;
+  const tokens = text.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0 || tokens.length > 3) return false;
+  return tokens.some(t => /[\u0590-\u05FF]/.test(t));
+}
+
+export function lastMeaningfulUrlContext(url: string): string | undefined {
+  try {
+    const u = new URL(url);
+    const parts = u.pathname.split("/").filter(Boolean);
+    const generic = new Set(["pages", "default.aspx", "forms", "allitems.aspx"]);
+    const meaningful: string[] = [];
+    for (let i = parts.length - 1; i >= 0 && meaningful.length < 2; i--) {
+      let seg = parts[i];
+      try { seg = decodeURIComponent(seg); } catch {}
+      const low = seg.toLowerCase();
+      if (!low) continue;
+      if (generic.has(low)) continue;
+      if (/\.(aspx|html?|pdf|jpg|png|gif)$/i.test(seg)) continue;
+      meaningful.unshift(seg);
+    }
+    return meaningful.length > 0 ? meaningful.join("/") : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function translateWithOpenAI(
+  text: string,
+  targetLang: TargetLang,
+  urlContext: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const client = getEmbedClient();
+  if (!client) return null;
+  const langName: Record<TargetLang, string> = { en: "English", fr: "French", ru: "Russian", ar: "Arabic" };
+  const { signal: combined, cleanup } = combineSignals(signal, 12000);
+  try {
+    const resp = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: `You translate Hebrew page titles to ${langName[targetLang]}. Reply with ONLY the translated text — no quotes, no explanations, no extra punctuation.`,
+        },
+        {
+          role: "user",
+          content: `Source URL path: ${urlContext}. Use this only as a disambiguation hint for short or ambiguous words.\n\nHebrew title: ${text}`,
+        },
+      ],
+    }, { signal: combined });
+    cleanup();
+    const out = resp.choices?.[0]?.message?.content?.trim();
+    if (!out) return null;
+    return out.replace(/^["'`]+|["'`]+$/g, "").trim() || null;
+  } catch {
+    cleanup();
+    return null;
+  }
+}
+
 async function translateWithGTX(text: string, source: string, target: string, signal?: AbortSignal): Promise<string | null> {
   if (signal?.aborted) return null;
   const { signal: combined, cleanup } = combineSignals(signal, 8000);
@@ -2477,9 +2542,25 @@ async function translateWithGTX(text: string, source: string, target: string, si
   return null;
 }
 
-async function translateText(text: string, targetLang: TargetLang, signal?: AbortSignal): Promise<string | null> {
+async function translateText(
+  text: string,
+  targetLang: TargetLang,
+  signal?: AbortSignal,
+  urlContext?: string,
+): Promise<string | null> {
+  const useUrlContext =
+    !!urlContext && URL_CONTEXT_TRANSLATION_ENABLED && isShortHebrewText(text);
   const cacheKey = `${text}|${targetLang}`;
-  if (translationCache.has(cacheKey)) return translationCache.get(cacheKey)!;
+  if (!useUrlContext && translationCache.has(cacheKey)) return translationCache.get(cacheKey)!;
+
+  if (useUrlContext) {
+    const aiResult = await translateWithOpenAI(text, targetLang, urlContext!, signal);
+    if (aiResult) return aiResult;
+    if (signal?.aborted) return null;
+    // Fall through to GTX as a fallback, but still bypass cache for this call.
+    const gtxFallback = await translateWithGTX(text, "he", targetLang, signal);
+    return gtxFallback ?? null;
+  }
 
   const result = await translateWithGTX(text, "he", targetLang, signal);
   if (result) {
@@ -2505,11 +2586,24 @@ export async function batchTranslate(
   texts: string[],
   targetLang: TargetLang,
   dbStorage?: IStorage,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  urlContexts?: (string | undefined)[],
 ): Promise<Map<string, string>> {
   const results = new Map<string, string>();
   const uniqueSet = new Set(texts);
   const unique = Array.from(uniqueSet);
+
+  // Build text -> urlContext map (first non-empty context for each unique text wins).
+  const contextByText = new Map<string, string>();
+  if (URL_CONTEXT_TRANSLATION_ENABLED && urlContexts && urlContexts.length > 0) {
+    for (let i = 0; i < texts.length && i < urlContexts.length; i++) {
+      const t = texts[i];
+      const c = urlContexts[i];
+      if (t && c && !contextByText.has(t)) contextByText.set(t, c);
+    }
+  }
+  const usesUrlContext = (text: string): boolean =>
+    contextByText.has(text) && isShortHebrewText(text);
 
   let dbCache: Map<string, string> | null = null;
   if (dbStorage) {
@@ -2520,10 +2614,11 @@ export async function batchTranslate(
 
   const needsTranslation: string[] = [];
   for (const text of unique) {
+    const useUrlContext = usesUrlContext(text);
     const cacheKey = `${text}|${targetLang}`;
-    if (translationCache.has(cacheKey)) {
+    if (!useUrlContext && translationCache.has(cacheKey)) {
       results.set(text, translationCache.get(cacheKey)!);
-    } else if (dbCache && dbCache.has(text)) {
+    } else if (!useUrlContext && dbCache && dbCache.has(text)) {
       const cached = dbCache.get(text)!;
       results.set(text, cached);
       translationCache.set(cacheKey, cached);
@@ -2554,13 +2649,19 @@ export async function batchTranslate(
 
     const batch = needsTranslation.slice(i, i + TRANSLATE_CONCURRENCY);
     const batchResults = await Promise.all(
-      batch.map((text) => translateText(text, targetLang, signal).then((r) => ({ text, result: r })))
+      batch.map((text) => {
+        const useCtx = usesUrlContext(text);
+        const ctx = useCtx ? contextByText.get(text) : undefined;
+        return translateText(text, targetLang, signal, ctx).then((r) => ({ text, result: r, bypassCache: useCtx }));
+      })
     );
 
-    for (const { text, result } of batchResults) {
+    for (const { text, result, bypassCache } of batchResults) {
       if (result) {
         results.set(text, result);
-        newTranslations.push({ sourceText: text, targetLang, translatedText: result });
+        if (!bypassCache) {
+          newTranslations.push({ sourceText: text, targetLang, translatedText: result });
+        }
         consecutiveFailures = 0;
       } else {
         consecutiveFailures++;
@@ -2758,13 +2859,15 @@ export async function titleMatchUnmatched(
   for (const lang of langs) {
     const inv = inventories[lang];
     const roots = allowedRoots?.[lang];
-    const titlesNeeded = unmatchedRows
-      .filter(r => r.needs[lang] && inv && inv.titleIndex.size > 0 && roots && roots.length > 0)
-      .map(r => r.title).filter(Boolean);
+    const filteredRows = unmatchedRows.filter(r =>
+      r.needs[lang] && inv && inv.titleIndex.size > 0 && roots && roots.length > 0 && r.title
+    );
+    const titlesNeeded = filteredRows.map(r => r.title);
+    const urlContexts = filteredRows.map(r => lastMeaningfulUrlContext(r.sourceUrl));
     if (titlesNeeded.length > 0) {
       if (signal?.aborted) break;
       log(`  Translating ${titlesNeeded.length} titles to ${langNames[lang]} for title matching...`);
-      translations[lang] = await batchTranslate(titlesNeeded, lang, dbStorage, signal);
+      translations[lang] = await batchTranslate(titlesNeeded, lang, dbStorage, signal, urlContexts);
       log(`  Translated ${translations[lang].size} titles to ${langNames[lang]}`);
     }
   }
@@ -3158,17 +3261,40 @@ export async function aiMatchUnmatched(
           }
           after = matches ? cleanParts.slice(targetRootNorm.length) : [];
         }
-        if (after.length > 0) {
-          const seg = normalizeSegment(after[0]);
-          if (seg && seg !== "pages" && seg !== "default.aspx" && seg.length > 2) {
-            bucket = seg;
+        const fileExtRe = /^[\w-]+\.(aspx|html?|pdf|jpg|png|gif)$/i;
+        const numericRe = /^\d+$/;
+        const segs: string[] = [];
+        for (const raw of after) {
+          const seg = normalizeSegment(raw);
+          if (!seg) continue;
+          if (seg === "pages" || seg === "default.aspx") continue;
+          if (seg.length <= 2) continue;
+          if (numericRe.test(seg)) continue;
+          if (fileExtRe.test(seg)) continue;
+          segs.push(seg);
+        }
+        if (segs.length > 0) {
+          const seenSeg = new Set<string>();
+          for (const seg of segs) {
+            if (seenSeg.has(seg)) continue;
+            seenSeg.add(seg);
+            const arr = sectionBuckets[l].get(seg) || [];
+            arr.push(i);
+            sectionBuckets[l].set(seg, arr);
           }
+          continue;
         }
       } catch {}
       const arr = sectionBuckets[l].get(bucket) || [];
       arr.push(i);
       sectionBuckets[l].set(bucket, arr);
     }
+    const top = Array.from(sectionBuckets[l].entries())
+      .sort((a, b) => b[1].length - a[1].length)
+      .slice(0, 5)
+      .map(([name, arr]) => `${name}(${arr.length})`)
+      .join(", ");
+    log(`    [diag] ${l.toUpperCase()} section buckets built: ${sectionBuckets[l].size} buckets, top: ${top}`);
   }
 
   // For a given source section (a Hebrew slug), figure out what target-lang
@@ -3419,8 +3545,9 @@ CRITICAL RULES:
 4. The AVAILABLE lists already exclude URLs that have been matched in earlier batches — every URL in those lists is fresh and unused. Do not propose a URL that is not in the AVAILABLE list.
 5. PRIMARY signal: compare the source page title (translated) against the "title" field of each candidate inventory entry. A match should make sense as a same-topic page in the other language. URL slug similarity is only a secondary hint.
 6. Strongly prefer candidates whose URL path starts with the target language section root shown in WEBSITE STRUCTURE, and prefer the same-section hint candidates listed first in each AVAILABLE block. Cross-section matches are allowed only when the title match is unambiguous and no in-section candidate fits.
-7. If the source title is a generic page like "contact us", "home", or "about", only match it to a clearly equivalent target page (same generic concept). When in doubt, return null.
-8. NEVER fall back to a section's index page (URLs ending in "/Pages/default.aspx", "/default.aspx", or "/Pages/") just because nothing more specific looks plausible. Index pages should only be returned when the SOURCE itself is clearly the section's index page (matching title like "default" / "home" / the section name). Otherwise return null. The ALREADY-TAKEN INDEX PAGES block lists index pages that have already been used — never propose those.${transliterationNote}
+7. If the source title is a generic page like "contact us", "home", or "about", only match it to a clearly equivalent target page (same generic concept). When in doubt, return null — EXCEPT when the translated source title clearly maps to exactly one inventory candidate's title (high word/concept overlap, no other comparably good candidate). In that unambiguous case, prefer committing to that match over returning null.
+8. NEVER fall back to a section's index page (URLs ending in "/Pages/default.aspx", "/default.aspx", or "/Pages/") just because nothing more specific looks plausible. Index pages should only be returned when the SOURCE itself is clearly the section's index page (matching title like "default" / "home" / the section name). Otherwise return null. The ALREADY-TAKEN INDEX PAGES block lists index pages that have already been used — never propose those.
+9. When a candidate's title is a clear semantic equivalent of the translated source title — even if the URL slug is opaque transliteration or otherwise unrelated-looking — return that candidate. The crawl inventory is closed-world (it lists every available target URL), so if a confident title match exists you should commit to it rather than returning null.${transliterationNote}
 
 WEBSITE STRUCTURE:
 ${patternContext.join("\n")}
