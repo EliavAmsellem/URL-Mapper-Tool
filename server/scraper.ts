@@ -3295,55 +3295,53 @@ export async function aiMatchUnmatched(
       return parts.join("\n");
     }).join("\n\n");
 
-    // Build the visible inventory from this batch's section bucket only.
-    // For each language we look up the section's URLs (mapping the source
-    // section through the segment translation map when present), then drop
-    // any already-used URLs. If the section bucket is empty for a language,
-    // we fall back to the full pool so we never hand the model an empty
-    // candidate list.
-    const INVENTORY_PER_LANG_CAP = 2000;
+    // Build the visible inventory as the FULL unused per-language pool, with
+    // same-section candidates listed first as a soft hint. The model decides
+    // by title; restricting to the section bucket previously hid valid
+    // matches whenever the Hebrew→target section translation was missing or
+    // wrong (a frequent failure mode for RU/AR transliterated slugs).
+    // gpt-4.1-mini's 1M-token context easily fits a broad inventory.
+    const INVENTORY_PER_LANG_CAP = 4000;
     const inventoryBlocks: string[] = [];
-    const visibleStats: { lang: TargetLang; total: number; available: number; shown: number; scoped: boolean }[] = [];
+    const visibleStats: { lang: TargetLang; total: number; available: number; shown: number; sectionHint: number }[] = [];
     for (const l of activeLangs) {
       const totalCount = inventoryUrls[l].length;
 
-      // Pick candidate indices for this section; fall back to all indices if
-      // the section bucket is missing or empty after used-URL filtering.
-      let candidateIndices: number[] = [];
-      let scoped = false;
+      // Identify same-section candidates as a soft hint. We list them FIRST
+      // in the visible inventory but never exclude the rest of the pool.
+      const sectionHintSet = new Set<number>();
       if (batchSection !== NO_SECTION) {
         const targetSecs = targetSectionsForSource(batchSection, l);
-        const seen = new Set<number>();
         for (const ts of targetSecs) {
           const arr = sectionBuckets[l].get(ts);
           if (!arr) continue;
-          for (const idx of arr) if (!seen.has(idx)) { seen.add(idx); candidateIndices.push(idx); }
+          for (const idx of arr) sectionHintSet.add(idx);
         }
-        if (candidateIndices.length > 0) scoped = true;
-      }
-      if (candidateIndices.length === 0) {
-        candidateIndices = Array.from({ length: inventoryUrls[l].length }, (_, i) => i);
       }
 
-      const available: string[] = [];
-      for (const i of candidateIndices) {
-        if (!usedUrls[l].has(inventoryUrls[l][i])) {
-          available.push(inventoryEntries[l][i]);
-        }
+      const hintAvailable: string[] = [];
+      const restAvailable: string[] = [];
+      for (let i = 0; i < inventoryUrls[l].length; i++) {
+        if (usedUrls[l].has(inventoryUrls[l][i])) continue;
+        if (sectionHintSet.has(i)) hintAvailable.push(inventoryEntries[l][i]);
+        else restAvailable.push(inventoryEntries[l][i]);
       }
+      const available = [...hintAvailable, ...restAvailable];
       const availableCount = available.length;
       const shown = available.length <= INVENTORY_PER_LANG_CAP
         ? available
         : available.slice(0, INVENTORY_PER_LANG_CAP);
       const truncatedNote = available.length > shown.length
-        ? `\n... (${available.length - shown.length} more available; not shown to keep prompt small)`
+        ? `\n... (${available.length - shown.length} more available; not shown to keep prompt size sane)`
         : "";
-      const scopeLabel = scoped ? `section "${batchSection}"` : `all sections (no scoped candidates for "${batchSection}")`;
+      const hintNote = hintAvailable.length > 0
+        ? ` (the first ${hintAvailable.length} entries are same-section candidates — preferred but not required)`
+        : "";
       const list = shown.length > 0
         ? shown.join("\n") + truncatedNote
-        : `(no ${langLabels[l]} URLs left in ${scopeLabel} — all candidates already matched)`;
-      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs in ${scopeLabel} (${availableCount} unused of ${totalCount} total). Each line is a JSON object {"i":<index>,"url":"<url>","title":"<page title>"}. When you choose, return the value of the "url" field verbatim:\n${list}`);
-      visibleStats.push({ lang: l, total: totalCount, available: availableCount, shown: shown.length, scoped });
+        : `(no ${langLabels[l]} URLs left in inventory — all candidates already matched)`;
+      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs (${availableCount} unused of ${totalCount} total)${hintNote}. Each line is a JSON object {"i":<index>,"url":"<url>","title":"<page title>"}. When you choose, return the value of the "url" field verbatim:\n${list}`);
+      visibleStats.push({ lang: l, total: totalCount, available: availableCount, shown: shown.length, sectionHint: hintAvailable.length });
     }
 
     // Tiny reminder block: only the generic /Pages/default.aspx-style index
@@ -3379,7 +3377,7 @@ CRITICAL RULES:
 3. Each target URL should only be used ONCE across all matches in this batch. Do not assign the same target URL to multiple source URLs.
 4. The AVAILABLE lists already exclude URLs that have been matched in earlier batches — every URL in those lists is fresh and unused. Do not propose a URL that is not in the AVAILABLE list.
 5. PRIMARY signal: compare the source page title (translated) against the "title" field of each candidate inventory entry. A match should make sense as a same-topic page in the other language. URL slug similarity is only a secondary hint.
-6. The chosen URL MUST start with the target language section root path shown in WEBSITE STRUCTURE. Cross-section matches (e.g. picking a payroll page for a contact-us source) are forbidden.
+6. Strongly prefer candidates whose URL path starts with the target language section root shown in WEBSITE STRUCTURE, and prefer the same-section hint candidates listed first in each AVAILABLE block. Cross-section matches are allowed only when the title match is unambiguous and no in-section candidate fits.
 7. If the source title is a generic page like "contact us", "home", or "about", only match it to a clearly equivalent target page (same generic concept). When in doubt, return null.
 8. NEVER fall back to a section's index page (URLs ending in "/Pages/default.aspx", "/default.aspx", or "/Pages/") just because nothing more specific looks plausible. Index pages should only be returned when the SOURCE itself is clearly the section's index page (matching title like "default" / "home" / the section name). Otherwise return null. The ALREADY-TAKEN INDEX PAGES block lists index pages that have already been used — never propose those.${transliterationNote}
 
@@ -3513,19 +3511,33 @@ Return ONLY the JSON array, no other text.`;
                 }
               } catch { outsideRoot = true; }
             }
-            if (outsideRoot) {
-              log(`    AI REJECTED (outside ${l.toUpperCase()} root ${rootBase}): ${suggestedUrl}`);
-              aiStats[l].rejOutsideRoot++;
-            } else if (!inventories[l]?.urls.has(suggestedUrl)) {
+            // For RU/AR the slugs are Latin transliterations and the
+            // section-translation map is unreliable, so the outside-root and
+            // section-context checks throw away too many correct matches.
+            // Inventory membership + already-used are still hard rejects (the
+            // first is the actual existence guarantee, the second prevents
+            // dupes); the structural checks are demoted to warnings for
+            // RU/AR and remain hard rejects for EN/FR.
+            const softGates = (l === "ru" || l === "ar");
+            if (!inventories[l]?.urls.has(suggestedUrl)) {
               log(`    AI REJECTED (not in inventory): ${l.toUpperCase()} ${suggestedUrl}`);
               aiStats[l].rejNotInInv++;
             } else if (usedUrls[l].has(suggestedUrl)) {
               log(`    AI REJECTED (already used): ${l.toUpperCase()} ${suggestedUrl}`);
               aiStats[l].rejAlreadyUsed++;
-            } else if (!validateSectionContext(suggestedUrl, row.sourceUrl, l, tabPatterns)) {
+            } else if (outsideRoot && !softGates) {
+              log(`    AI REJECTED (outside ${l.toUpperCase()} root ${rootBase}): ${suggestedUrl}`);
+              aiStats[l].rejOutsideRoot++;
+            } else if (!validateSectionContext(suggestedUrl, row.sourceUrl, l, tabPatterns) && !softGates) {
               log(`    AI REJECTED (section/category mismatch with source): ${l.toUpperCase()} ${suggestedUrl} ⟵ ${row.sourceUrl}`);
               aiStats[l].rejSection++;
             } else {
+              if (outsideRoot && softGates) {
+                log(`    AI WARN (outside ${l.toUpperCase()} root ${rootBase}, accepting): ${suggestedUrl}`);
+              }
+              if (softGates && !validateSectionContext(suggestedUrl, row.sourceUrl, l, tabPatterns)) {
+                log(`    AI WARN (${l.toUpperCase()} section/category mismatch, accepting): ${suggestedUrl} ⟵ ${row.sourceUrl}`);
+              }
               setResultMatch(result, l, suggestedUrl, 82, "ai-match");
               usedUrls[l].add(suggestedUrl);
               aiStats[l].accepted++;
@@ -3555,7 +3567,7 @@ Return ONLY the JSON array, no other text.`;
       }
 
       aiMatches += batchMatches;
-      const visibleStr = visibleStats.map(v => `${v.lang.toUpperCase()}:${v.shown}/${v.available}${v.scoped ? "" : "*"}`).join(" ");
+      const visibleStr = visibleStats.map(v => `${v.lang.toUpperCase()}:${v.shown}/${v.available}(hint=${v.sectionHint})`).join(" ");
       log(`  AI batch ${batchIdx + 1}/${batches.length} [${batchSection}] (${chatModel}): ${batchMatches} matches from ${batch.length} URLs (visible inventory ${visibleStr})`);
 
       if (batchMatches === 0) {

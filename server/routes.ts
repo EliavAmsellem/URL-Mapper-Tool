@@ -1613,54 +1613,38 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       );
 
       if (aiMatches.size > 0) {
-        const aiUrls: string[] = [];
-        for (const [, aiResult] of Array.from(aiMatches.entries())) {
-          for (const l of allLangs) {
-            const url = getResultUrl(aiResult, l);
-            if (url) aiUrls.push(url);
-          }
-        }
-
-        log(`  HEAD-verifying ${aiUrls.length} AI-suggested URLs...`);
-        const existence = await batchHeadCheck(aiUrls, control.signal);
-
+        // AI picks come from the crawled inventory, which is already proof of
+        // existence — re-running HEAD here previously rejected every match on
+        // sites where HEAD is unreliable (e.g. BTL returns 4xx for valid
+        // pages). Trust inventory membership; the AI step itself enforces it.
+        // Depth validation is also a frequent false-positive for RU/AR where
+        // the source/target tree shapes diverge, so it is downgraded to a
+        // warning for those languages.
         const rowSourceMap = new Map<number, string>();
         for (const r of unmatchedForAi) {
           rowSourceMap.set(r.rowIndex, r.sourceUrl);
         }
 
         let aiAccepted = 0;
-        let aiHeadRejected = 0;
         let aiDepthRejected = 0;
-        let aiRedirRescued = 0;
-        const aiVerifiedUrls = new Map<string, string>();
+        let aiDepthWarned = 0;
 
         for (const [rowIndex, aiResult] of Array.from(aiMatches.entries())) {
           const srcUrl = rowSourceMap.get(rowIndex) || "";
 
           for (const l of allLangs) {
             const url = getResultUrl(aiResult, l);
-            if (!url) continue;
-            const probe = existence.get(url);
-            if (!probe || !probe.ok) {
-              log(`    AI HEAD REJECTED: ${l.toUpperCase()} ${url}`);
-              clearResultMatch(aiResult, l);
-              aiHeadRejected++;
-            } else if (probe.finalUrl && probe.finalUrl !== url) {
-              aiVerifiedUrls.set(`${rowIndex}:${l}`, probe.finalUrl);
-              aiRedirRescued++;
-            }
-          }
-
-          for (const l of allLangs) {
-            const url = getResultUrl(aiResult, l);
             const sr = langSrcRoot(inv.tabPatterns, l);
             if (url && srcUrl && sr.length > 0) {
-              const verifiedUrl = aiVerifiedUrls.get(`${rowIndex}:${l}`) || url;
-              if (!validateDepthMatch(srcUrl, verifiedUrl, sr, langRoot(inv.tabPatterns, l))) {
-                log(`    AI DEPTH REJECTED: ${l.toUpperCase()} ${verifiedUrl}`);
-                clearResultMatch(aiResult, l);
-                aiDepthRejected++;
+              if (!validateDepthMatch(srcUrl, url, sr, langRoot(inv.tabPatterns, l))) {
+                if (l === "ru" || l === "ar") {
+                  log(`    AI DEPTH WARN (${l.toUpperCase()}, accepting): ${url}`);
+                  aiDepthWarned++;
+                } else {
+                  log(`    AI DEPTH REJECTED: ${l.toUpperCase()} ${url}`);
+                  clearResultMatch(aiResult, l);
+                  aiDepthRejected++;
+                }
               }
             }
           }
@@ -1675,12 +1659,10 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
             for (const l of allLangs) {
               const url = getResultUrl(aiResult, l);
               if (!url) continue;
-              const verifiedUrl = aiVerifiedUrls.get(`${rowIndex}:${l}`) || url;
-              if (!getResultUrl(existing, l) && !inv.usedUrls[l].has(verifiedUrl)) {
-                const baseMethod = getResultMethod(aiResult, l) || "";
-                const method = verifiedUrl !== url ? `${baseMethod}+redirect` : baseMethod;
-                setResultMatch(existing, l, verifiedUrl, getResultConf(aiResult, l) || 0, method);
-                inv.usedUrls[l].add(verifiedUrl);
+              if (!getResultUrl(existing, l) && !inv.usedUrls[l].has(url)) {
+                const method = getResultMethod(aiResult, l) || "";
+                setResultMatch(existing, l, url, getResultConf(aiResult, l) || 0, method);
+                inv.usedUrls[l].add(url);
                 aiAccepted++;
               }
             }
@@ -1688,7 +1670,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         }
 
         matchedCount += aiAccepted;
-        log(`  AI results: ${aiAccepted} accepted, ${aiHeadRejected} HEAD-rejected, ${aiDepthRejected} depth-rejected${aiRedirRescued > 0 ? `, ${aiRedirRescued} via redirect rescue` : ''}`);
+        log(`  AI results: ${aiAccepted} accepted, ${aiDepthRejected} depth-rejected${aiDepthWarned > 0 ? `, ${aiDepthWarned} depth-warned (RU/AR soft gate)` : ''}`);
         await storage.updateJob(jobId, { matchedUrls: matchedCount });
       }
     }

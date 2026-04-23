@@ -33,6 +33,7 @@ The system supports multi-pass processing, where newly matched URLs in each pass
 -   **Database**: PostgreSQL is used as the primary database for storing job details, mapping results, and translation cache. Drizzle ORM manages schema and interactions.
 -   **Concurrency**: Batch HEAD requests and title translations are handled with controlled concurrency and rate limiting.
 -   **Error Handling**: AI matching includes retry logic with exponential backoff and early termination for persistent errors.
+-   **AI Matching Strategy (Task #55, Apr 2026)**: AI matching shows the model the FULL unused per-language inventory (cap 4000 entries), with same-section candidates listed first as a soft hint rather than a hard filter. Inventory-membership and already-used remain hard rejects; outside-root and section-context checks are hard rejects for EN/FR but warnings only for RU/AR (whose URL slugs are Latin transliterations and frequently break the section-translation map). HEAD-verification of AI picks was removed entirely — picks come from the crawled inventory, so existence is already proven, and re-checking HEAD breaks on sites like BTL that return 4xx for valid pages.
 -   **Scalability**: The job-based architecture allows for asynchronous processing, separating long-running tasks from the main request-response cycle.
 
 ## External Dependencies
