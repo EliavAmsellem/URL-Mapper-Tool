@@ -1302,58 +1302,73 @@ export async function crawlDirectory(
       }
 
       if (html) {
-        addToInventory(inventory, url);
-
-        const $ = cheerio.load(html);
-        const pageTitle = $("title").first().text().trim();
-        const lowerTitle = (pageTitle || "").toLowerCase();
-        const titleIsError = lowerTitle.includes("page not found") ||
-          lowerTitle.includes("404 -") ||
-          lowerTitle.includes("שגיאה") ||
-          lowerTitle.includes("הדף לא נמצא");
-
-        const htmlSnippet = html.slice(0, 8000);
-        const spSoftRedirect = /window\.location\.replace\s*\(\s*['"][^'"]*(?:PageNotFoundError|PageNotFound|404)[^'"]*['"]\s*\)/i.test(htmlSnippet) ||
-          /window\.location\.href\s*=\s*['"][^'"]*(?:PageNotFoundError|PageNotFound|404)[^'"]*['"]/i.test(htmlSnippet);
-        const spErrorMeta = !!$('meta[name="SharePointError"], meta[name="sharepointerror"]').length;
-        const robotsMeta = ($('meta[name="Robots"], meta[name="robots"]').attr("content") || "").toUpperCase();
-        const spNoIndex = robotsMeta.includes("NOINDEX");
-        const spMetaError = spErrorMeta || (spNoIndex && lowerTitle === "");
-
-        const isErrorPage = titleIsError || spSoftRedirect || spMetaError;
-
-        if (isErrorPage) {
+        // Skip SharePoint folder-listing UI pages. They all share the generic
+        // site-wide title ("דף הבית, הביטוח הלאומי") regardless of language,
+        // which pollutes the inventory shown to the AI matcher: ~14% of the
+        // RU prompt was these indistinguishable junk entries. They are admin
+        // UI, not user-facing content, and have no Hebrew→target equivalent.
+        const lowerUrlPath = (() => {
+          try { return new URL(url).pathname.toLowerCase(); }
+          catch { return url.toLowerCase(); }
+        })();
+        const isSharePointListing = /\/forms\/allitems\.aspx$/i.test(lowerUrlPath);
+        if (isSharePointListing) {
           removeFromInventory(inventory, url);
         } else {
-          let effectiveTitle = pageTitle || $("h1").first().text().trim();
-          if (effectiveTitle) {
-            effectiveTitle = effectiveTitle.replace(/\s*\|\s*ביטוח לאומי\s*$/, "").trim();
-            inventory.titleIndex.set(url, effectiveTitle);
-          }
-        }
+          addToInventory(inventory, url);
 
-        const links = extractLinks(html, url, scopePrefix);
-        for (const link of links) {
-          if (!visited.has(link)) {
-            queue.push(link);
-          }
-        }
+          const $ = cheerio.load(html);
+          const pageTitle = $("title").first().text().trim();
+          const lowerTitle = (pageTitle || "").toLowerCase();
+          const titleIsError = lowerTitle.includes("page not found") ||
+            lowerTitle.includes("404 -") ||
+            lowerTitle.includes("שגיאה") ||
+            lowerTitle.includes("הדף לא נמצא");
 
-        try {
-          const parsed = new URL(url);
-          const lowerPath = parsed.pathname.toLowerCase();
-          if (lowerPath.endsWith("/pages/default.aspx") || lowerPath.endsWith("/pages/")) {
-            const pagesDir = parsed.pathname.replace(/default\.aspx$/i, "");
-            const pagesDirUrl = parsed.origin + pagesDir;
-            if (!visited.has(pagesDirUrl)) {
-              queue.push(pagesDirUrl);
-            }
-            const allItemsUrl = parsed.origin + pagesDir + "Forms/AllItems.aspx";
-            if (!visited.has(allItemsUrl)) {
-              queue.push(allItemsUrl);
+          const htmlSnippet = html.slice(0, 8000);
+          const spSoftRedirect = /window\.location\.replace\s*\(\s*['"][^'"]*(?:PageNotFoundError|PageNotFound|404)[^'"]*['"]\s*\)/i.test(htmlSnippet) ||
+            /window\.location\.href\s*=\s*['"][^'"]*(?:PageNotFoundError|PageNotFound|404)[^'"]*['"]/i.test(htmlSnippet);
+          const spErrorMeta = !!$('meta[name="SharePointError"], meta[name="sharepointerror"]').length;
+          const robotsMeta = ($('meta[name="Robots"], meta[name="robots"]').attr("content") || "").toUpperCase();
+          const spNoIndex = robotsMeta.includes("NOINDEX");
+          const spMetaError = spErrorMeta || (spNoIndex && lowerTitle === "");
+
+          const isErrorPage = titleIsError || spSoftRedirect || spMetaError;
+
+          if (isErrorPage) {
+            removeFromInventory(inventory, url);
+          } else {
+            let effectiveTitle = pageTitle || $("h1").first().text().trim();
+            if (effectiveTitle) {
+              effectiveTitle = effectiveTitle.replace(/\s*\|\s*ביטוח לאומי\s*$/, "").trim();
+              inventory.titleIndex.set(url, effectiveTitle);
             }
           }
-        } catch {}
+
+          const links = extractLinks(html, url, scopePrefix);
+          for (const link of links) {
+            // Don't enqueue the SharePoint folder-listing UI URLs; they pollute
+            // the inventory with identically-titled pages (see filter above).
+            if (/\/forms\/allitems\.aspx$/i.test(link)) continue;
+            if (!visited.has(link)) {
+              queue.push(link);
+            }
+          }
+
+          try {
+            const parsed = new URL(url);
+            const lowerPath = parsed.pathname.toLowerCase();
+            if (lowerPath.endsWith("/pages/default.aspx") || lowerPath.endsWith("/pages/")) {
+              const pagesDir = parsed.pathname.replace(/default\.aspx$/i, "");
+              const pagesDirUrl = parsed.origin + pagesDir;
+              if (!visited.has(pagesDirUrl)) {
+                queue.push(pagesDirUrl);
+              }
+              // Intentionally NOT enqueuing Forms/AllItems.aspx anymore — those
+              // are SharePoint admin listing pages with no real content.
+            }
+          } catch {}
+        }
       }
     }
 
