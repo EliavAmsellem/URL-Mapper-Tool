@@ -2185,30 +2185,36 @@ interface TitleParts {
   full: string;
 }
 
+interface ParsedTitle {
+  pageName: string;
+  parents: string[];
+  full: string;
+}
+
+const TITLE_SEPARATORS_RE = /\s+[-–—|]\s+/g;
+
+function parseTitle(title: string): ParsedTitle {
+  const full = (title || "").trim();
+  if (!full) return { pageName: "", parents: [], full: "" };
+  const parts = full.split(TITLE_SEPARATORS_RE).map(s => s.trim()).filter(s => s.length > 0);
+  if (parts.length <= 1) {
+    return { pageName: full, parents: [], full };
+  }
+  return { pageName: parts[0], parents: parts.slice(1), full };
+}
+
+/** @deprecated Use parseTitle. The original name and labels were inverted (it
+ * called the H1 "section" and the breadcrumb "pageName"). This wrapper
+ * preserves the OLD field shape for any caller we missed but maps the fields
+ * to the correct semantic content (pageName = the H1, section = breadcrumb).
+ */
 function splitTitleParts(title: string): TitleParts {
-  const separators = [" - ", " – ", " — ", " | "];
-  let bestIdx = -1;
-  let bestSepLen = 0;
-
-  for (const sep of separators) {
-    const idx = title.indexOf(sep);
-    if (idx > 0 && idx < title.length - sep.length) {
-      if (bestIdx === -1) {
-        bestIdx = idx;
-        bestSepLen = sep.length;
-      }
-      break;
-    }
-  }
-
-  if (bestIdx > 0) {
-    const section = title.substring(0, bestIdx).trim();
-    const rest = title.substring(bestIdx + bestSepLen).trim();
-    if (section.split(/\s+/).length <= 5) {
-      return { section, pageName: rest, full: title };
-    }
-  }
-  return { section: "", pageName: title.trim(), full: title };
+  const p = parseTitle(title);
+  return {
+    section: p.parents.join(" - "),
+    pageName: p.pageName,
+    full: p.full,
+  };
 }
 
 function wordSetSimilarity(a: string, b: string): number {
@@ -2712,9 +2718,9 @@ export function matchByTitle(
   const minDepth = refDepths && refDepths.length > 0 ? Math.min(...refDepths) - 2 : 0;
   const maxDepth = refDepths && refDepths.length > 0 ? Math.max(...refDepths) + 2 : Infinity;
 
-  const translatedParts = splitTitleParts(translatedTitle);
-  const translatedSection = translatedParts.section ? normalizeTitle(translatedParts.section) : "";
-  const hasSection = translatedSection.length > 0;
+  const translatedParts = parseTitle(translatedTitle);
+  const translatedParentTrail = translatedParts.parents.join(" - ");
+  const hasParentTrail = translatedParentTrail.length > 0;
 
   inventory.titleIndex.forEach((pageTitle, url) => {
     if (allowedRoots && allowedRoots.length > 0) {
@@ -2732,20 +2738,23 @@ export function matchByTitle(
       } catch { return; }
     }
 
-    const baseSim = titleSimilarity(translatedTitle, pageTitle);
+    // Compare on the bare H1 (pageName), not the full breadcrumb-laden
+    // title. RU/AR titles are formatted "<H1> - <Parent> - <Grandparent>";
+    // dragging the breadcrumb tail into the comparison drowns out genuine
+    // page-name matches.
+    const targetParts = parseTitle(pageTitle);
+    const baseSim = titleSimilarity(translatedParts.pageName || translatedTitle, targetParts.pageName || pageTitle);
 
     let sectionBonus = 0;
     let usedSection = false;
 
-    if (hasSection) {
-      const targetParts = splitTitleParts(pageTitle);
-      if (targetParts.section) {
-        const sectionSim = wordSetSimilarity(translatedParts.section, targetParts.section);
-        if (sectionSim >= 0.4) {
-          const pageSim = wordSetSimilarity(translatedParts.pageName, targetParts.pageName);
-          sectionBonus = pageSim * 0.1 + sectionSim * 0.05;
-          usedSection = true;
-        }
+    if (hasParentTrail && targetParts.parents.length > 0) {
+      const targetParentTrail = targetParts.parents.join(" - ");
+      const sectionSim = wordSetSimilarity(translatedParentTrail, targetParentTrail);
+      if (sectionSim >= 0.4) {
+        const pageSim = wordSetSimilarity(translatedParts.pageName, targetParts.pageName);
+        sectionBonus = pageSim * 0.1 + sectionSim * 0.05;
+        usedSection = true;
       }
     }
 
@@ -3205,8 +3214,15 @@ export async function aiMatchUnmatched(
       const titleIdx = inventories[l]!.titleIndex;
       inventoryEntries[l] = inventoryUrls[l].map((u, i) => {
         const t = titleIdx.get(u);
-        const obj: { i: number; url: string; title?: string } = { i, url: u };
-        if (t) obj.title = truncTitle(t);
+        const obj: { i: number; url: string; title?: string; parents?: string[] } = { i, url: u };
+        if (t) {
+          // Trim breadcrumb tail: send the bare H1 as `title` and the
+          // breadcrumb labels as `parents`. The full title stays intact in
+          // inventory.titleIndex for any downstream re-derivation.
+          const parsed = parseTitle(t);
+          obj.title = truncTitle(parsed.pageName || t);
+          if (parsed.parents.length > 0) obj.parents = parsed.parents.map(p => truncTitle(p));
+        }
         return JSON.stringify(obj);
       });
     }
@@ -3242,9 +3258,21 @@ export async function aiMatchUnmatched(
   // are always available as a fallback.
   const NO_SECTION = "__no_section__";
   const sectionBuckets: Record<TargetLang, Map<string, number[]>> = { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() };
+  // Breadcrumb-tail section index: a parallel signal to URL-path bucketing.
+  // Many target sites (notably BTL on RU) format titles as
+  // "<H1> - <Parent> - <Grandparent>"; the breadcrumb tail names the section
+  // in the target language directly, while URL path nesting differs from
+  // Hebrew compound slugs like HozrimBituah. Keyed by normalized last
+  // breadcrumb label.
+  const breadcrumbBuckets: Record<TargetLang, Map<string, number[]>> = { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() };
+  // Per-language tally of how many entries actually had a breadcrumb tail
+  // (Regression #7 verification): if RU is at 0 then breadcrumb parsing is
+  // broken and the change has no effect.
+  const breadcrumbCount: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
   for (const l of activeLangs) {
     const targetRoot = langRoot(tabPatterns, l);
     const targetRootNorm = targetRoot.map(s => normalizeSegment(s));
+    const titleIdx = inventories[l]?.titleIndex;
     for (let i = 0; i < inventoryUrls[l].length; i++) {
       const u = inventoryUrls[l][i];
       let bucket = NO_SECTION;
@@ -3288,6 +3316,29 @@ export async function aiMatchUnmatched(
       const arr = sectionBuckets[l].get(bucket) || [];
       arr.push(i);
       sectionBuckets[l].set(bucket, arr);
+
+      // Breadcrumb bucket: index by EVERY parent label in the title's
+      // breadcrumb tail (immediate parent gets the strongest signal but
+      // grandparents help for deeply nested sections too). Skip entries
+      // with no breadcrumb (most EN/FR titles, short RU titles).
+      if (titleIdx) {
+        const t = titleIdx.get(u);
+        if (t) {
+          const parsed = parseTitle(t);
+          if (parsed.parents.length > 0) {
+            breadcrumbCount[l]++;
+            const seenParent = new Set<string>();
+            for (const parent of parsed.parents) {
+              const key = normalizeTitle(parent);
+              if (!key || seenParent.has(key)) continue;
+              seenParent.add(key);
+              const barr = breadcrumbBuckets[l].get(key) || [];
+              barr.push(i);
+              breadcrumbBuckets[l].set(key, barr);
+            }
+          }
+        }
+      }
     }
     const top = Array.from(sectionBuckets[l].entries())
       .sort((a, b) => b[1].length - a[1].length)
@@ -3295,6 +3346,12 @@ export async function aiMatchUnmatched(
       .map(([name, arr]) => `${name}(${arr.length})`)
       .join(", ");
     log(`    [diag] ${l.toUpperCase()} section buckets built: ${sectionBuckets[l].size} buckets, top: ${top}`);
+    const topBc = Array.from(breadcrumbBuckets[l].entries())
+      .sort((a, b) => b[1].length - a[1].length)
+      .slice(0, 5)
+      .map(([name, arr]) => `"${name.slice(0, 30)}"(${arr.length})`)
+      .join(", ");
+    log(`    [diag] ${l.toUpperCase()} breadcrumb buckets built: ${breadcrumbBuckets[l].size} buckets from ${breadcrumbCount[l]} entries with breadcrumb, top: ${topBc || "(none)"}`);
   }
 
   // For a given source section (a Hebrew slug), figure out what target-lang
@@ -3442,6 +3499,62 @@ export async function aiMatchUnmatched(
 
   const langNeedLabel: Record<TargetLang, string> = { en: "English URL", fr: "French URL", ru: "Russian URL", ar: "Arabic URL" };
 
+  // Memoize translated section name per (section, lang) so each unique source
+  // section is only translated once across all of its batches. Used to look
+  // the section up in the breadcrumb buckets. Translation goes through the
+  // existing URL-context-aware translator (cache bypass for short text).
+  const sectionTranslationByLang: Map<string, Map<TargetLang, string | null>> = new Map();
+  const getBreadcrumbHints = async (
+    section: string,
+    sampleSourceUrl: string,
+    l: TargetLang,
+  ): Promise<Set<number>> => {
+    const out = new Set<number>();
+    if (section === NO_SECTION || !section) return out;
+    if (breadcrumbBuckets[l].size === 0) return out;
+    let perLang = sectionTranslationByLang.get(section);
+    if (!perLang) { perLang = new Map(); sectionTranslationByLang.set(section, perLang); }
+    let translated: string | null;
+    if (perLang.has(l)) {
+      translated = perLang.get(l) || null;
+    } else {
+      try {
+        // Translate the source-section slug to the target language. The slug
+        // is often a Latin transliteration (HozrimBituah), so we pass the
+        // full source URL as context so the URL-context translator can use
+        // surrounding path segments to disambiguate.
+        // dbStorage isn't available in this scope; that's fine — the in-memory
+        // translationCache plus a single network call per (section, lang) is
+        // cheap enough and avoids polluting the persistent cache (Regression #10).
+        const tx = await batchTranslate([section], l, undefined, signal, [sampleSourceUrl]);
+        translated = tx.get(section) || null;
+      } catch { translated = null; }
+      perLang.set(l, translated);
+    }
+    if (!translated) return out;
+    const normTranslated = normalizeTitle(translated);
+    if (!normTranslated) return out;
+    const translatedTokens = new Set(normTranslated.split(/\s+/).filter(t => t.length >= 4));
+    // Direct full-key match first (strongest signal).
+    const direct = breadcrumbBuckets[l].get(normTranslated);
+    if (direct) for (const idx of direct) out.add(idx);
+    // Token-overlap fallback: any breadcrumb bucket whose key shares a >=4
+    // char token with the translated section name. This catches cases like
+    // translated="страхование" matching bucket key="страхование и страховые взносы".
+    if (translatedTokens.size > 0) {
+      breadcrumbBuckets[l].forEach((idxs, bcKey) => {
+        if (bcKey === normTranslated) return; // already added
+        const bcTokens = bcKey.split(/\s+/);
+        let hit = false;
+        for (const tok of bcTokens) {
+          if (tok.length >= 4 && translatedTokens.has(tok)) { hit = true; break; }
+        }
+        if (hit) idxs.forEach(idx => out.add(idx));
+      });
+    }
+    return out;
+  };
+
   for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
     if (signal?.aborted) {
       log(`  AI matching ABORTED by user before batch ${batchIdx + 1}/${batches.length}`);
@@ -3470,21 +3583,33 @@ export async function aiMatchUnmatched(
     // gpt-4.1-mini's 1M-token context easily fits a broad inventory.
     const INVENTORY_PER_LANG_CAP = 4000;
     const inventoryBlocks: string[] = [];
-    const visibleStats: { lang: TargetLang; total: number; available: number; shown: number; sectionHint: number }[] = [];
+    const visibleStats: { lang: TargetLang; total: number; available: number; shown: number; sectionHint: number; urlBucket: number; breadcrumbBucket: number; both: number }[] = [];
+    const sampleSourceUrl = batch[0]?.sourceUrl || "";
     for (const l of activeLangs) {
       const totalCount = inventoryUrls[l].length;
 
       // Identify same-section candidates as a soft hint. We list them FIRST
       // in the visible inventory but never exclude the rest of the pool.
-      const sectionHintSet = new Set<number>();
+      // Two parallel signals: (1) URL-path bucketing (sectionBuckets) — works
+      // when target URL paths mirror source compound segments. (2) Breadcrumb
+      // bucketing (breadcrumbBuckets) — works when the target page title
+      // breadcrumb names the section directly (RU/AR on BTL). UNION the two,
+      // never replace, so today's working URL-bucket signal cannot regress.
+      const urlBucketSet = new Set<number>();
       if (batchSection !== NO_SECTION) {
         const targetSecs = targetSectionsForSource(batchSection, l);
         for (const ts of targetSecs) {
           const arr = sectionBuckets[l].get(ts);
           if (!arr) continue;
-          for (const idx of arr) sectionHintSet.add(idx);
+          for (const idx of arr) urlBucketSet.add(idx);
         }
       }
+      const breadcrumbBucketSet = await getBreadcrumbHints(batchSection, sampleSourceUrl, l);
+      const sectionHintSet = new Set<number>();
+      urlBucketSet.forEach(idx => sectionHintSet.add(idx));
+      breadcrumbBucketSet.forEach(idx => sectionHintSet.add(idx));
+      let bothCount = 0;
+      urlBucketSet.forEach(idx => { if (breadcrumbBucketSet.has(idx)) bothCount++; });
 
       const hintAvailable: string[] = [];
       const restAvailable: string[] = [];
@@ -3507,9 +3632,24 @@ export async function aiMatchUnmatched(
       const list = shown.length > 0
         ? shown.join("\n") + truncatedNote
         : `(no ${langLabels[l]} URLs left in inventory — all candidates already matched)`;
-      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs (${availableCount} unused of ${totalCount} total)${hintNote}. Each line is a JSON object {"i":<index>,"url":"<url>","title":"<page title>"}. When you choose, return the value of the "url" field verbatim:\n${list}`);
-      visibleStats.push({ lang: l, total: totalCount, available: availableCount, shown: shown.length, sectionHint: hintAvailable.length });
+      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs (${availableCount} unused of ${totalCount} total)${hintNote}. Each line is a JSON object {"i":<index>,"url":"<url>","title":"<page H1>","parents":[<breadcrumb labels>]} where "parents" is omitted when empty. When you choose, return the value of the "url" field verbatim:\n${list}`);
+      visibleStats.push({
+        lang: l,
+        total: totalCount,
+        available: availableCount,
+        shown: shown.length,
+        sectionHint: hintAvailable.length,
+        urlBucket: urlBucketSet.size,
+        breadcrumbBucket: breadcrumbBucketSet.size,
+        both: bothCount,
+      });
     }
+    // Per-batch hint telemetry: lets us see whether breadcrumb signal is
+    // doing real work vs. URL-path signal alone.
+    const hintBreakdown = visibleStats.map(v =>
+      `${v.lang}:hint=${v.sectionHint}(url=${v.urlBucket} bc=${v.breadcrumbBucket} both=${v.both})`
+    ).join(" ");
+    log(`    [diag] batch ${batchIdx + 1}/${batches.length} section=${batchSection} ${hintBreakdown}`);
 
     // Tiny reminder block: only the generic /Pages/default.aspx-style index
     // pages that have already been taken. The model has a strong bias toward
@@ -3543,7 +3683,7 @@ CRITICAL RULES:
 2. If you cannot find a confident match, return null for that language. Leaving a cell blank is ALWAYS better than assigning a wrong URL.
 3. Each target URL should only be used ONCE across all matches in this batch. Do not assign the same target URL to multiple source URLs.
 4. The AVAILABLE lists already exclude URLs that have been matched in earlier batches — every URL in those lists is fresh and unused. Do not propose a URL that is not in the AVAILABLE list.
-5. PRIMARY signal: compare the source page title (translated) against the "title" field of each candidate inventory entry. A match should make sense as a same-topic page in the other language. URL slug similarity is only a secondary hint.
+5. PRIMARY signal: compare the source page title (translated) against the "title" field of each candidate inventory entry. A match should make sense as a same-topic page in the other language. The "title" field is the page H1 (bare page name); the optional "parents" array is the breadcrumb context (parent and grandparent section labels) — match on "title", and use "parents" only as section context to disambiguate generic page names. URL slug similarity is only a secondary hint.
 6. Strongly prefer candidates whose URL path starts with the target language section root shown in WEBSITE STRUCTURE, and prefer the same-section hint candidates listed first in each AVAILABLE block. Cross-section matches are allowed only when the title match is unambiguous and no in-section candidate fits.
 7. If the source title is a generic page like "contact us", "home", or "about", only match it to a clearly equivalent target page (same generic concept). When in doubt, return null — EXCEPT when the translated source title clearly maps to exactly one inventory candidate's title (high word/concept overlap, no other comparably good candidate). In that unambiguous case, prefer committing to that match over returning null.
 8. NEVER fall back to a section's index page (URLs ending in "/Pages/default.aspx", "/default.aspx", or "/Pages/") just because nothing more specific looks plausible. Index pages should only be returned when the SOURCE itself is clearly the section's index page (matching title like "default" / "home" / the section name). Otherwise return null. The ALREADY-TAKEN INDEX PAGES block lists index pages that have already been used — never propose those.
