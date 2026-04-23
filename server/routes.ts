@@ -42,6 +42,7 @@ import {
   detectCrossScriptLangs,
   harvestAlternateLinks,
   type AlternateLinkCache,
+  mineSegmentsFromInventory,
 } from "./scraper";
 import { log } from "./index";
 
@@ -516,11 +517,14 @@ async function matchTab(
   seedOverrides?: Partial<Record<TargetLang, string>>,
   alternateLinkCache?: AlternateLinkCache,
   globalPatterns?: TabPatterns,
+  feedbackAnchors?: Partial<Record<TargetLang, string[]>>,
 ): Promise<{
   matchResults: Map<number, BatchMatchResult>;
   inventories: Record<TargetLang, CrawlInventory | null>;
   tabPatterns: TabPatterns;
   usedUrls: Record<TargetLang, Set<string>>;
+  newFeedbackAnchors: Record<TargetLang, string[]>;
+  minedSegments: Record<TargetLang, Map<string, string>>;
 }> {
   const { sheetName, allRows, tabRefRows } = tabData;
   const allLangsLocal: TargetLang[] = ["en", "fr", "ru", "ar"];
@@ -572,7 +576,11 @@ async function matchTab(
     return false;
   });
   if (needsMatching.length === 0 || !hasAnyRoot) {
-    return { matchResults, inventories, tabPatterns, usedUrls };
+    return {
+      matchResults, inventories, tabPatterns, usedUrls,
+      newFeedbackAnchors: { en: [], fr: [], ru: [], ar: [] },
+      minedSegments: { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() },
+    };
   }
 
   for (const l of langs) {
@@ -631,6 +639,73 @@ async function matchTab(
       break;
     }
     return s;
+  }
+
+  // ---- FEEDBACK ANCHORS FROM PRIOR PASSES ----
+  // When the coverage diagnostic in an earlier pass logged a "missing subtree"
+  // (e.g. /Odot_ru/sheelotTshuvot/), seed crawl this pass with that subtree's
+  // root and its `…/Pages/default.aspx` so the crawler reaches that subtree.
+  // Survivors of the HEAD probe become anchors with their own crawl scope.
+  const FEEDBACK_PROBE_CAP = 2000;
+  const feedbackProbePromises: Promise<void>[] = [];
+  const feedbackAliveByLang: Record<TargetLang, Set<string>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
+  if (origin && feedbackAnchors) {
+    for (const l of langs) {
+      const paths = feedbackAnchors[l] || [];
+      if (paths.length === 0) continue;
+      const probes: string[] = [];
+      const seen = new Set<string>();
+      for (const p of paths) {
+        if (probes.length >= FEEDBACK_PROBE_CAP) break;
+        const norm = "/" + p.replace(/^\/+|\/+$/g, "");
+        if (!norm || norm === "/") continue;
+        const u1 = origin + norm + "/";
+        const u2 = origin + norm + "/Pages/default.aspx";
+        for (const u of [u1, u2]) {
+          if (!seen.has(u)) { seen.add(u); probes.push(u); }
+          if (probes.length >= FEEDBACK_PROBE_CAP) break;
+        }
+      }
+      if (probes.length === 0) continue;
+      log(`  ${langLabels[l]} feedback anchors from prior pass: HEAD-probing ${probes.length} URL(s) (${paths.length} subtree path(s))...`);
+      feedbackProbePromises.push(
+        batchHeadCheck(probes, control.signal).then(results => {
+          let alive = 0;
+          for (const [u, r] of Array.from(results.entries())) {
+            if (r.ok) {
+              seedUrls[l].push(u);
+              feedbackAliveByLang[l].add(u);
+              alive++;
+            }
+          }
+          log(`  ${langLabels[l]} feedback anchors: ${alive}/${probes.length} alive (added to crawl seeds)`);
+        })
+      );
+    }
+  }
+  if (feedbackProbePromises.length > 0) await Promise.all(feedbackProbePromises);
+
+  // Surviving feedback URLs need their section root added to anchorRoots so
+  // the crawl scope actually covers them — `crawlDirectory` drops seed URLs
+  // whose pathname does not start with the active scopePrefix.
+  const feedbackAnchorRoots: Record<TargetLang, string[][]> = { en: [], fr: [], ru: [], ar: [] };
+  for (const l of langs) {
+    if (feedbackAliveByLang[l].size === 0) continue;
+    const seenAnchorKey = new Set<string>();
+    for (const u of Array.from(feedbackAliveByLang[l])) {
+      try {
+        const parts = new URL(u).pathname.split("/").filter(Boolean);
+        const section = normalizeAnchorRoot(parts);
+        if (section.length === 0) continue;
+        const key = section.map(s => s.toLowerCase()).join("/");
+        if (seenAnchorKey.has(key)) continue;
+        seenAnchorKey.add(key);
+        feedbackAnchorRoots[l].push(section);
+      } catch {}
+    }
+    if (feedbackAnchorRoots[l].length > 0) {
+      log(`  ${langLabels[l]} feedback anchors expanded crawl scope with ${feedbackAnchorRoots[l].length} new section root(s)`);
+    }
   }
 
   // ---- PRE-CRAWL SEED DISCOVERY ----
@@ -794,6 +869,12 @@ async function matchTab(
         combinedAnchors.push(userSeed);
       }
     }
+    for (const fbAnchor of feedbackAnchorRoots[l]) {
+      const fbKey = fbAnchor.map(s => s.toLowerCase()).join("/");
+      if (!combinedAnchors.some(a => a.map(s => s.toLowerCase()).join("/") === fbKey)) {
+        combinedAnchors.push(fbAnchor);
+      }
+    }
     if (combinedAnchors.length > 0) {
       const sorted = combinedAnchors.slice().sort((a, b) => a.length - b.length);
       const kept: string[][] = [];
@@ -868,6 +949,11 @@ async function matchTab(
   // row, how many are actually present in the crawled inventory? Surface this
   // BEFORE the AI step so a future inventory regression is obvious in 30
   // seconds rather than after a full AI run.
+  // Also: capture every "missing subtree" path with count >= FEEDBACK_MIN_MISS
+  // into newFeedbackAnchors so the next pass can HEAD-probe those subtrees and
+  // seed crawl from any survivors.
+  const FEEDBACK_MIN_MISS = 50;
+  const newFeedbackAnchors: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
   for (const l of langs) {
     const inv = inventories[l];
     if (!inv) continue;
@@ -898,9 +984,63 @@ async function matchTab(
     log(`  ${langLabels[l]} coverage: predicted ${predictedSet.size} target URLs from ${rowsContributing} source rows, ${present} present in inventory (${present}/${predictedSet.size} = ${pct}%)`);
     const missingTotal = predictedSet.size - present;
     if (missingTotal > 0 && missingByPrefix.size > 0) {
-      const top = Array.from(missingByPrefix.entries()).sort((a, b) => b[1] - a[1]).slice(0, 5);
+      const sorted = Array.from(missingByPrefix.entries()).sort((a, b) => b[1] - a[1]);
+      const top = sorted.slice(0, 5);
       for (const [prefix, count] of top) {
         log(`    ${langLabels[l]} missing subtree: /${prefix}/: ${count} URLs`);
+      }
+      const alreadyProbedPaths = new Set<string>();
+      for (const u of Array.from(feedbackAliveByLang[l])) {
+        try { alreadyProbedPaths.add(new URL(u).pathname.replace(/^\/+|\/+$/g, "")); } catch {}
+      }
+      for (const [prefix, count] of sorted) {
+        if (count < FEEDBACK_MIN_MISS) break;
+        if (alreadyProbedPaths.has(prefix)) continue;
+        newFeedbackAnchors[l].push(prefix);
+      }
+      if (newFeedbackAnchors[l].length > 0) {
+        log(`    ${langLabels[l]} captured ${newFeedbackAnchors[l].length} feedback anchor path(s) for next pass (>=${FEEDBACK_MIN_MISS} missing each)`);
+      }
+    }
+  }
+
+  // ---- INVENTORY TAIL-PAIR SEGMENT MINING ----
+  // For each unmatched HE source URL, look up inventory URLs of the same inner
+  // length sharing at least one identical positional segment. For each such
+  // pairing, vote on positions where segments differ. Promote (heSeg→tgtSeg)
+  // when supported by >=2 distinct pairings and a clear winner. Mined segments
+  // are merged into tabPatterns.segmentMap (without overwriting confirmed) for
+  // the rest of this tab AND returned for the global registry.
+  const minedSegments: Record<TargetLang, Map<string, string>> = { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() };
+  {
+    const refSourceSet = new Set<string>();
+    for (const ref of tabRefRows) refSourceSet.add(ref.sourceUrl);
+    const unmatchedSources: string[] = [];
+    for (const row of allRows) {
+      if (refSourceSet.has(row.sourceUrl)) continue;
+      if (langs.some(l => row[needsKey[l]])) unmatchedSources.push(row.sourceUrl);
+    }
+    if (unmatchedSources.length > 0) {
+      for (const l of langs) {
+        const inv = inventories[l];
+        if (!inv) continue;
+        const beforeSize = tabPatterns.segmentMap.get(l)?.size || 0;
+        const result = mineSegmentsFromInventory(unmatchedSources, inv, tabPatterns, l, { pairingCap: 10000, minVotes: 2 });
+        if (result.promoted > 0) {
+          let segMap = tabPatterns.segmentMap.get(l);
+          if (!segMap) { segMap = new Map(); tabPatterns.segmentMap.set(l, segMap); }
+          for (const [k, v] of Array.from(result.segments.entries())) {
+            if (!segMap.has(k)) {
+              segMap.set(k, v);
+              minedSegments[l].set(k, v);
+            }
+          }
+          const after = tabPatterns.segmentMap.get(l)?.size || beforeSize;
+          const sample = Array.from(minedSegments[l].entries()).slice(0, 6).map(([k, v]) => `${k}→${v}`).join(", ");
+          log(`  ${langLabels[l]} inventory mining: ${result.pairings} pairings, ${minedSegments[l].size} new segment(s) promoted (segMap ${beforeSize}→${after})${sample ? `; sample: ${sample}` : ""}`);
+        } else if (result.pairings > 0) {
+          log(`  ${langLabels[l]} inventory mining: ${result.pairings} pairings, 0 segments promoted (no candidate reached ${2} votes)`);
+        }
       }
     }
   }
@@ -1353,7 +1493,7 @@ async function matchTab(
     log(`  Deduplication removed ${summary} duplicate target assignments`);
   }
 
-  return { matchResults, inventories, tabPatterns, usedUrls };
+  return { matchResults, inventories, tabPatterns, usedUrls, newFeedbackAnchors, minedSegments };
 }
 
 async function processJob(jobId: string, _threshold: number, control: JobControl) {
@@ -1535,6 +1675,28 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
     for (const line of lines) log(line);
   };
 
+  // Cross-pass state for Task #64:
+  //  - feedbackAnchorsByTab: missing-subtree paths captured by the coverage
+  //    diagnostic in the previous pass; the next pass HEAD-probes them and
+  //    seeds crawl from any survivors.
+  //  - globalMinedSegments: per-language segment translations mined from
+  //    inventory by tail-pairing. Re-injected into globalPatterns after every
+  //    rebuild from confirmed pairs (which would otherwise drop them).
+  const feedbackAnchorsByTab = new Map<string, Record<TargetLang, string[]>>();
+  const globalMinedSegments: Record<TargetLang, Map<string, string>> = { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() };
+
+  function injectMinedIntoGlobal() {
+    for (const l of activeLangs) {
+      const mined = globalMinedSegments[l];
+      if (mined.size === 0) continue;
+      let segMap = globalPatterns.segmentMap.get(l);
+      if (!segMap) { segMap = new Map(); globalPatterns.segmentMap.set(l, segMap); }
+      for (const [k, v] of Array.from(mined.entries())) {
+        if (!segMap.has(k)) segMap.set(k, v);
+      }
+    }
+  }
+
   let globalRefRows = rebuildGlobalRefRows();
   let globalPatterns = learnTabPatterns(globalRefRows, activeLangs, { silent: true, label: "[global]" });
   logGlobalRegistrySnapshot("seed");
@@ -1544,6 +1706,8 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
 
     const passStartTime = Date.now();
     let passNewMatches = 0;
+    let passNewMined = 0;
+    let passNewFeedbackAnchors = 0;
 
     if (pass > 1) {
       log(`\n========== PASS ${pass} ==========`);
@@ -1551,6 +1715,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       updateRowsFromResults(allTabData, globalMatchResults);
       globalRefRows = rebuildGlobalRefRows();
       globalPatterns = learnTabPatterns(globalRefRows, activeLangs, { silent: true, label: "[global]" });
+      injectMinedIntoGlobal();
     }
     logGlobalRegistrySnapshot(`pass ${pass} start`);
 
@@ -1572,8 +1737,33 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       const stepLabel = pass > 1 ? `pass${pass}:${tabData.sheetName}` : `matching:${tabData.sheetName}`;
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
-      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns);
+      const incomingFeedback = feedbackAnchorsByTab.get(tabData.sheetName);
+      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed, newFeedbackAnchors, minedSegments } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns, incomingFeedback);
       tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
+
+      // Track new feedback anchors / mined segments so the multi-pass loop
+      // continues even when this pass produced 0 new matches but DID surface
+      // new crawl seeds or new segment translations to use next pass.
+      const prevFeedback = feedbackAnchorsByTab.get(tabData.sheetName) || { en: [], fr: [], ru: [], ar: [] };
+      const mergedFeedback: Record<TargetLang, string[]> = { en: [], fr: [], ru: [], ar: [] };
+      for (const l of activeLangs) {
+        const seen = new Set<string>(prevFeedback[l]);
+        const merged = prevFeedback[l].slice();
+        for (const p of newFeedbackAnchors[l]) {
+          if (!seen.has(p)) { seen.add(p); merged.push(p); passNewFeedbackAnchors++; }
+        }
+        mergedFeedback[l] = merged;
+      }
+      feedbackAnchorsByTab.set(tabData.sheetName, mergedFeedback);
+
+      for (const l of activeLangs) {
+        for (const [k, v] of Array.from(minedSegments[l].entries())) {
+          if (!globalMinedSegments[l].has(k)) {
+            globalMinedSegments[l].set(k, v);
+            passNewMined++;
+          }
+        }
+      }
 
       if (!globalMatchResults.has(tabData.sheetName)) {
         globalMatchResults.set(tabData.sheetName, new Map());
@@ -1618,6 +1808,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         const prevSegs: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
         for (const l of activeLangs) prevSegs[l] = globalPatterns.segmentMap.get(l)?.size || 0;
         globalPatterns = learnTabPatterns(globalRefRows, activeLangs, { silent: true, label: "[global]" });
+        injectMinedIntoGlobal();
         const segDelta = activeLangs
           .map(l => ({ l, d: (globalPatterns.segmentMap.get(l)?.size || 0) - prevSegs[l] }))
           .filter(x => x.d > 0)
@@ -1628,10 +1819,11 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
     }
 
     const passTime = ((Date.now() - passStartTime) / 1000).toFixed(1);
-    log(`\nPass ${pass} completed in ${passTime}s: ${passNewMatches} new matches`);
+    log(`\nPass ${pass} completed in ${passTime}s: ${passNewMatches} new matches, ${passNewMined} mined segment(s), ${passNewFeedbackAnchors} feedback anchor(s)`);
 
-    if (pass > 1 && passNewMatches === 0) {
-      log(`No new matches in pass ${pass}, stopping multi-pass.`);
+    const shouldContinue = passNewMatches > 0 || passNewMined > 0 || passNewFeedbackAnchors > 0;
+    if (pass > 1 && !shouldContinue) {
+      log(`Pass ${pass} produced no new matches, mined segments, or feedback anchors — stopping multi-pass.`);
       break;
     }
 

@@ -555,6 +555,96 @@ export function mergeIntoTabPatterns(
   return { addedSegments, addedPairs };
 }
 
+// Mine candidate segment translations from an already-crawled inventory by
+// pairing unmatched HE source URLs with target-language inventory URLs that
+// share at least one identical inner path segment in the same position. For
+// each (HE seg, target seg) candidate, count distinct supporting pairings;
+// promote those with >= MIN_VOTES votes and a clear winner. Never overwrites
+// already-confirmed entries in the tab's segmentMap.
+export function mineSegmentsFromInventory(
+  unmatchedSources: string[],
+  inventory: { urls: Set<string> },
+  tabPatterns: TabPatterns,
+  lang: TargetLang,
+  opts?: { pairingCap?: number; minVotes?: number },
+): { segments: Map<string, string>; pairings: number; promoted: number } {
+  const pairingCap = opts?.pairingCap ?? 10000;
+  const minVotes = opts?.minVotes ?? 2;
+  const confirmed = tabPatterns.segmentMap.get(lang) || new Map<string, string>();
+  const tgtRoot = langRoot(tabPatterns, lang);
+  const srcRoot = langSrcRoot(tabPatterns, lang);
+  if (tgtRoot.length === 0) return { segments: new Map(), pairings: 0, promoted: 0 };
+
+  function innerOf(url: string, root: string[]): string[] | null {
+    try {
+      const parts = new URL(url).pathname.split("/").filter(Boolean);
+      const cleaned = parts.filter(p => !/\.aspx$/i.test(p) && p.toLowerCase() !== "pages");
+      let i = 0;
+      while (i < root.length && cleaned[i] && normalizeSegment(cleaned[i]) === normalizeSegment(root[i])) i++;
+      const inner = cleaned.slice(i);
+      return inner.length > 0 ? inner : null;
+    } catch { return null; }
+  }
+
+  const invInners: string[][] = [];
+  const invByPos = new Map<string, Set<number>>();
+  for (const url of Array.from(inventory.urls)) {
+    const inner = innerOf(url, tgtRoot);
+    if (!inner) continue;
+    const idx = invInners.length;
+    invInners.push(inner);
+    for (let p = 0; p < inner.length; p++) {
+      const k = `${inner.length}|${p}|${normalizeSegment(inner[p])}`;
+      let bucket = invByPos.get(k);
+      if (!bucket) { bucket = new Set(); invByPos.set(k, bucket); }
+      bucket.add(idx);
+    }
+  }
+
+  const votes = new Map<string, Map<string, number>>();
+  let pairings = 0;
+  outer: for (const heUrl of unmatchedSources) {
+    const inner = innerOf(heUrl, srcRoot);
+    if (!inner) continue;
+    const candidateIdxs = new Set<number>();
+    for (let p = 0; p < inner.length; p++) {
+      const k = `${inner.length}|${p}|${normalizeSegment(inner[p])}`;
+      const bucket = invByPos.get(k);
+      if (bucket) for (const idx of Array.from(bucket)) candidateIdxs.add(idx);
+    }
+    for (const idx of Array.from(candidateIdxs)) {
+      const candInner = invInners[idx];
+      pairings++;
+      for (let p = 0; p < inner.length; p++) {
+        const sNorm = normalizeSegment(inner[p]);
+        const tOrig = candInner[p];
+        const tNorm = normalizeSegment(tOrig);
+        if (sNorm === tNorm) continue;
+        let m = votes.get(sNorm);
+        if (!m) { m = new Map(); votes.set(sNorm, m); }
+        m.set(tOrig, (m.get(tOrig) || 0) + 1);
+      }
+      if (pairings >= pairingCap) break outer;
+    }
+  }
+
+  const segments = new Map<string, string>();
+  for (const [heSeg, tgtVotes] of Array.from(votes.entries())) {
+    if (confirmed.has(heSeg)) continue;
+    let bestSeg = "";
+    let bestCount = 0;
+    let runnerUp = 0;
+    for (const [tSeg, count] of Array.from(tgtVotes.entries())) {
+      if (count > bestCount) { runnerUp = bestCount; bestCount = count; bestSeg = tSeg; }
+      else if (count > runnerUp) runnerUp = count;
+    }
+    if (bestCount >= minVotes && bestCount > runnerUp) {
+      segments.set(heSeg, bestSeg);
+    }
+  }
+  return { segments, pairings, promoted: segments.size };
+}
+
 /** Top-N segment translation samples per language for diagnostic logging. */
 export function summarizeSegmentTranslations(
   tp: TabPatterns,
