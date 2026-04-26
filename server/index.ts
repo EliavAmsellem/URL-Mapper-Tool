@@ -70,11 +70,11 @@ async function reconcileStuckJobs() {
     if (stuck.length === 0) return;
     for (const job of stuck) {
       await storage.updateJob(job.id, {
-        status: "cancelled",
-        currentStep: "interrupted (server restarted)",
+        status: "error",
+        currentStep: "interrupted by server restart — please re-run this job",
       });
     }
-    log(`Reconciled ${stuck.length} stuck job(s) on startup: ${stuck.map(j => j.id).join(", ")}`);
+    log(`Reconciled ${stuck.length} orphaned job(s) on startup → error: ${stuck.map(j => j.id).join(", ")}`);
   } catch (err: any) {
     log(`Stuck-job reconciler skipped: ${err.message}`);
   }

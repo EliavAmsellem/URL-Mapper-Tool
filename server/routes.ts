@@ -358,19 +358,35 @@ export async function registerRoutes(
       const threshold = parseInt(req.body?.threshold as string) || 85;
 
       // Single-tenant safeguard: matchers share global in-process caches
-      // (translation cache, alternate-link cache, inventory caches) which are
-      // reset at the start of each processJob via clearAllCaches(). Allowing
-      // two jobs to run concurrently would corrupt those caches mid-run, so
-      // any previously-active job is cancelled before a new one starts. See
-      // replit.md "Job concurrency" for the full rationale.
-      for (const [existingJobId, existingControl] of Array.from(activeJobs.entries())) {
-        if (existingJobId !== jobId) {
-          log(`Cancelling previous job ${existingJobId} before starting new job ${jobId} (matchers share global caches; only one job can run at a time)`);
-          existingControl.cancel = true;
-          existingControl.abortController.abort();
-          await storage.updateJob(existingJobId, { status: "cancelled", currentStep: "done" });
-          activeJobs.delete(existingJobId);
-        }
+      // (translation cache, alternate-link cache, inventory caches) reset by
+      // clearAllCaches() at the start of each processJob. Two concurrent
+      // jobs would corrupt those caches mid-run.
+      //
+      // We previously *auto-cancelled* any other running job, but that lets
+      // one user destroy another user's in-flight job (cross-user
+      // interference). Instead we now refuse to start when another job is
+      // active and surface a 409 so the second user is told explicitly that
+      // someone else's job must finish (or be stopped via that user's Stop
+      // button). The `?force=1` query flag preserves the legacy "cancel
+      // others and start anyway" behaviour for the operator who knows they
+      // own both jobs. See replit.md "Job concurrency" for full rationale.
+      const force = String(req.query.force ?? "").toLowerCase() === "1" ||
+                    String(req.body?.force ?? "").toLowerCase() === "true";
+      const otherActive = Array.from(activeJobs.entries()).filter(([id]) => id !== jobId);
+      if (otherActive.length > 0 && !force) {
+        const otherIds = otherActive.map(([id]) => id).join(", ");
+        log(`Refusing to start ${jobId}: another job is still running (${otherIds}). Pass ?force=1 to override.`);
+        return res.status(409).json({
+          message: "Another mapping job is already running. Wait for it to finish or stop it from its own browser tab. Use ?force=1 to override.",
+          activeJobIds: otherActive.map(([id]) => id),
+        });
+      }
+      for (const [existingJobId, existingControl] of otherActive) {
+        log(`force=1: cancelling previous job ${existingJobId} before starting ${jobId}`);
+        existingControl.cancel = true;
+        existingControl.abortController.abort();
+        await storage.updateJob(existingJobId, { status: "cancelled", currentStep: "done" });
+        activeJobs.delete(existingJobId);
       }
 
       const control = newJobControl();
@@ -2967,9 +2983,10 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       if (rowHasAnyActive) finalMatchedCount++;
 
       // Per-language diagnostic block stored in mapping_results.details JSONB.
-      // Captures the matcher stage (derived from the method string), plus the
-      // per-(row,lang) scoped/crossScript flags recorded at match time. Used
-      // for post-hoc auditing only — the user-facing Excel export is unchanged.
+      // Captures the matcher stage (derived from the method string), a short
+      // reason string, and the per-(row,lang) scoped/crossScript flags
+      // recorded at match time. Used for post-hoc auditing only — the
+      // user-facing Excel export is unchanged.
       const stageOf = (method: string | null): string | null => {
         if (!method) return null;
         if (method === "existing") return "existing";
@@ -2977,7 +2994,22 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         if (method === "ai-match") return "ai";
         if (method.startsWith("title")) return "title";
         if (method.includes("tail") || method.startsWith("crawl") || method.startsWith("inventory")) return "inventory";
+        if (method === "alternate-link") return "alternate-link";
         if (method === "pattern" || method.includes("pattern")) return "pattern";
+        return method;
+      };
+      const reasonOf = (method: string | null): string | null => {
+        if (!method) return null;
+        if (method === "existing") return "value already present in source workbook";
+        if (method === "excluded-config") return "explicitly listed in Excludes sheet";
+        if (method === "excluded-auto") return "no reference rows or constructed candidates available";
+        if (method === "ai-match") return "AI matcher selected from per-tab inventory";
+        if (method === "alternate-link") return "discovered via <link rel=alternate hreflang=...>";
+        if (method.startsWith("title-semantic")) return "title embedding cosine similarity";
+        if (method.startsWith("title")) return "title text overlap";
+        if (method.startsWith("crawl") || method.includes("tail")) return "URL tail matched a crawled inventory entry";
+        if (method.startsWith("inventory")) return "constructed URL found in crawled inventory";
+        if (method === "pattern") return "constructed from learned URL pattern";
         return method;
       };
       const perLangDetails: Record<string, Record<string, unknown>> = {};
@@ -2989,11 +3021,14 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       ];
       for (const [l, method, flags] of langPairs) {
         const stage = stageOf(method);
+        const reason = reasonOf(method);
         if (!stage && !flags?.scoped && !flags?.crossScript) continue;
-        const entry: Record<string, unknown> = {};
-        if (stage) entry.stage = stage;
-        if (flags?.scoped) entry.scoped = true;
-        if (flags?.crossScript) entry.crossScript = true;
+        const entry: Record<string, unknown> = {
+          stage: stage,
+          reason: reason,
+          scoped: !!flags?.scoped,
+          crossScript: !!flags?.crossScript,
+        };
         perLangDetails[l] = entry;
       }
 

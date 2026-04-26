@@ -37,7 +37,14 @@ export class DatabaseStorage implements IStorage {
   }
 
   async updateJob(id: string, updates: Partial<InsertMappingJob>): Promise<MappingJob | undefined> {
-    const [updated] = await db.update(mappingJobs).set(updates).where(eq(mappingJobs.id, id)).returning();
+    // Always touch updatedAt so timestamps reflect the latest state change
+    // (status transitions, currentStep updates, save-phase progress). This
+    // is what makes "how long did the save phase take?" answerable from the
+    // DB alone, without trawling logs.
+    const [updated] = await db.update(mappingJobs)
+      .set({ ...updates, updatedAt: new Date() })
+      .where(eq(mappingJobs.id, id))
+      .returning();
     return updated;
   }
 
