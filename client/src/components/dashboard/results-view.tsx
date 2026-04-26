@@ -144,33 +144,36 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
                     <td className="px-4 py-3 font-mono text-xs text-foreground/80 max-w-[220px] truncate" title={row.sourceUrl}>
                       {row.sourceUrl}
                     </td>
-                    {activeLangs.map(cfg => {
+                    {activeLangs.map((cfg, i) => {
                       const url = row[cfg.urlKey];
+                      const langCode = (Object.keys(LANG_CONFIG) as Array<keyof typeof LANG_CONFIG>).find(k => LANG_CONFIG[k] === cfg) ?? `idx${i}`;
+                      const conf = cfg.confKey ? (row[cfg.confKey] || 0) : 0;
+                      const meth = cfg.methodKey ? (row[cfg.methodKey] || "") : "";
                       return (
-                        <td key={cfg.label} className="px-4 py-3 font-mono text-xs text-muted-foreground max-w-[220px] truncate" title={url || ""}>
+                        <td key={cfg.label} className="px-4 py-3 font-mono text-xs text-muted-foreground max-w-[220px] truncate" title={url ? `${url} (${conf}% / ${meth || "—"})` : ""} data-testid={`text-url-${langCode}-${row.id}`}>
                           {url || <span className="italic opacity-50">—</span>}
                         </td>
                       );
                     })}
                     <td className="px-4 py-3 text-center">
                       {bestConfidence > 0 ? (
-                        <div className="flex items-center justify-center gap-2">
+                        <div className="flex items-center justify-center gap-2" data-testid={`text-confidence-${row.id}`}>
                           <div className={cn("w-2 h-2 rounded-full", bestConfidence > 85 ? "bg-green-500" : "bg-yellow-500")} />
                           <span className={cn("font-medium text-xs", bestConfidence > 85 ? "text-green-600" : "text-yellow-600")}>
                             {bestConfidence}%
                           </span>
                         </div>
                       ) : (
-                        <span className="text-muted-foreground/50 text-xs">—</span>
+                        <span className="text-muted-foreground/50 text-xs" data-testid={`text-confidence-${row.id}`}>—</span>
                       )}
                     </td>
                     <td className="px-4 py-3 text-right">
                       {method ? (
-                        <span className="px-2 py-0.5 rounded text-[10px] bg-muted text-muted-foreground uppercase tracking-wider font-semibold border border-border">
+                        <span className="px-2 py-0.5 rounded text-[10px] bg-muted text-muted-foreground uppercase tracking-wider font-semibold border border-border" data-testid={`text-method-${row.id}`}>
                           {method}
                         </span>
                       ) : (
-                        <span className="text-muted-foreground/50 text-xs">—</span>
+                        <span className="text-muted-foreground/50 text-xs" data-testid={`text-method-${row.id}`}>—</span>
                       )}
                     </td>
                   </motion.tr>
