@@ -2579,12 +2579,12 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
     // that the workbook's reference rows say should exist.
     const cov = tabCoverageStats.get(tabData.sheetName);
     if (cov) {
-      const invLine = allLangs
-        .filter(l => cov[l].mappedSubtrees > 0 || cov[l].totalInventory > 0)
+      // Emit one deterministic line per active language so a missing entry
+      // is unambiguously a bug rather than a "skipped because zero" choice.
+      const invLine = activeLangs
         .map(l => `${l.toUpperCase()}=${cov[l].totalInventory}`)
         .join(", ");
-      const sparseLine = allLangs
-        .filter(l => cov[l].sparseAfter > 0 || cov[l].backfilledUrls > 0)
+      const sparseLine = activeLangs
         .map(l => `${l.toUpperCase()}: ${cov[l].sparseAfter}/${cov[l].mappedSubtrees} sparse (backfill +${cov[l].backfilledUrls})`)
         .join("; ");
       if (invLine) {
