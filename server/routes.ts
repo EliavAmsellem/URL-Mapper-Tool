@@ -49,6 +49,7 @@ import {
   isUrlUnderTgtDir,
   type MatchTrace,
   type RowLangTrace,
+  setTrace,
 } from "./scraper";
 import { log } from "./index";
 
@@ -2677,18 +2678,37 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       const inv = tabInventories.get(tabData.sheetName);
       if (!sheetGlobal || !inv) continue;
 
-      const unmatchedForAi = tabData.allRows.filter(row => {
-        if (!row.title) return false;
-        const m = sheetGlobal.get(row.rowIndex);
-        return allLangs.some(l => row[needsKey[l]] && (!m || !getResultUrl(m, l)));
-      }).map(row => {
+      // Task #89 — trace bookkeeping must straddle the filter so rows
+      // dropped at the AI gate get a per-(row,lang) trace entry instead
+      // of leaving the title-stage's "no-candidates"/"below-threshold"
+      // verdict as the silent last word. Hoisting the tab trace map up
+      // here lets the filter pass write `ai-no-title` directly.
+      const tabTraceForAi: MatchTrace = tabMatchTraces.get(tabData.sheetName) ?? (() => {
+        const t: MatchTrace = new Map();
+        tabMatchTraces.set(tabData.sheetName, t);
+        return t;
+      })();
+
+      const unmatchedForAi: Array<{ rowIndex: number; title: string; sourceUrl: string; needs: Record<TargetLang, boolean> }> = [];
+      for (const row of tabData.allRows) {
         const m = sheetGlobal.get(row.rowIndex);
         const needs: Record<TargetLang, boolean> = { en: false, fr: false, ru: false, ar: false };
+        let hasAnyNeed = false;
         for (const l of allLangs) {
           needs[l] = !!(row[needsKey[l]] && (!m || !getResultUrl(m, l)));
+          if (needs[l]) hasAnyNeed = true;
         }
-        return { rowIndex: row.rowIndex, title: row.title, sourceUrl: row.sourceUrl, needs };
-      });
+        if (!hasAnyNeed) continue;
+        if (!row.title) {
+          for (const l of allLangs) {
+            if (needs[l]) {
+              setTrace(tabTraceForAi, row.rowIndex, l, { stage: "ai", outcome: "ai-no-title" });
+            }
+          }
+          continue;
+        }
+        unmatchedForAi.push({ rowIndex: row.rowIndex, title: row.title, sourceUrl: row.sourceUrl, needs });
+      }
 
       if (unmatchedForAi.length === 0) continue;
 
@@ -2737,11 +2757,8 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       // matches can be tagged with the same flag in mapping_results.details.
       const aiCrossScriptLangs = detectCrossScriptLangs(tabData.tabRefRows, allLangs);
 
-      const tabTraceForAi = tabMatchTraces.get(tabData.sheetName) ?? (() => {
-        const t: MatchTrace = new Map();
-        tabMatchTraces.set(tabData.sheetName, t);
-        return t;
-      })();
+      // tabTraceForAi was hoisted above (Task #89) so the AI-gate filter
+      // can record `ai-no-title` for rows it drops; reuse the same map here.
       const aiOutput = await aiMatchUnmatched(
         unmatchedForAi,
         effectiveInventories,

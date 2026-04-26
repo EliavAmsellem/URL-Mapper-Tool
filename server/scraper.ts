@@ -723,7 +723,12 @@ export type TraceOutcome =
   | "ai-already-used"
   | "ai-outside-root"
   | "ai-null"
-  | "ai-section-mismatch";
+  | "ai-section-mismatch"
+  // Task #89 — instrumentation for the five "AI silently skipped this row" leak sites.
+  | "ai-no-title"          // routes.ts: row dropped from unmatchedForAi because row.title is empty
+  | "ai-no-inventory"      // scraper.ts: lang dropped from activeLangs because inventoryUrls[l] is empty
+  | "ai-omitted-by-model"  // scraper.ts: model's response did not include this (sourceUrl, lang) pair
+  | "ai-early-exit-skipped"; // scraper.ts: consecutive-zero-batches early-exit dropped this row's batch
 
 export interface RowLangTrace {
   stage: TraceStage;
@@ -4148,7 +4153,19 @@ export async function aiMatchUnmatched(
         return JSON.stringify(obj);
       });
     }
-    if (inventoryUrls[l].length > 0) activeLangs.push(l);
+    if (inventoryUrls[l].length > 0) {
+      activeLangs.push(l);
+    } else {
+      // Task #89 — every row that needed this lang is about to be silently
+      // skipped (no batch will ever ask the model for it). Record the gate
+      // verdict so the per-row trace reflects "AI never ran for `l` here"
+      // instead of leaving the title-stage's last outcome as the answer.
+      for (const r of unmatchedRows) {
+        if (r.needs[l]) {
+          setTrace(traceOut, r.rowIndex, l, { stage: "ai", outcome: "ai-no-inventory" });
+        }
+      }
+    }
   }
 
   // Inventory-title health log: how many inventory URLs actually carry a
@@ -5113,12 +5130,16 @@ Return ONLY the JSON array, no other text.`;
       }
 
       // Any (row, lang) pair we needed but the model never returned in its
-      // suggestions counts as a null reject (silent omission).
+      // suggestions counts as a null reject (silent omission). Task #89 —
+      // also record a per-row trace so model-omitted rows are visible in
+      // `details.<lang>.trace`; previously this site only updated counters,
+      // leaving the trace stuck at the title stage's last verdict.
       for (const r of batch) {
         for (const l of langs) {
           if (r.needs[l] && !handled[l].has(r.sourceUrl)) {
             aiStats[l].rejNull++;
             siblingFence[l].nonFenceFailureRowIndices.add(r.rowIndex);
+            setTrace(traceOut, r.rowIndex, l, { stage: "ai", outcome: "ai-omitted-by-model" });
           }
         }
       }
@@ -5205,11 +5226,39 @@ Return ONLY the JSON array, no other text.`;
       // the deferred logs so debugging telemetry is still visible, but
       // skip the commit entirely.
       for (const line of result.prep.deferredLogs) log(line);
+      // Task #89 — trace every (row, lang) in this drained in-flight batch
+      // so the early-exit cutoff is visible in `details.<lang>.trace`. Without
+      // this, the rows below the cutoff inherit whatever the title stage's
+      // last verdict was and the AI funnel looks like it just "didn't try".
+      for (const r of result.prep.batch) {
+        for (const l of langs) {
+          if (r.needs[l]) {
+            setTrace(traceOut, r.rowIndex, l, { stage: "ai", outcome: "ai-early-exit-skipped" });
+          }
+        }
+      }
       continue;
     }
 
     const { earlyExit: ee } = commitBatch(result.prep, result.content, result.callError);
     if (ee) earlyExit = true;
+  }
+
+  // Task #89 — when early-exit triggers, batches with idx >= nextToLaunch
+  // were never launched at all (no `prep` was created). Walk the unlaunched
+  // slice of `batches` directly and record the same trace outcome so the
+  // per-(row, lang) funnel includes the entire skipped tail, not just the
+  // batches that happened to be mid-flight.
+  if (earlyExit && nextToLaunch < batches.length) {
+    for (let idx = nextToLaunch; idx < batches.length; idx++) {
+      for (const r of batches[idx].rows) {
+        for (const l of langs) {
+          if (r.needs[l]) {
+            setTrace(traceOut, r.rowIndex, l, { stage: "ai", outcome: "ai-early-exit-skipped" });
+          }
+        }
+      }
+    }
   }
 
   log(`  AI matching complete: ${aiMatches} total matches from ${unmatchedRows.length} unmatched URLs`);
