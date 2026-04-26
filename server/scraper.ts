@@ -4481,24 +4481,27 @@ Return ONLY the JSON array, no other text.`;
               siblingFence[l].rejected++;
               siblingFence[l].markedRowIndices.add(row.rowIndex);
             } else {
-              if (outsideRoot && softGates) {
-                log(`    AI WARN (outside ${l.toUpperCase()} root ${rootBase}, accepting): ${suggestedUrl}`);
-              }
-              if (softGates && sectionFails) {
-                log(`    AI WARN (${l.toUpperCase()} section/category mismatch, accepting): ${suggestedUrl} ⟵ ${row.sourceUrl}`);
-              }
               // Task #74: bookkeeping for "scope skipped a hard-gate
-              // rejection". Only counted for non-soft-gate langs (EN/FR);
-              // for RU/AR these gates are already soft (warn-only) so
-              // there is nothing to "skip". The fence above guarantees
-              // correctness, so the skip is safe.
-              if (scopeActive && !softGates && outsideRoot) {
+              // rejection". Applied uniformly to EN/FR/RU/AR per the task
+              // spec — the soft-gate split for RU/AR remains for UNSCOPED
+              // rows only. For scoped RU/AR, the SKIP log/counter replaces
+              // the soft WARN so telemetry reflects the same "scope
+              // bypassed structural gate" event for every language.
+              const rootSkipped = scopeActive && outsideRoot;
+              const sectionSkipped = scopeActive && sectionFails;
+              if (rootSkipped) {
                 log(`    AI ROOT-SKIP (${l.toUpperCase()} scope active, accepting outside ${rootBase}): ${suggestedUrl}`);
                 aiStats[l].rejOutsideRootSkipped++;
+              } else if (outsideRoot && softGates) {
+                // Unscoped RU/AR: keep the legacy soft-warn path unchanged.
+                log(`    AI WARN (outside ${l.toUpperCase()} root ${rootBase}, accepting): ${suggestedUrl}`);
               }
-              if (scopeActive && !softGates && sectionFails) {
+              if (sectionSkipped) {
                 log(`    AI SECTION-SKIP (${l.toUpperCase()} scope active, accepting section-mismatch): ${suggestedUrl} ⟵ ${row.sourceUrl}`);
                 aiStats[l].rejSectionSkipped++;
+              } else if (softGates && sectionFails) {
+                // Unscoped RU/AR: keep the legacy soft-warn path unchanged.
+                log(`    AI WARN (${l.toUpperCase()} section/category mismatch, accepting): ${suggestedUrl} ⟵ ${row.sourceUrl}`);
               }
               setResultMatch(result, l, suggestedUrl, 82, "ai-match");
               usedUrls[l].add(suggestedUrl);
