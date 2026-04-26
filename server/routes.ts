@@ -1536,6 +1536,22 @@ async function matchTab(
             if (!url) continue;
             if (getResultUrl(result, l)) continue;
             if (usedUrls[l].has(url)) continue;
+            // Sibling-scope hard fence (Task #70). Pass 1.5 alternate-link
+            // harvest reads <link rel="alternate" hreflang> tags from the HE
+            // page, which the BTL CMS can publish even when the linked
+            // target page lives outside the per-pair mapped subtree. Apply
+            // the same fence as the title/AI commits so the architectural
+            // guarantee is global: a row with a confirmed sibling scope
+            // never commits a target outside its mapped subtree, even if a
+            // hreflang link points there. Out-of-scope harvest hits count
+            // as fence rejections at the title stage.
+            const scope = computeSiblingScope(sourceUrl, l, tabPatterns);
+            if (scope && !isUrlUnderTgtDir(url, scope.mappedTgtDir)) {
+              titleFenceRejected[l]++;
+              titleFenceMarks[l].add(rowIndex);
+              log(`    Pass 1.5 alt-link REJECTED (sibling-scope fence): ${l.toUpperCase()} ${url} ⟵ ${sourceUrl}`);
+              continue;
+            }
             setResultMatch(result, l, url, 95, "alternate-link");
             usedUrls[l].add(url);
             harvestApplied++;
