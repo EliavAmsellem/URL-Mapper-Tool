@@ -1946,7 +1946,15 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         }
         if (refHit) continue;
 
-        // Negative signal B (sample up to 5 rows)
+        // Negative signal B (sample up to 5 rows). Two positive checks
+        // — either is enough to KEEP the prefix (i.e. NOT exclude):
+        //   (B1) an exact constructed candidate is present in the
+        //        inventory (filename mappable), OR
+        //   (B2) the row has a sibling-scope mapping AND any URL in
+        //        the inventory lives under that mapped target directory
+        //        (directory-level presence — guards against
+        //        over-exclusion when filenames don't transliterate
+        //        deterministically but the section IS translated).
         let invHit = false;
         const sample = rows.slice(0, 5);
         for (const r of sample) {
@@ -1955,6 +1963,16 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
             if (invSet.has(c)) { invHit = true; break; }
           }
           if (invHit) break;
+          const scope = computeSiblingScope(r.sourceUrl, l, inv.tabPatterns);
+          if (scope) {
+            const tgtPrefix = ("/" + scope.mappedTgtDir.join("/") + "/").toLowerCase();
+            for (const u of Array.from(invSet)) {
+              try {
+                if (new URL(u).pathname.toLowerCase().startsWith(tgtPrefix)) { invHit = true; break; }
+              } catch {}
+            }
+            if (invHit) break;
+          }
         }
         if (invHit) continue;
 
