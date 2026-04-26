@@ -622,6 +622,10 @@ async function matchTab(
   minedSegments: Record<TargetLang, Map<string, string>>;
   coverageStats: Record<TargetLang, { totalInventory: number; mappedSubtrees: number; sparseBefore: number; sparseAfter: number; backfilledUrls: number }>;
   fenceStats: Record<TargetLang, { titleRejected: number; aiRejected: number; markedRowIndices: Set<number>; nonFenceFailureRowIndices: Set<number> }>;
+  // Task #74: per-lang count of title-stage commits admitted under the
+  // scope-active relaxed floors that the pre-loosening cascade would have
+  // rejected. Accumulated across all title-stage calls inside this tab.
+  titleLoosenedAccepted: Record<TargetLang, number>;
 }> {
   const { sheetName, allRows, tabRefRows } = tabData;
   const allLangsLocal: TargetLang[] = ["en", "fr", "ru", "ar"];
@@ -634,6 +638,11 @@ async function matchTab(
   // before the title-match stage) can both increment it; aggregated into the
   // returned fenceStats. The AI-stage fence is tracked outside matchTab.
   const titleFenceRejected: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  // Task #74: per-lang count of title-stage matches admitted under the
+  // relaxed (scope-active) floors that the pre-loosening cascade would have
+  // rejected. Accumulated across the title-stage call and projected into
+  // matchTab's return so processJob can emit per-tab telemetry.
+  const titleLoosenedAccepted: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
   // Per-row marks for the sibling fence (Task #70 row-level telemetry):
   // remember which rowIndices had at least one candidate rejected by the
   // fence in this tab × language. processJob diffs these against the final
@@ -709,6 +718,7 @@ async function matchTab(
         ru: { titleRejected: 0, aiRejected: 0, markedRowIndices: new Set(), nonFenceFailureRowIndices: new Set() },
         ar: { titleRejected: 0, aiRejected: 0, markedRowIndices: new Set(), nonFenceFailureRowIndices: new Set() },
       },
+      titleLoosenedAccepted: { en: 0, fr: 0, ru: 0, ar: 0 },
     };
   }
 
@@ -1667,6 +1677,10 @@ async function matchTab(
       for (const idx of Array.from(titleOutput.siblingFence[l].nonFenceFailureRowIndices)) {
         titleNonFenceFailureMarks[l].add(idx);
       }
+      // Task #74: accumulate scope-active loosened admissions reported by
+      // the title matcher. Sums per-lang across multiple title-stage calls
+      // within the same tab; surfaced in processJob's per-tab summary line.
+      titleLoosenedAccepted[l] += titleOutput.loosenedAccepted[l];
     }
 
     for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
@@ -1856,7 +1870,7 @@ async function matchTab(
     ru: { titleRejected: titleFenceRejected.ru, aiRejected: 0, markedRowIndices: titleFenceMarks.ru, nonFenceFailureRowIndices: titleNonFenceFailureMarks.ru },
     ar: { titleRejected: titleFenceRejected.ar, aiRejected: 0, markedRowIndices: titleFenceMarks.ar, nonFenceFailureRowIndices: titleNonFenceFailureMarks.ar },
   };
-  return { matchResults, inventories, tabPatterns, usedUrls, newFeedbackAnchors, minedSegments, coverageStats, fenceStats };
+  return { matchResults, inventories, tabPatterns, usedUrls, newFeedbackAnchors, minedSegments, coverageStats, fenceStats, titleLoosenedAccepted };
 }
 
 async function processJob(jobId: string, _threshold: number, control: JobControl) {
@@ -2007,6 +2021,12 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
   const tabInventories = new Map<string, { inventories: Record<TargetLang, CrawlInventory | null>; tabPatterns: TabPatterns; usedUrls: Record<TargetLang, Set<string>> }>();
   const tabCoverageStats = new Map<string, Record<TargetLang, { totalInventory: number; mappedSubtrees: number; sparseBefore: number; sparseAfter: number; backfilledUrls: number }>>();
   const tabFenceStats = new Map<string, Record<TargetLang, { titleRejected: number; aiRejected: number; markedRowIndices: Set<number>; nonFenceFailureRowIndices: Set<number> }>>();
+  // Task #74: per-tab × per-lang counters for the scope-active relaxations.
+  // - titleLoosened: title-stage matches admitted under the lowered floors.
+  // - aiSectionSkipped / aiRootSkipped: AI commits where the scope-active
+  //   bypass let a section-mismatch / outside-root suggestion through.
+  // Surfaced as a single "scoped-loosened" line in the per-tab summary.
+  const tabLooseStats = new Map<string, Record<TargetLang, { titleLoosened: number; aiSectionSkipped: number; aiRootSkipped: number }>>();
 
   function getRowExisting(row: RowData, lang: TargetLang): string {
     switch (lang) { case "en": return row.existingEn; case "fr": return row.existingFr; case "ru": return row.existingRu; case "ar": return row.existingAr; }
@@ -2330,7 +2350,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
       const incomingFeedback = feedbackAnchorsByTab.get(tabData.sheetName);
-      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed, newFeedbackAnchors, minedSegments, coverageStats, fenceStats } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns, incomingFeedback);
+      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed, newFeedbackAnchors, minedSegments, coverageStats, fenceStats, titleLoosenedAccepted } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns, incomingFeedback);
       tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
       tabCoverageStats.set(tabData.sheetName, coverageStats);
       // Sibling-scope fence accumulator across passes within this tab. Each
@@ -2350,6 +2370,20 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         }
       } else {
         tabFenceStats.set(tabData.sheetName, fenceStats);
+      }
+      // Task #74: accumulate title-stage scope-loosened admissions across
+      // passes for this tab. AI-side scope skips are folded in later, after
+      // the AI matcher returns.
+      const prevLoose = tabLooseStats.get(tabData.sheetName);
+      if (prevLoose) {
+        for (const l of allLangs) prevLoose[l].titleLoosened += titleLoosenedAccepted[l];
+      } else {
+        tabLooseStats.set(tabData.sheetName, {
+          en: { titleLoosened: titleLoosenedAccepted.en, aiSectionSkipped: 0, aiRootSkipped: 0 },
+          fr: { titleLoosened: titleLoosenedAccepted.fr, aiSectionSkipped: 0, aiRootSkipped: 0 },
+          ru: { titleLoosened: titleLoosenedAccepted.ru, aiSectionSkipped: 0, aiRootSkipped: 0 },
+          ar: { titleLoosened: titleLoosenedAccepted.ar, aiSectionSkipped: 0, aiRootSkipped: 0 },
+        });
       }
 
       // HE-only auto-detect: applied IMMEDIATELY after the per-tab inventory
@@ -2621,6 +2655,23 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
           ar: { titleRejected: 0, aiRejected: aiOutput.siblingFence.ar.rejected, markedRowIndices: new Set(aiOutput.siblingFence.ar.markedRowIndices), nonFenceFailureRowIndices: new Set(aiOutput.siblingFence.ar.nonFenceFailureRowIndices) },
         });
       }
+      // Task #74: fold AI-stage scope-skip counters into this tab's
+      // loose-stats accumulator alongside the title-stage counts. Initialize
+      // the entry if matchTab didn't already (e.g. no title-stage call ran).
+      const aiLooseForTab = tabLooseStats.get(tabData.sheetName);
+      if (aiLooseForTab) {
+        for (const l of allLangs) {
+          aiLooseForTab[l].aiSectionSkipped += aiOutput.scopeSkipped[l].sectionSkipped;
+          aiLooseForTab[l].aiRootSkipped += aiOutput.scopeSkipped[l].outsideRootSkipped;
+        }
+      } else {
+        tabLooseStats.set(tabData.sheetName, {
+          en: { titleLoosened: 0, aiSectionSkipped: aiOutput.scopeSkipped.en.sectionSkipped, aiRootSkipped: aiOutput.scopeSkipped.en.outsideRootSkipped },
+          fr: { titleLoosened: 0, aiSectionSkipped: aiOutput.scopeSkipped.fr.sectionSkipped, aiRootSkipped: aiOutput.scopeSkipped.fr.outsideRootSkipped },
+          ru: { titleLoosened: 0, aiSectionSkipped: aiOutput.scopeSkipped.ru.sectionSkipped, aiRootSkipped: aiOutput.scopeSkipped.ru.outsideRootSkipped },
+          ar: { titleLoosened: 0, aiSectionSkipped: aiOutput.scopeSkipped.ar.sectionSkipped, aiRootSkipped: aiOutput.scopeSkipped.ar.outsideRootSkipped },
+        });
+      }
 
       if (aiMatches.size > 0) {
         // AI picks come from the crawled inventory, which is already proof of
@@ -2799,6 +2850,34 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         .join(", ");
       if (titleLine || aiLine || rowsLine) {
         log(`Tab "${tabData.sheetName}" sibling-scope fence: title-stage{${titleLine || "none"}}, AI-stage{${aiLine || "none"}}, rows-blocked-by-fence-only{${rowsLine || "none"}}`);
+      }
+    }
+
+    // Task #74: per-tab "scoped-loosened" summary line. Reports
+    //   * title{...}: borderline title-stage matches admitted under the
+    //     scope-relaxed cheap/semantic/paired/single-lang floors;
+    //   * ai-section-skipped{...}: AI commits where the section-context
+    //     gate was bypassed because the row's sibling-scope fence is active;
+    //   * ai-root-skipped{...}: AI commits where the outside-root gate was
+    //     bypassed for the same reason.
+    // All three are silent (omitted) when zero, mirroring the fence line
+    // above, so unscoped runs see no extra log noise.
+    const loose = tabLooseStats.get(tabData.sheetName);
+    if (loose) {
+      const titleLine = activeLangs
+        .filter(l => loose[l].titleLoosened > 0)
+        .map(l => `${l.toUpperCase()}=${loose[l].titleLoosened}`)
+        .join(", ");
+      const aiSecLine = activeLangs
+        .filter(l => loose[l].aiSectionSkipped > 0)
+        .map(l => `${l.toUpperCase()}=${loose[l].aiSectionSkipped}`)
+        .join(", ");
+      const aiRootLine = activeLangs
+        .filter(l => loose[l].aiRootSkipped > 0)
+        .map(l => `${l.toUpperCase()}=${loose[l].aiRootSkipped}`)
+        .join(", ");
+      if (titleLine || aiSecLine || aiRootLine) {
+        log(`Tab "${tabData.sheetName}" scoped-loosened: title{${titleLine || "none"}}, ai-section-skipped{${aiSecLine || "none"}}, ai-root-skipped{${aiRootLine || "none"}}`);
       }
     }
   }

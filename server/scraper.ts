@@ -3073,6 +3073,12 @@ export interface SiblingFenceStats {
 export interface TitleMatchOutput {
   matches: Map<number, BatchMatchResult>;
   siblingFence: Record<TargetLang, SiblingFenceStats>;
+  // Task #74: count of committed title-stage matches that would have been
+  // rejected by the pre-loosening floors (cheap minSim, semantic minCos,
+  // paired gate, or single-lang gate) but were admitted because the row's
+  // sibling-scope fence is active for that lang. Each (rowIndex, lang) is
+  // counted at most once.
+  loosenedAccepted: Record<TargetLang, number>;
 }
 
 export async function titleMatchUnmatched(
@@ -3097,10 +3103,10 @@ export async function titleMatchUnmatched(
   const langNames: Record<TargetLang, string> = { en: "English", fr: "French", ru: "Russian", ar: "Arabic" };
   const isCrossScript: Record<TargetLang, boolean> = crossScriptLangs ?? { en: false, fr: false, ru: false, ar: false };
 
-  if (unmatchedRows.length === 0) return { matches: results, siblingFence };
+  if (unmatchedRows.length === 0) return { matches: results, siblingFence, loosenedAccepted: { en: 0, fr: 0, ru: 0, ar: 0 } };
 
   const titles = unmatchedRows.map((r) => r.title).filter(Boolean);
-  if (titles.length === 0) return { matches: results, siblingFence };
+  if (titles.length === 0) return { matches: results, siblingFence, loosenedAccepted: { en: 0, fr: 0, ru: 0, ar: 0 } };
 
   const translations: Record<TargetLang, Map<string, string>> = { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() };
 
@@ -3203,6 +3209,13 @@ export async function titleMatchUnmatched(
   const siblingRowCount: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
   const siblingPoolSizes: Record<TargetLang, number[]> = { en: [], fr: [], ru: [], ar: [] };
   const siblingTitleAccepted: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  // Task #74: per-(rowIndex, lang) flag for "this row's match was admitted at
+  // a relaxed floor (cheap minSim, semantic minCos, paired gate, or single-
+  // lang gate) thanks to the row's sibling-scope fence." Set during the
+  // matcher loop; consulted at setResultMatch time so we only count matches
+  // that survived all gates and committed.
+  const rowScoped: Map<number, Record<TargetLang, boolean>> = new Map();
+  const loosenedAccepted: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
 
   for (const row of unmatchedRows) {
     if (!row.title) continue;
@@ -3253,12 +3266,35 @@ export async function titleMatchUnmatched(
           }
         }
 
+        // Task #74: remember per-(rowIndex, lang) whether the sibling-scope
+        // fence is active for downstream paired/single-lang gate relaxation
+        // and for the loosened-accepted bookkeeping at commit time.
+        if (siblingScope) {
+          let entry = rowScoped.get(row.rowIndex);
+          if (!entry) {
+            entry = { en: false, fr: false, ru: false, ar: false };
+            rowScoped.set(row.rowIndex, entry);
+          }
+          entry[lang] = true;
+        }
+
         const translated = translations[lang].get(row.title);
         if (translated) {
-          const minSim = (lang === "ru" || lang === "ar") ? 0.55 : 0.60;
-          // When sibling-scope narrowed, drop the per-lang refDepths too:
-          // depth distribution is calibrated against the broader base root
-          // and excludes valid sibling pages whose depth differs.
+          // Task #74: when scope is active for this row×lang, lower minSim
+          // by 0.05 (RU/AR 0.55→0.50; others 0.60→0.55). The hard sibling
+          // fence below guarantees the committed URL is under mappedTgtDir,
+          // so a borderline title pick is safe to admit; any out-of-scope
+          // pick is fence-rejected harmlessly.
+          // NOTE: gate on `siblingScope` (not `scopeNarrow`), so the
+          // relaxation also fires when scope is active but the inventory
+          // pool is empty under tgtPath — Task #74 spec ties relaxation
+          // to scope being active, and the fence is the safety net.
+          const minSimBase = (lang === "ru" || lang === "ar") ? 0.55 : 0.60;
+          const minSim = siblingScope ? minSimBase - 0.05 : minSimBase;
+          // When sibling-scope narrowed (pool > 0), drop per-lang refDepths
+          // too: depth distribution is calibrated against the broader base
+          // root and excludes valid sibling pages whose depth differs.
+          // (Stays gated on scopeNarrow since it pairs with effectiveRoots.)
           const effectiveDepths = scopeNarrow ? undefined : refDepths?.[lang];
           rowMatches[lang] = matchByTitle(translated, inv, minSim, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow);
           if (rowMatches[lang]) {
@@ -3276,7 +3312,13 @@ export async function titleMatchUnmatched(
           if (trEmb) {
             semanticAttempted++;
             semAttemptedByLang[lang]++;
-            const minCos = (lang === "ru" || lang === "ar") ? 0.55 : 0.58;
+            // Task #74: scope-aware semantic floor (RU/AR 0.55→0.50; others
+            // 0.58→0.53). Same justification as the cheap minSim above —
+            // gated on `siblingScope`, not `scopeNarrow`, so the relaxation
+            // also fires when scope is active but the in-pool inventory is
+            // empty; out-of-scope picks are fence-rejected harmlessly.
+            const minCosBase = (lang === "ru" || lang === "ar") ? 0.55 : 0.58;
+            const minCos = siblingScope ? minCosBase - 0.05 : minCosBase;
             const effectiveDepths = scopeNarrow ? undefined : refDepths?.[lang];
             const semMatch = matchByTitleSemantic(trEmb, inv, minCos, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow);
             if (semMatch) {
@@ -3407,15 +3449,26 @@ export async function titleMatchUnmatched(
         // cheap matches that were already paired with another cheap match.
         const otherCheapPresent = matchedLangs.some(o => o !== l && m[o] && !((m[o]!.method || "").includes("semantic")));
         const shouldGate = isSem || (!isSem && otherCheapPresent);
-        if (shouldGate && m[l]!.similarity < 0.60) {
-          log(`    Paired ${l.toUpperCase()} REJECTED (similarity ${m[l]!.similarity.toFixed(3)} < 0.60, method=${m[l]!.method}): "${m[l]!.url}"`);
+        // Task #74: scope-aware paired floor (0.60 → 0.55) when this row's
+        // sibling-scope fence is active for this lang. The fence already
+        // enforces subtree membership, so a borderline paired pick inside
+        // the right subtree is not the wrong-section risk that 0.60 was
+        // calibrated to block.
+        const scopedHere = rowScoped.get(candidate.rowIndex)?.[l] === true;
+        const pairedFloor = scopedHere ? 0.55 : 0.60;
+        if (shouldGate && m[l]!.similarity < pairedFloor) {
+          log(`    Paired ${l.toUpperCase()} REJECTED (similarity ${m[l]!.similarity.toFixed(3)} < ${pairedFloor}, method=${m[l]!.method}): "${m[l]!.url}"`);
           m[l] = null;
           rejected.crossValidation++;
         }
       }
     } else if (matchedLangs.length === 1) {
       const l = matchedLangs[0];
-      const minSim = (l === "ru" || l === "ar") ? 0.55 : 0.65;
+      // Task #74: scope-aware single-lang floor (RU/AR 0.55→0.50; others
+      // 0.65→0.60) when the row's sibling-scope fence is active.
+      const scopedHere = rowScoped.get(candidate.rowIndex)?.[l] === true;
+      const minSimBase = (l === "ru" || l === "ar") ? 0.55 : 0.65;
+      const minSim = scopedHere ? minSimBase - 0.05 : minSimBase;
       if (m[l]!.similarity < minSim) {
         log(`    Single-lang ${l.toUpperCase()} REJECTED (similarity ${m[l]!.similarity.toFixed(3)} < ${minSim}): "${m[l]!.url}"`);
         m[l] = null;
@@ -3439,6 +3492,34 @@ export async function titleMatchUnmatched(
           if ((match.method || "").includes("semantic")) {
             semanticAccepted++;
             semAcceptedByLang[lang]++;
+          }
+          // Task #74: post-commit loosened bookkeeping. Count this match as
+          // "loosened-accepted" iff (a) the row is scoped for this lang and
+          // (b) the match's similarity is below the highest pre-loosening
+          // floor that would have applied to it (cheap/semantic title floor
+          // OR paired/single-lang downstream floor). One increment per
+          // committed (rowIndex, lang).
+          if (rowScoped.get(candidate.rowIndex)?.[lang] === true) {
+            const isSem = (match.method || "").includes("semantic");
+            const cheapBaseFloor = (lang === "ru" || lang === "ar") ? 0.55 : 0.60;
+            const semBaseFloor = (lang === "ru" || lang === "ar") ? 0.55 : 0.58;
+            const titleBase = isSem ? semBaseFloor : cheapBaseFloor;
+            // Replicate the gate selection used above: paired floor (0.60)
+            // applies only when matchedLangs >= 2 AND (isSem OR another
+            // cheap match is paired). Single-lang floor applies when only
+            // one lang matched. Otherwise no downstream gate.
+            const otherCheapPresent = matchedLangs.some(o => o !== lang && m[o] && !((m[o]!.method || "").includes("semantic")));
+            let downstreamBase = 0;
+            if (matchedLangs.length === 1 && matchedLangs[0] === lang) {
+              downstreamBase = (lang === "ru" || lang === "ar") ? 0.55 : 0.65;
+            } else if (matchedLangs.length >= 2 && (isSem || otherCheapPresent)) {
+              downstreamBase = 0.60;
+            }
+            const originalFloor = Math.max(titleBase, downstreamBase);
+            if (match.similarity < originalFloor) {
+              loosenedAccepted[lang]++;
+              log(`    Title LOOSENED-ACCEPTED ${lang.toUpperCase()} (sim=${match.similarity.toFixed(3)} < oldFloor=${originalFloor.toFixed(2)}, method=${match.method}): "${match.url}"`);
+            }
           }
         }
       }
@@ -3489,7 +3570,17 @@ export async function titleMatchUnmatched(
   if (fenceSummary) {
     log(`  Sibling-scope title fence: ${fenceSummary} candidate(s) rejected (out-of-scope)`);
   }
-  return { matches: results, siblingFence };
+  // Task #74: per-lang loosened-accepted summary for the title stage. Only
+  // emit when at least one lang admitted a borderline pick — silence is the
+  // default for unscoped runs.
+  const looseSummary = langs
+    .filter(l => loosenedAccepted[l] > 0)
+    .map(l => `${l.toUpperCase()}=${loosenedAccepted[l]}`)
+    .join(", ");
+  if (looseSummary) {
+    log(`  Sibling-scope title loosened-accepted: ${looseSummary}`);
+  }
+  return { matches: results, siblingFence, loosenedAccepted };
 }
 
 const AI_BATCH_SIZE = 15;
@@ -3514,6 +3605,14 @@ interface AiSuggestion {
 export interface AiMatchOutput {
   matches: Map<number, BatchMatchResult>;
   siblingFence: Record<TargetLang, SiblingFenceStats>;
+  // Task #74: per-lang counts of AI commits where the structural gates
+  // (outsideRoot, section-context) were SKIPPED because the row's
+  // sibling-scope fence was active. Each increment is a candidate that the
+  // pre-loosening cascade would have rejected at that gate; whether it
+  // ultimately committed depends on later checks (already-used, fence,
+  // etc.). Reported in the per-tab summary as "ai-section-skipped" /
+  // "ai-root-skipped".
+  scopeSkipped: Record<TargetLang, { sectionSkipped: number; outsideRootSkipped: number }>;
 }
 
 export async function aiMatchUnmatched(
@@ -3536,7 +3635,16 @@ export async function aiMatchUnmatched(
   const langLabels: Record<TargetLang, string> = { en: "English", fr: "French", ru: "Russian", ar: "Arabic" };
   const suggestionKeys: Record<TargetLang, keyof AiSuggestion> = { en: "englishUrl", fr: "frenchUrl", ru: "russianUrl", ar: "arabicUrl" };
 
-  if (unmatchedRows.length === 0) return { matches: results, siblingFence };
+  if (unmatchedRows.length === 0) return {
+    matches: results,
+    siblingFence,
+    scopeSkipped: {
+      en: { sectionSkipped: 0, outsideRootSkipped: 0 },
+      fr: { sectionSkipped: 0, outsideRootSkipped: 0 },
+      ru: { sectionSkipped: 0, outsideRootSkipped: 0 },
+      ar: { sectionSkipped: 0, outsideRootSkipped: 0 },
+    },
+  };
 
   const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
@@ -3896,11 +4004,11 @@ export async function aiMatchUnmatched(
 
   // Per-language AI telemetry: counts attempts, accepts, and each rejection reason
   // so prompt tuning is measurable across runs.
-  const aiStats: Record<TargetLang, { attempted: number; accepted: number; rejNull: number; rejNotInInv: number; rejAlreadyUsed: number; rejOutsideRoot: number; rejSection: number; rejSiblingScope: number }> = {
-    en: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0 },
-    fr: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0 },
-    ru: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0 },
-    ar: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0 },
+  const aiStats: Record<TargetLang, { attempted: number; accepted: number; rejNull: number; rejNotInInv: number; rejAlreadyUsed: number; rejOutsideRoot: number; rejSection: number; rejSiblingScope: number; rejOutsideRootSkipped: number; rejSectionSkipped: number }> = {
+    en: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0, rejOutsideRootSkipped: 0, rejSectionSkipped: 0 },
+    fr: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0, rejOutsideRootSkipped: 0, rejSectionSkipped: 0 },
+    ru: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0, rejOutsideRootSkipped: 0, rejSectionSkipped: 0 },
+    ar: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0, rejOutsideRootSkipped: 0, rejSectionSkipped: 0 },
   };
 
   const langNeedLabel: Record<TargetLang, string> = { en: "English URL", fr: "French URL", ru: "Russian URL", ar: "Arabic URL" };
@@ -4085,8 +4193,15 @@ export async function aiMatchUnmatched(
       // When the sibling-scope hard fence is active for this lang, label the
       // block STRICTLY RESTRICTED so the model treats it as a closed-world
       // pool — there is no "preferred but not required" allowance here.
+      // Task #74: STRICTLY RESTRICTED blocks already pre-filter the pool to
+      // the correct subtree, so the rule-#2 "blank is always better"
+      // default is too conservative here. Append a per-block override
+      // telling the model to commit when there is any reasonable title
+      // overlap inside the restricted list. Rule #6's strict
+      // out-of-list ban remains in force; this only loosens the
+      // rule-#2 null-bias inside the closed-world list.
       const fenceLabel = fenceKey !== null
-        ? ` — STRICTLY RESTRICTED to the per-pair sibling-scope subtree (${fenceKey}). Pick from this list only or return null; out-of-list picks will be rejected.`
+        ? ` — STRICTLY RESTRICTED to the per-pair sibling-scope subtree (${fenceKey}). Pick from this list only or return null; out-of-list picks will be rejected. NOTE for this block: the candidate pool has been pre-filtered to the correct subtree, so prefer to commit when any reasonable title overlap exists with the source title; only return null if no inventory entry plausibly matches.`
         : "";
       const hintNote = fenceKey === null && hintAvailable.length > 0
         ? ` (the first ${hintAvailable.length} entries are same-section candidates — preferred but not required)`
@@ -4323,6 +4438,16 @@ Return ONLY the JSON array, no other text.`;
             // dupes); the structural checks are demoted to warnings for
             // RU/AR and remain hard rejects for EN/FR.
             const softGates = (l === "ru" || l === "ar");
+            // Task #74: when this row's sibling-scope fence is active for
+            // this language, the structural gates (outsideRoot, section
+            // context) are subsumed by isUrlUnderTgtDir — any candidate
+            // outside the mapped subtree will be killed by the fence below.
+            // Skip them here so borderline-but-correct picks are not lost.
+            // Only the hard gates (inventory membership, already-used,
+            // sibling-scope fence) remain in effect for scoped rows.
+            const rowScope = computeSiblingScope(row.sourceUrl, l, tabPatterns);
+            const scopeActive = rowScope !== null;
+            const sectionFails = !validateSectionContext(suggestedUrl, row.sourceUrl, l, tabPatterns);
             if (!inventories[l]?.urls.has(suggestedUrl)) {
               log(`    AI REJECTED (not in inventory): ${l.toUpperCase()} ${suggestedUrl}`);
               aiStats[l].rejNotInInv++;
@@ -4331,11 +4456,11 @@ Return ONLY the JSON array, no other text.`;
               log(`    AI REJECTED (already used): ${l.toUpperCase()} ${suggestedUrl}`);
               aiStats[l].rejAlreadyUsed++;
               siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
-            } else if (outsideRoot && !softGates) {
+            } else if (outsideRoot && !softGates && !scopeActive) {
               log(`    AI REJECTED (outside ${l.toUpperCase()} root ${rootBase}): ${suggestedUrl}`);
               aiStats[l].rejOutsideRoot++;
               siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
-            } else if (!validateSectionContext(suggestedUrl, row.sourceUrl, l, tabPatterns) && !softGates) {
+            } else if (sectionFails && !softGates && !scopeActive) {
               log(`    AI REJECTED (section/category mismatch with source): ${l.toUpperCase()} ${suggestedUrl} ⟵ ${row.sourceUrl}`);
               aiStats[l].rejSection++;
               siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
@@ -4349,11 +4474,7 @@ Return ONLY the JSON array, no other text.`;
               // an architectural constraint, not a heuristic. Independent of
               // the batch-level hardFenceLangs gate above so mixed-scope
               // batches still get the per-row check.
-              (() => {
-                const scope = computeSiblingScope(row.sourceUrl, l, tabPatterns);
-                if (!scope) return false;
-                return !isUrlUnderTgtDir(suggestedUrl as string, scope.mappedTgtDir);
-              })()
+              scopeActive && !isUrlUnderTgtDir(suggestedUrl as string, rowScope!.mappedTgtDir)
             ) {
               log(`    AI REJECTED (sibling-scope fence): ${l.toUpperCase()} ${suggestedUrl} ⟵ ${row.sourceUrl}`);
               aiStats[l].rejSiblingScope++;
@@ -4363,8 +4484,21 @@ Return ONLY the JSON array, no other text.`;
               if (outsideRoot && softGates) {
                 log(`    AI WARN (outside ${l.toUpperCase()} root ${rootBase}, accepting): ${suggestedUrl}`);
               }
-              if (softGates && !validateSectionContext(suggestedUrl, row.sourceUrl, l, tabPatterns)) {
+              if (softGates && sectionFails) {
                 log(`    AI WARN (${l.toUpperCase()} section/category mismatch, accepting): ${suggestedUrl} ⟵ ${row.sourceUrl}`);
+              }
+              // Task #74: bookkeeping for "scope skipped a hard-gate
+              // rejection". Only counted for non-soft-gate langs (EN/FR);
+              // for RU/AR these gates are already soft (warn-only) so
+              // there is nothing to "skip". The fence above guarantees
+              // correctness, so the skip is safe.
+              if (scopeActive && !softGates && outsideRoot) {
+                log(`    AI ROOT-SKIP (${l.toUpperCase()} scope active, accepting outside ${rootBase}): ${suggestedUrl}`);
+                aiStats[l].rejOutsideRootSkipped++;
+              }
+              if (scopeActive && !softGates && sectionFails) {
+                log(`    AI SECTION-SKIP (${l.toUpperCase()} scope active, accepting section-mismatch): ${suggestedUrl} ⟵ ${row.sourceUrl}`);
+                aiStats[l].rejSectionSkipped++;
               }
               setResultMatch(result, l, suggestedUrl, 82, "ai-match");
               usedUrls[l].add(suggestedUrl);
@@ -4461,9 +4595,17 @@ Return ONLY the JSON array, no other text.`;
   for (const l of activeLangs) {
     const s = aiStats[l];
     if (s.attempted === 0) continue;
+    // accountedFor stays the sum of mutually-exclusive outcomes per attempt
+    // (accepted, rejNull, rejNotInInv, rejAlreadyUsed, rejOutsideRoot,
+    // rejSection, rejSiblingScope). The Task #74 *Skipped counters are
+    // additive observations on top of "accepted" — a skipped gate means
+    // the suggestion was admitted, so it's already counted as accepted.
     const accountedFor = s.accepted + s.rejNull + s.rejNotInInv + s.rejAlreadyUsed + s.rejOutsideRoot + s.rejSection + s.rejSiblingScope;
     const invariantNote = accountedFor === s.attempted ? "" : ` [WARN: counter drift, accounted=${accountedFor} != attempted]`;
-    log(`    AI ${l.toUpperCase()} stats: attempted=${s.attempted} accepted=${s.accepted} | rejected: null=${s.rejNull}, not-in-inv=${s.rejNotInInv}, already-used=${s.rejAlreadyUsed}, outside-root=${s.rejOutsideRoot}, section-mismatch=${s.rejSection}, sibling-scope=${s.rejSiblingScope}${invariantNote}`);
+    const skipsNote = (s.rejOutsideRootSkipped > 0 || s.rejSectionSkipped > 0)
+      ? ` | scope-skipped: outside-root=${s.rejOutsideRootSkipped}, section-mismatch=${s.rejSectionSkipped}`
+      : "";
+    log(`    AI ${l.toUpperCase()} stats: attempted=${s.attempted} accepted=${s.accepted} | rejected: null=${s.rejNull}, not-in-inv=${s.rejNotInInv}, already-used=${s.rejAlreadyUsed}, outside-root=${s.rejOutsideRoot}, section-mismatch=${s.rejSection}, sibling-scope=${s.rejSiblingScope}${skipsNote}${invariantNote}`);
   }
   const aiFenceSummary = langs
     .filter(l => siblingFence[l].rejected > 0)
@@ -4472,5 +4614,15 @@ Return ONLY the JSON array, no other text.`;
   if (aiFenceSummary) {
     log(`  Sibling-scope AI fence: ${aiFenceSummary} candidate(s) rejected (out-of-scope)`);
   }
-  return { matches: results, siblingFence };
+  // Task #74: project per-lang scope-skip counters into the structured
+  // scopeSkipped output so the per-tab summary log in routes.ts can emit a
+  // single "scoped-loosened" telemetry line alongside the existing fence
+  // and coverage lines.
+  const scopeSkipped: Record<TargetLang, { sectionSkipped: number; outsideRootSkipped: number }> = {
+    en: { sectionSkipped: aiStats.en.rejSectionSkipped, outsideRootSkipped: aiStats.en.rejOutsideRootSkipped },
+    fr: { sectionSkipped: aiStats.fr.rejSectionSkipped, outsideRootSkipped: aiStats.fr.rejOutsideRootSkipped },
+    ru: { sectionSkipped: aiStats.ru.rejSectionSkipped, outsideRootSkipped: aiStats.ru.rejOutsideRootSkipped },
+    ar: { sectionSkipped: aiStats.ar.rejSectionSkipped, outsideRootSkipped: aiStats.ar.rejOutsideRootSkipped },
+  };
+  return { matches: results, siblingFence, scopeSkipped };
 }
