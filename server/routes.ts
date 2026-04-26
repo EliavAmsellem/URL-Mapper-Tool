@@ -1420,12 +1420,13 @@ async function matchTab(
         } else {
           if (match) dedupBlockedCount++; else inventoryMissCount++;
           sectionStats[section][`${l}Missed`]++;
-          // Pattern miss → non-fence failure for strict fence-only telemetry.
-          // Either the inventory had no matching URL or the matched URL was
-          // already used by another row; both are commit-time failures
-          // unrelated to the sibling fence and thus disqualify this row from
-          // the strict "fence rejected the only candidate" bucket.
-          titleNonFenceFailureMarks[l].add(row.rowIndex);
+          // Pattern miss → non-fence failure for strict fence-only telemetry,
+          // BUT only when the failure was not itself caused by the sibling
+          // fence. If `scopeBlocked` is true the row's pattern miss IS the
+          // fence rejection and we must not also add it to the non-fence
+          // bucket — doing so would suppress a legitimate fence-only row in
+          // the strict counter.
+          if (!scopeBlocked) titleNonFenceFailureMarks[l].add(row.rowIndex);
           const allCandidates = constructAllTargetUrls(row.sourceUrl, l, tabPatterns);
           if (debugSamples[l] < MAX_DEBUG_SAMPLES) {
             const reason = match ? `dedup-blocked (${match.url})` : "not-in-inventory";
@@ -1658,6 +1659,13 @@ async function matchTab(
       titleFenceRejected[l] += titleOutput.siblingFence[l].rejected;
       for (const idx of Array.from(titleOutput.siblingFence[l].markedRowIndices)) {
         titleFenceMarks[l].add(idx);
+      }
+      // Merge title-stage non-fence failure rows (matcher returned nothing
+      // for reasons unrelated to the sibling fence: no candidate found, all
+      // candidates already used, etc.) so the strict fence-only-blocked
+      // metric correctly disqualifies these rows.
+      for (const idx of Array.from(titleOutput.siblingFence[l].nonFenceFailureRowIndices)) {
+        titleNonFenceFailureMarks[l].add(idx);
       }
     }
 
