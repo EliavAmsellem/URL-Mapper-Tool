@@ -4202,16 +4202,24 @@ export async function aiMatchUnmatched(
   // `aiStats`, `siblingFence`, the `results` map, and the early-exit /
   // consecutive-zero counters are all updated serially in commitBatch().
   //
-  // Tradeoff: a worker building batch N+k's prompt sees the snapshot of
-  // `usedUrls` at launch time, which excludes commits from batches still
-  // in flight. The bounded window (4) keeps that window of staleness small,
-  // and the commit-time hard-rejects (`already-used`, `not-in-inventory`,
-  // sibling-scope fence) preserve correctness either way.
+  // BYTE-IDENTITY DEFAULT: with MAX_PARALLEL_AI_BATCHES=1 the driver
+  // degenerates to a strict serial pipeline (prep → call → commit) and the
+  // visible inventory in each batch's prompt sees exactly the same
+  // `usedUrls` snapshot it would have seen in the previous serial loop.
+  // That is the default so the task #78 "byte-identical match output"
+  // contract holds out of the box. Operators who want the wall-clock
+  // win from overlapping OpenAI latency can set LINGUAMAP_AI_PARALLEL to
+  // a higher value (e.g. 4); when they do, batch N+k's prompt may see a
+  // stale `usedUrls` snapshot (commits from in-flight earlier batches
+  // are not yet visible). Commit-time hard rejects (`already-used`,
+  // `not-in-inventory`, sibling-scope fence) keep the *output* correct,
+  // but the model may pick differently when its visible inventory differs
+  // — accept this tradeoff explicitly.
   //
   // Buffered logs: the prep + call phases write to a per-prep `deferredLogs`
   // array which is flushed by commitBatch() right before its own logs, so
   // the on-disk log ordering still matches the batch-index ordering.
-  const MAX_PARALLEL_AI_BATCHES = parseInt(process.env.LINGUAMAP_AI_PARALLEL || "4", 10) || 4;
+  const MAX_PARALLEL_AI_BATCHES = Math.max(1, parseInt(process.env.LINGUAMAP_AI_PARALLEL || "1", 10) || 1);
 
   type BatchPrep = {
     batchIdx: number;
