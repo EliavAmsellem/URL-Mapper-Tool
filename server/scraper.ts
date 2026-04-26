@@ -3970,12 +3970,12 @@ export async function aiMatchUnmatched(
     const batch = batchEntry.rows;
     const batchSection = batchEntry.section;
     const batchScope = batchEntry.scopeKey;
-    // Hard-fence enabled for a lang in this batch ONLY when every needing
-    // row shares the same non-null mappedTgtDir. In that case the visible
-    // inventory is restricted to URLs under that subtree, the prompt drops
-    // the cross-section allowance for that lang, and the commit-time fence
-    // rejects any out-of-scope picks.
-    const hardFenceLangs = new Set<TargetLang>(langs.filter(l => batchScope[l] !== null));
+    // Hard-fence at the batch level is implicit in the batching decision:
+    // batches are sub-bucketed by scopeKey above, so any lang with a
+    // non-null batchScope[l] is uniformly scoped for every row in this
+    // batch. The visible inventory restriction, prompt language, and
+    // commit-time fence each consult batchScope[l] / computeSiblingScope
+    // directly — no separate "hardFenceLangs" set is required.
 
     const urlsBlock = batch.map(row => {
       const parts = [`- Source URL: ${row.sourceUrl}`];
