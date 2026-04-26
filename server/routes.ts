@@ -93,6 +93,93 @@ function isSeedsSheet(name: string): boolean {
   return SEEDS_SHEET_NAMES.has(name.trim().toLowerCase());
 }
 
+const EXCLUDES_SHEET_NAMES = new Set(["excludes", "exclude", "exclusions"]);
+function isExcludesSheet(name: string): boolean {
+  return EXCLUDES_SHEET_NAMES.has(name.trim().toLowerCase());
+}
+function isMetadataSheet(name: string): boolean {
+  return isSeedsSheet(name) || isExcludesSheet(name);
+}
+
+// Excludes sheet payload: tab name → per-language list of HE source path
+// prefixes. A row whose source URL pathname starts with any prefix in the
+// per-tab list for a given language is marked excluded for that language
+// (method="excluded-config") and skipped from the matching pipeline.
+export type ExcludesMap = Map<string, Partial<Record<TargetLang, string[]>>>;
+
+function normalizeExcludePath(raw: string): string | null {
+  const v = raw.trim();
+  if (!v) return null;
+  let p: string;
+  if (/^https?:\/\//i.test(v)) {
+    try { p = new URL(v).pathname; } catch { return null; }
+  } else {
+    p = v.startsWith("/") ? v : "/" + v;
+  }
+  return p.toLowerCase();
+}
+
+function splitExcludeCell(raw: string): string[] {
+  if (!raw) return [];
+  return raw
+    .split(/[\n;,]+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+function parseExcludesSheet(ws: ExcelJS.Worksheet, knownSheets: string[]): ExcludesMap {
+  const result: ExcludesMap = new Map();
+  const data = worksheetToAoa(ws);
+  if (data.length === 0) return result;
+  const headerRowCells = data[0].map(c => (c || "").toString().trim().toLowerCase());
+
+  let tabCol = 0;
+  const langCol: Partial<Record<TargetLang, number>> = {};
+  let headerDetected = false;
+  for (let i = 0; i < headerRowCells.length; i++) {
+    const h = headerRowCells[i];
+    if (h === "tab" || h === "sheet" || h === "name" || h === "tab name" || h === "sheet name") { tabCol = i; headerDetected = true; }
+    else if (h === "en" || h === "english") { langCol.en = i; headerDetected = true; }
+    else if (h === "fr" || h === "french") { langCol.fr = i; headerDetected = true; }
+    else if (h === "ru" || h === "russian") { langCol.ru = i; headerDetected = true; }
+    else if (h === "ar" || h === "arabic") { langCol.ar = i; headerDetected = true; }
+  }
+  if (!headerDetected) {
+    langCol.en = 1; langCol.fr = 2; langCol.ru = 3; langCol.ar = 4;
+  }
+  const startRow = headerDetected ? 1 : 0;
+  if (data.length <= startRow) return result;
+
+  const knownLower = new Map<string, string>();
+  for (const s of knownSheets) knownLower.set(s.toLowerCase(), s);
+
+  for (let r = startRow; r < data.length; r++) {
+    const row = data[r];
+    const tabRaw = (row[tabCol] || "").toString().trim();
+    if (!tabRaw) continue;
+    const matched = knownLower.get(tabRaw.toLowerCase());
+    if (!matched) {
+      log(`Excludes sheet: tab "${tabRaw}" (row ${r + 1}) does not match any data sheet — ignoring`);
+      continue;
+    }
+    const entry: Partial<Record<TargetLang, string[]>> = result.get(matched) ?? {};
+    for (const l of ["en", "fr", "ru", "ar"] as TargetLang[]) {
+      const ci = langCol[l];
+      if (ci === undefined) continue;
+      const cell = (row[ci] || "").toString();
+      const prefixes = splitExcludeCell(cell)
+        .map(normalizeExcludePath)
+        .filter((p): p is string => !!p);
+      if (prefixes.length === 0) continue;
+      const list = entry[l] ?? [];
+      for (const p of prefixes) if (!list.includes(p)) list.push(p);
+      entry[l] = list;
+    }
+    if (Object.keys(entry).length > 0) result.set(matched, entry);
+  }
+  return result;
+}
+
 export type SeedMap = Map<string, Partial<Record<TargetLang, string>>>;
 
 function normalizeSeedToPath(raw: string): string | null {
@@ -217,7 +304,7 @@ export async function registerRoutes(
       let totalUrls = 0;
 
       for (const worksheet of workbook.worksheets) {
-        if (isSeedsSheet(worksheet.name)) continue;
+        if (isMetadataSheet(worksheet.name)) continue;
         totalUrls += Math.max(0, worksheet.rowCount - 1);
       }
 
@@ -251,7 +338,7 @@ export async function registerRoutes(
       fs.copyFileSync(req.file.path, savedPath);
       fs.unlinkSync(req.file.path);
 
-      res.json({ jobId: job.id, totalUrls, sheets: workbook.worksheets.filter(ws => !isSeedsSheet(ws.name)).map(ws => ws.name) });
+      res.json({ jobId: job.id, totalUrls, sheets: workbook.worksheets.filter(ws => !isMetadataSheet(ws.name)).map(ws => ws.name) });
     } catch (error: any) {
       log(`Upload error: ${error.message}`);
       res.status(500).json({ message: error.message });
@@ -425,6 +512,12 @@ interface TabData {
   allRows: RowData[];
   tabRefRows: TabRefRow[];
   data: any[][];
+  // Per-row, per-language exclusion records. Populated from the optional
+  // Excludes workbook sheet (method="excluded-config") and from the
+  // HE-only auto-detect pass (method="excluded-auto"). The save block
+  // writes the method into the existing-URL cell prefixed with a marker
+  // (or leaves the cell blank — see save block) so the user can audit.
+  excludedMethods?: Map<number, Map<TargetLang, string>>;
 }
 
 function cellValueToString(v: ExcelJS.CellValue): string | number | boolean | Date | null {
@@ -1341,6 +1434,7 @@ async function matchTab(
     const titleMatches = await titleMatchUnmatched(
       unmatchedForTitle, inventories, storage,
       allowedRoots, refDepths, knownUrlSets, control.signal, crossScriptLangs,
+      tabPatterns,
     );
 
     for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
@@ -1541,9 +1635,14 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
 
   const allTabData: TabData[] = [];
   let seedsSheet: ExcelJS.Worksheet | null = null;
+  let excludesSheet: ExcelJS.Worksheet | null = null;
   for (const worksheet of workbook.worksheets) {
     if (isSeedsSheet(worksheet.name)) {
       seedsSheet = worksheet;
+      continue;
+    }
+    if (isExcludesSheet(worksheet.name)) {
+      excludesSheet = worksheet;
       continue;
     }
     const td = parseSheet(worksheet.name, worksheet, targetLangs);
@@ -1565,6 +1664,62 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       }
       log(`Job ${jobId}: Seeds sheet provides overrides for ${seedMap.size} tab(s): ${summary.join("; ")}`);
     }
+  }
+
+  const excludesMap: ExcludesMap = excludesSheet
+    ? parseExcludesSheet(excludesSheet, allTabData.map(t => t.sheetName))
+    : new Map();
+  if (excludesSheet) {
+    if (excludesMap.size === 0) {
+      log(`Job ${jobId}: Excludes sheet found but no usable rows`);
+    } else {
+      const summary: string[] = [];
+      for (const [tab, entry] of Array.from(excludesMap.entries())) {
+        const parts = (Object.keys(entry) as TargetLang[])
+          .filter(l => entry[l] && entry[l]!.length > 0)
+          .map(l => `${l.toUpperCase()}=${entry[l]!.length}`)
+          .join(", ");
+        summary.push(`"${tab}" {${parts}}`);
+      }
+      log(`Job ${jobId}: Excludes sheet provides exclusion prefixes for ${excludesMap.size} tab(s): ${summary.join("; ")}`);
+    }
+  }
+
+  // Apply Excludes-sheet exclusions BEFORE the matching pipeline runs.
+  // For each row whose source pathname starts with any per-language prefix
+  // listed for its tab, mark needs[lang]=false and record the method as
+  // "excluded-config" so the save block can surface it.
+  const excludeLangs: TargetLang[] = ["en", "fr", "ru", "ar"];
+  let excludedConfigCount = 0;
+  for (const tabData of allTabData) {
+    const tabExcl = excludesMap.get(tabData.sheetName);
+    if (!tabExcl) continue;
+    if (!tabData.excludedMethods) tabData.excludedMethods = new Map();
+    for (const row of tabData.allRows) {
+      let srcPath: string;
+      try { srcPath = new URL(row.sourceUrl).pathname.toLowerCase(); }
+      catch { continue; }
+      for (const l of excludeLangs) {
+        if (!targetLangs.includes(l)) continue;
+        const prefixes = tabExcl[l];
+        if (!prefixes || prefixes.length === 0) continue;
+        const hit = prefixes.some(p => srcPath.startsWith(p));
+        if (!hit) continue;
+        switch (l) {
+          case "en": if (!row.needsEn) continue; row.needsEn = false; break;
+          case "fr": if (!row.needsFr) continue; row.needsFr = false; break;
+          case "ru": if (!row.needsRu) continue; row.needsRu = false; break;
+          case "ar": if (!row.needsAr) continue; row.needsAr = false; break;
+        }
+        let perRow = tabData.excludedMethods.get(row.rowIndex);
+        if (!perRow) { perRow = new Map(); tabData.excludedMethods.set(row.rowIndex, perRow); }
+        perRow.set(l, "excluded-config");
+        excludedConfigCount++;
+      }
+    }
+  }
+  if (excludedConfigCount > 0) {
+    log(`Job ${jobId}: Excludes sheet excluded ${excludedConfigCount} row+lang combinations from matching`);
   }
 
   const allLangs: TargetLang[] = ["en", "fr", "ru", "ar"];
@@ -2049,6 +2204,101 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
     log(`Job ${jobId} cancelled — saving partial results from passes already completed.`);
   }
 
+  // HE-only auto-detect: any source-path prefix where every constructed
+  // candidate URL misses the target inventory AND no reference row under
+  // that prefix has a translation for the target language is treated as a
+  // HE-only subtree (e.g. /benefits/HozrimGimlaot/). Mark its rows with
+  // method="excluded-auto" so they aren't reported as missing matches.
+  if (!control.cancel) {
+    let excludedAutoCount = 0;
+    let autoPrefixesScanned = 0;
+    for (const tabData of allTabData) {
+      const inv = tabInventories.get(tabData.sheetName);
+      if (!inv) continue;
+      const sheetGlobal = globalMatchResults.get(tabData.sheetName) || new Map();
+      const refUrlByPair: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = {
+        en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl",
+      };
+
+      for (const l of allLangs) {
+        if (!targetLangs.includes(l)) continue;
+        const inventory = inv.inventories[l];
+        if (!inventory) continue;
+        const invSet = new Set<string>();
+        inventory.urls.forEach(u => invSet.add(u));
+
+        // Group still-unmatched rows for this language by 3-segment HE
+        // source prefix. Only consider rows that the matching pipeline
+        // actually attempted (not already excluded-config).
+        const groups = new Map<string, RowData[]>();
+        for (const row of tabData.allRows) {
+          const excl = tabData.excludedMethods?.get(row.rowIndex);
+          if (excl?.has(l)) continue;
+          const m = sheetGlobal.get(row.rowIndex);
+          if (m && getResultUrl(m, l)) continue;
+          const orig = l === "en" ? row.originalEn
+                     : l === "fr" ? row.originalFr
+                     : l === "ru" ? row.originalRu
+                     : row.originalAr;
+          if (orig) continue;
+          let segs: string[];
+          try { segs = new URL(row.sourceUrl).pathname.split("/").filter(Boolean); }
+          catch { continue; }
+          if (segs.length < 3) continue;
+          const prefix = "/" + segs.slice(0, 3).join("/").toLowerCase() + "/";
+          let arr = groups.get(prefix);
+          if (!arr) { arr = []; groups.set(prefix, arr); }
+          arr.push(row);
+        }
+
+        for (const [prefix, rows] of Array.from(groups.entries())) {
+          autoPrefixesScanned++;
+          // Negative signal A: any reference row whose source falls under
+          // this prefix already has a translation for this language → the
+          // subtree IS translated, do NOT auto-exclude.
+          let refHit = false;
+          for (const ref of tabData.tabRefRows) {
+            try {
+              const refPath = new URL(ref.sourceUrl).pathname.toLowerCase();
+              if (!refPath.startsWith(prefix)) continue;
+              if (ref[refUrlByPair[l]]) { refHit = true; break; }
+            } catch {}
+          }
+          if (refHit) continue;
+
+          // Negative signal B: any constructed target candidate (sample up
+          // to 5 rows under this prefix) is present in the inventory →
+          // the subtree IS translated, do NOT auto-exclude.
+          let invHit = false;
+          const sample = rows.slice(0, 5);
+          for (const r of sample) {
+            const cands = constructAllTargetUrls(r.sourceUrl, l, inv.tabPatterns);
+            for (const c of cands) {
+              if (invSet.has(c)) { invHit = true; break; }
+            }
+            if (invHit) break;
+          }
+          if (invHit) continue;
+
+          // Both signals negative → HE-only prefix for this language.
+          if (!tabData.excludedMethods) tabData.excludedMethods = new Map();
+          for (const r of rows) {
+            let perRow = tabData.excludedMethods.get(r.rowIndex);
+            if (!perRow) { perRow = new Map(); tabData.excludedMethods.set(r.rowIndex, perRow); }
+            if (!perRow.has(l)) {
+              perRow.set(l, "excluded-auto");
+              excludedAutoCount++;
+            }
+          }
+          log(`  Auto-exclude (${l.toUpperCase()}) prefix="${prefix}" rows=${rows.length} (no ref translation, no inventory hit)`);
+        }
+      }
+    }
+    if (autoPrefixesScanned > 0) {
+      log(`Job ${jobId}: HE-only auto-detect scanned ${autoPrefixesScanned} prefix×lang groups, excluded ${excludedAutoCount} row+lang combinations`);
+    }
+  }
+
   await storage.deleteResultsByJob(jobId);
 
   let finalMatchedCount = 0;
@@ -2085,6 +2335,18 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         if (match.arUrl && !row.originalAr) {
           arUrl = match.arUrl; confidenceAr = match.confidenceAr; matchMethodAr = match.matchMethodAr;
         }
+      }
+
+      // Exclusion records (Excludes sheet + auto-detect): when a row+lang
+      // was deliberately skipped from matching, surface the method so the
+      // user can audit. URL stays null. Existing matches and pre-existing
+      // values take precedence — exclusions only fill empty slots.
+      const excl = tabData.excludedMethods?.get(row.rowIndex);
+      if (excl) {
+        if (excl.has("en") && !enUrl && !matchMethodEn) matchMethodEn = excl.get("en")!;
+        if (excl.has("fr") && !frUrl && !matchMethodFr) matchMethodFr = excl.get("fr")!;
+        if (excl.has("ru") && !ruUrl && !matchMethodRu) matchMethodRu = excl.get("ru")!;
+        if (excl.has("ar") && !arUrl && !matchMethodAr) matchMethodAr = excl.get("ar")!;
       }
 
       const rowFinalUrls: Record<TargetLang, string | null> = { en: enUrl, fr: frUrl, ru: ruUrl, ar: arUrl };

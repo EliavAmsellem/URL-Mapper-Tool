@@ -1878,6 +1878,64 @@ function disambiguateByDepth(
   }
 }
 
+export interface SiblingScope {
+  mappedSrcDir: string[];
+  mappedTgtDir: string[];
+  residualSrcTail: string[];
+  matchLen: number;
+}
+
+/**
+ * Find the most specific confirmed (sourceRoot → targetRoot) directory mapping
+ * that prefixes this source URL, using tabPatterns.rootMappings (i.e. the
+ * per-tab pairs already learned from the workbook reference rows). Returns
+ * null when no mapping is more specific than the per-language source root.
+ *
+ * The returned `mappedTgtDir` is the inventory subtree that should contain
+ * sibling pages of this source URL — used by the title and AI matchers to
+ * narrow the candidate pool.
+ */
+export function computeSiblingScope(
+  sourceUrl: string,
+  lang: TargetLang,
+  tabPatterns: TabPatterns,
+): SiblingScope | null {
+  let cleanSrc: string[];
+  try {
+    cleanSrc = stripSuffix(new URL(sourceUrl).pathname.split("/").filter(Boolean));
+  } catch { return null; }
+
+  const sourceRoot = langSrcRoot(tabPatterns, lang);
+  const pairMappings = tabPatterns.rootMappings.get(lang) || [];
+  let bestSrcRoot: string[] | null = null;
+  let bestTgtRoot: string[] | null = null;
+  let bestLen = 0;
+
+  for (const mapping of pairMappings) {
+    if (mapping.sourceRoot.length <= bestLen) continue;
+    if (mapping.sourceRoot.length > cleanSrc.length) continue;
+    let ok = true;
+    for (let i = 0; i < mapping.sourceRoot.length; i++) {
+      if (normalizeSegment(cleanSrc[i]) !== normalizeSegment(mapping.sourceRoot[i])) { ok = false; break; }
+    }
+    if (!ok) continue;
+    bestLen = mapping.sourceRoot.length;
+    bestSrcRoot = mapping.sourceRoot;
+    bestTgtRoot = mapping.targetRoot;
+  }
+
+  if (!bestTgtRoot || !bestSrcRoot) return null;
+  if (bestLen <= sourceRoot.length) return null;
+  if (bestTgtRoot.length === 0) return null;
+
+  return {
+    mappedSrcDir: bestSrcRoot,
+    mappedTgtDir: bestTgtRoot,
+    residualSrcTail: cleanSrc.slice(bestLen),
+    matchLen: bestLen,
+  };
+}
+
 /**
  * Detect tabs/languages where source URL slugs and target inventory slugs are in
  * different writing systems / vocabularies (e.g. EN source `/benefits/Disability`
@@ -2464,6 +2522,7 @@ export function matchByTitleSemantic(
   refDepths?: number[],
   sourceSegments?: Set<string>,
   disableSegmentRail: boolean = false,
+  siblingScopeNarrow: boolean = false,
 ): TitleMatchResult | null {
   if (!inventory.titleEmbeddings || inventory.titleEmbeddings.size === 0) return null;
 
@@ -2506,7 +2565,10 @@ export function matchByTitleSemantic(
   const confidenceFor = (s: number) => Math.min(Math.round(70 + s * 25), 95);
 
   const gap = bestSim - secondBestSim;
-  if (gap < 0.03 && bestSim < 0.85) {
+  // Sibling-scope narrow pool: relax the strict ambiguity gate for the same
+  // reason as in matchByTitle — the candidate set has been pre-filtered to a
+  // single confirmed sibling directory, so close ties are expected and OK.
+  if (gap < 0.03 && bestSim < 0.85 && !(siblingScopeNarrow && bestSim >= minCosine + 0.03)) {
     if (sourceSegments && sourceSegments.size > 0) {
       const close = scored.filter(s => s.sim >= bestSim - 0.03);
       if (close.length >= 2) {
@@ -2535,7 +2597,7 @@ export function matchByTitleSemantic(
     return null;
   }
 
-  if (sourceSegments && sourceSegments.size > 0 && !disableSegmentRail) {
+  if (sourceSegments && sourceSegments.size > 0 && !disableSegmentRail && !siblingScopeNarrow) {
     const allNonLatin = Array.from(sourceSegments).every(seg => /[^\x00-\x7F]/.test(seg));
     if (!allNonLatin) {
       try {
@@ -2814,6 +2876,7 @@ export function matchByTitle(
   refDepths?: number[],
   sourceSegments?: Set<string>,
   disableSegmentRail: boolean = false,
+  siblingScopeNarrow: boolean = false,
 ): TitleMatchResult | null {
   let bestMatch: TitleMatchResult | null = null;
   let bestSimilarity = minSimilarity;
@@ -2881,7 +2944,11 @@ export function matchByTitle(
   const finalMatch = bestMatch as TitleMatchResult | null;
   if (finalMatch) {
     const gap = bestSimilarity - secondBestSimilarity;
-    if (gap < 0.05 && bestSimilarity < 0.95) {
+    // When the candidate pool is narrowed by a confirmed sibling-directory
+    // scope, the absolute number of plausible options is small and the model
+    // can pick a true match even when the second-best is also semantically
+    // close. Skip the strict ambiguity gate as long as we cleared the floor.
+    if (gap < 0.05 && bestSimilarity < 0.95 && !(siblingScopeNarrow && bestSimilarity >= minSimilarity + 0.05)) {
       if (sourceSegments && sourceSegments.size > 0) {
         const allMatches = Array.from(inventory.urls).filter(url => {
           const pageTitle = inventory.titleIndex.get(url);
@@ -2930,7 +2997,7 @@ export function matchByTitle(
       return null;
     }
 
-    if (sourceSegments && sourceSegments.size > 0 && !disableSegmentRail) {
+    if (sourceSegments && sourceSegments.size > 0 && !disableSegmentRail && !siblingScopeNarrow) {
       const allNonLatin = Array.from(sourceSegments).every(seg => /[^\x00-\x7F]/.test(seg));
       if (!allNonLatin) {
         try {
@@ -2964,6 +3031,7 @@ export async function titleMatchUnmatched(
   knownUrls?: Record<TargetLang, Set<string>>,
   signal?: AbortSignal,
   crossScriptLangs?: Record<TargetLang, boolean>,
+  tabPatterns?: TabPatterns,
 ): Promise<Map<number, BatchMatchResult>> {
   const results = new Map<number, BatchMatchResult>();
   const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
@@ -3070,6 +3138,13 @@ export async function titleMatchUnmatched(
 
   const candidates: { rowIndex: number; sourceUrl: string; matches: Record<TargetLang, TitleMatchResult | null> }[] = [];
 
+  // Sibling-scope telemetry (per-language): how many rows had a sibling scope,
+  // pool sizes when scoped, and how many matches actually came from a scoped
+  // call. Logged once at the end of this stage.
+  const siblingRowCount: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  const siblingPoolSizes: Record<TargetLang, number[]> = { en: [], fr: [], ru: [], ar: [] };
+  const siblingTitleAccepted: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+
   for (const row of unmatchedRows) {
     if (!row.title) continue;
 
@@ -3089,13 +3164,48 @@ export async function titleMatchUnmatched(
 
     for (const lang of langs) {
       const inv = inventories[lang];
-      const roots = allowedRoots?.[lang];
-      if (row.needs[lang] && inv && inv.titleIndex.size > 0 && roots && roots.length > 0) {
+      const baseRoots = allowedRoots?.[lang];
+      if (row.needs[lang] && inv && inv.titleIndex.size > 0 && baseRoots && baseRoots.length > 0) {
+        // Per-row sibling scope: when a confirmed (sourceRoot → targetRoot)
+        // mapping covers this source URL more specifically than the per-lang
+        // base root, narrow the candidate pool to that single sibling
+        // directory. This fixes the long-standing failure mode where RU
+        // pages under e.g. /About/faq/atzmayim/ never matched because the
+        // tab-wide allowedRoots were too broad and the model/title scorer
+        // got distracted by cross-section URLs.
+        const siblingScope = tabPatterns ? computeSiblingScope(row.sourceUrl, lang, tabPatterns) : null;
+        let effectiveRoots = baseRoots;
+        let scopeNarrow = false;
+        let scopedPool = 0;
+        if (siblingScope) {
+          const tgtPath = "/" + siblingScope.mappedTgtDir.join("/") + "/";
+          // Count inventory URLs under the scoped subtree to gauge whether
+          // the narrowing is meaningful (vs. the base root).
+          inv.urls.forEach(u => {
+            try {
+              if (new URL(u).pathname.toLowerCase().startsWith(tgtPath.toLowerCase())) scopedPool++;
+            } catch {}
+          });
+          if (scopedPool > 0) {
+            effectiveRoots = [tgtPath];
+            scopeNarrow = true;
+            siblingRowCount[lang]++;
+            siblingPoolSizes[lang].push(scopedPool);
+          }
+        }
+
         const translated = translations[lang].get(row.title);
         if (translated) {
           const minSim = (lang === "ru" || lang === "ar") ? 0.55 : 0.60;
-          rowMatches[lang] = matchByTitle(translated, inv, minSim, roots, refDepths?.[lang], sourceSegments, isCrossScript[lang]);
-          if (rowMatches[lang]) hasMatch = true;
+          // When sibling-scope narrowed, drop the per-lang refDepths too:
+          // depth distribution is calibrated against the broader base root
+          // and excludes valid sibling pages whose depth differs.
+          const effectiveDepths = scopeNarrow ? undefined : refDepths?.[lang];
+          rowMatches[lang] = matchByTitle(translated, inv, minSim, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow);
+          if (rowMatches[lang]) {
+            hasMatch = true;
+            if (scopeNarrow) siblingTitleAccepted[lang]++;
+          }
         }
 
         // Semantic fallback: only if cheap pass produced nothing for this row+lang.
@@ -3108,7 +3218,8 @@ export async function titleMatchUnmatched(
             semanticAttempted++;
             semAttemptedByLang[lang]++;
             const minCos = (lang === "ru" || lang === "ar") ? 0.55 : 0.58;
-            const semMatch = matchByTitleSemantic(trEmb, inv, minCos, roots, refDepths?.[lang], sourceSegments, isCrossScript[lang]);
+            const effectiveDepths = scopeNarrow ? undefined : refDepths?.[lang];
+            const semMatch = matchByTitleSemantic(trEmb, inv, minCos, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow);
             if (semMatch) {
               // Note: semanticAccepted is NOT incremented here — only after the
               // match survives cross-validation, knownUrl filter, and dedup at
@@ -3248,6 +3359,21 @@ export async function titleMatchUnmatched(
   const usedSummary = langs.map(l => `${usedUrls[l].size} ${l.toUpperCase()}`).join(", ");
   log(`  Title matching found ${titleMatches} new matches (${usedSummary} unique URLs)`);
   log(`  Title rejections: ambiguous=${rejected.ambiguous}, noSharedSegments=${rejected.noSegments}, crossValidation=${rejected.crossValidation}, knownUrl=${rejected.knownUrl}`);
+  // Sibling-scope telemetry per language: rows scoped, median pool size, and
+  // accepted matches whose call used the narrowed scope. A median of 0 with
+  // accepted > 0 just means scope wasn't useful for the matched rows.
+  const median = (arr: number[]) => {
+    if (arr.length === 0) return 0;
+    const s = arr.slice().sort((a, b) => a - b);
+    return s[Math.floor(s.length / 2)];
+  };
+  const siblingSummary = langs
+    .filter(l => siblingRowCount[l] > 0)
+    .map(l => `${l.toUpperCase()}=${siblingTitleAccepted[l]}/${siblingRowCount[l]} rows (medianPool=${median(siblingPoolSizes[l])})`)
+    .join(", ");
+  if (siblingSummary) {
+    log(`  Sibling-scope title-match: ${siblingSummary}`);
+  }
   if (semanticActive) {
     const cost = (semanticTokens / 1_000_000) * EMBED_PRICE_PER_M_TOKENS;
     const perLang = langs
@@ -3725,9 +3851,30 @@ export async function aiMatchUnmatched(
         }
       }
       const breadcrumbBucketSet = await getBreadcrumbHints(batchSection, sampleSourceUrl, l);
+      // Sibling-scope hint: for each row in this batch, if its source URL is
+      // covered by a confirmed (sourceRoot → targetRoot) per-pair mapping,
+      // every inventory URL under that target subtree becomes a soft hint.
+      // Union with URL/breadcrumb hints — never replace.
+      const siblingBucketSet = new Set<number>();
+      const seenScopes = new Set<string>();
+      for (const r of batch) {
+        const scope = computeSiblingScope(r.sourceUrl, l, tabPatterns);
+        if (!scope) continue;
+        const tgtPrefix = ("/" + scope.mappedTgtDir.join("/") + "/").toLowerCase();
+        if (seenScopes.has(tgtPrefix)) continue;
+        seenScopes.add(tgtPrefix);
+        for (let i = 0; i < inventoryUrls[l].length; i++) {
+          try {
+            if (new URL(inventoryUrls[l][i]).pathname.toLowerCase().startsWith(tgtPrefix)) {
+              siblingBucketSet.add(i);
+            }
+          } catch {}
+        }
+      }
       const sectionHintSet = new Set<number>();
       urlBucketSet.forEach(idx => sectionHintSet.add(idx));
       breadcrumbBucketSet.forEach(idx => sectionHintSet.add(idx));
+      siblingBucketSet.forEach(idx => sectionHintSet.add(idx));
       let bothCount = 0;
       urlBucketSet.forEach(idx => { if (breadcrumbBucketSet.has(idx)) bothCount++; });
 
