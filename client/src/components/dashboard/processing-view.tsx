@@ -199,7 +199,12 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
 
         {job && (
           <div className="flex justify-between items-center text-sm text-muted-foreground">
-            <span data-testid="text-matches">Matches found: <strong className="text-foreground">{job.matchedUrls}</strong></span>
+            <div className="flex items-center gap-4">
+              <span data-testid="text-matches">Matches found: <strong className="text-foreground">{job.matchedUrls}</strong></span>
+              {job.prefilledUrls > 0 && (
+                <span data-testid="text-prefilled">Already mapped: <strong className="text-foreground">{job.prefilledUrls}</strong></span>
+              )}
+            </div>
             <div className="flex items-center gap-3">
               <span>File: <strong className="text-foreground">{job.fileName}</strong></span>
               {job.status === "processing" && (

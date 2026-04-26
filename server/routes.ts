@@ -2101,9 +2101,8 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
     }
   }
   if (preExistingMatches > 0) {
-    matchedCount = preExistingMatches;
-    log(`Job ${jobId} found ${preExistingMatches} pre-existing match row(s) in upload (counted toward total)`);
-    await storage.updateJob(jobId, { matchedUrls: matchedCount });
+    log(`Job ${jobId} found ${preExistingMatches} pre-existing match row(s) in upload (tracked separately as "Already mapped")`);
+    await storage.updateJob(jobId, { prefilledUrls: preExistingMatches });
   }
   const needsKey: Record<TargetLang, keyof RowData> = { en: "needsEn", fr: "needsFr", ru: "needsRu", ar: "needsAr" };
   const refUrlKey: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = { en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl" };
@@ -3065,9 +3064,16 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         if (excl.has("ar") && !arUrl && !matchMethodAr) matchMethodAr = excl.get("ar")!;
       }
 
+      // Task #88: count only matches the run discovered. Rows whose only
+      // populated URLs came from the upload (`match_method_xx === 'existing'`)
+      // are surfaced separately via `prefilledUrls` and must NOT inflate the
+      // "Matches found" tally on the dashboard.
+      const rowFinalMethods: Record<TargetLang, string | null> = { en: matchMethodEn, fr: matchMethodFr, ru: matchMethodRu, ar: matchMethodAr };
       const rowFinalUrls: Record<TargetLang, string | null> = { en: enUrl, fr: frUrl, ru: ruUrl, ar: arUrl };
-      const rowHasAnyActive = activeLangsForCount.some(l => !!rowFinalUrls[l]);
-      if (rowHasAnyActive) finalMatchedCount++;
+      const rowHasNewMatch = activeLangsForCount.some(l =>
+        !!rowFinalUrls[l] && rowFinalMethods[l] !== "existing"
+      );
+      if (rowHasNewMatch) finalMatchedCount++;
 
       // Per-language diagnostic block stored in mapping_results.details JSONB.
       // Captures the matcher stage (derived from the method string), a short

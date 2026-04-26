@@ -5,6 +5,7 @@ export interface JobStatus {
   totalUrls: number;
   processedUrls: number;
   matchedUrls: number;
+  prefilledUrls: number;
   targetLanguages: string[];
   currentStep: string;
   createdAt: string;
