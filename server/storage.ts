@@ -4,7 +4,7 @@ import {
   mappingJobs, mappingResults, translationCache,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, and, inArray } from "drizzle-orm";
+import { eq, and, inArray, asc } from "drizzle-orm";
 
 export interface IStorage {
   createJob(job: InsertMappingJob): Promise<MappingJob>;
@@ -14,7 +14,7 @@ export interface IStorage {
   createResult(result: InsertMappingResult): Promise<MappingResult>;
   createResults(results: InsertMappingResult[]): Promise<void>;
   deleteResultsByJob(jobId: string): Promise<void>;
-  getResultsByJob(jobId: string): Promise<MappingResult[]>;
+  getResultsByJob(jobId: string, sinceCount?: number): Promise<MappingResult[]>;
   getCachedTranslation(sourceText: string, targetLang: string): Promise<string | null>;
   getCachedTranslations(targetLang: string): Promise<Map<string, string>>;
   saveCachedTranslations(entries: { sourceText: string; targetLang: string; translatedText: string }[]): Promise<void>;
@@ -65,8 +65,18 @@ export class DatabaseStorage implements IStorage {
     await db.delete(mappingResults).where(eq(mappingResults.jobId, jobId));
   }
 
-  async getResultsByJob(jobId: string): Promise<MappingResult[]> {
-    return db.select().from(mappingResults).where(eq(mappingResults.jobId, jobId));
+  async getResultsByJob(jobId: string, sinceCount?: number): Promise<MappingResult[]> {
+    // Stable, deterministic ordering by (sheet_name, row_index) so the
+    // delta-polling cursor (`since=<count>`) can OFFSET safely. Without an
+    // explicit ORDER BY, Postgres is free to return rows in any order and
+    // an offset would skip arbitrary rows on each poll.
+    const q = db.select().from(mappingResults)
+      .where(eq(mappingResults.jobId, jobId))
+      .orderBy(asc(mappingResults.sheetName), asc(mappingResults.rowIndex));
+    if (typeof sinceCount === "number" && sinceCount > 0) {
+      return q.offset(sinceCount);
+    }
+    return q;
   }
 
   async getCachedTranslation(sourceText: string, targetLang: string): Promise<string | null> {

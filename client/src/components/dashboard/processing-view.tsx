@@ -2,6 +2,7 @@ import { motion } from "framer-motion";
 import { Check, Loader2, Search, GitMerge, Save, Brain, Square } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useEffect, useState, useRef } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { getJobStatus, stopJob, type JobStatus } from "@/lib/api";
 
 interface ProcessingViewProps {
@@ -38,79 +39,78 @@ function parseStep(currentStep: string): { phase: string; tabName: string | null
   return { phase: currentStep, tabName: null, passNum: null };
 }
 
+const TERMINAL_STATUSES = new Set(["completed", "error", "cancelled"]);
+
 export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
-  const [job, setJob] = useState<JobStatus | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [isStopping, setIsStopping] = useState(false);
-  const pollRef = useRef<NodeJS.Timeout | null>(null);
   const prevStepRef = useRef<string>("");
   const prevMatchedRef = useRef<number>(0);
+  const completedRef = useRef<boolean>(false);
 
-  const steps = [
-    { id: "learning", title: "Learning Patterns", icon: Search, desc: "Extracting URL patterns from reference rows..." },
-    { id: "matching", title: "URL Matching", icon: GitMerge, desc: "Constructing & verifying target URLs..." },
-    { id: "ai-matching", title: "AI Matching", icon: Brain, desc: "Using AI to match remaining URLs..." },
-    { id: "saving", title: "Saving Results", icon: Save, desc: "Writing results to database..." },
-  ];
+  // React Query polling: refetch every 2s while the job is processing,
+  // and automatically stop polling once the status is terminal (completed
+  // / error / cancelled). Cleanup on unmount is handled by the hook —
+  // no manual setInterval / clearInterval book-keeping required.
+  const { data: job } = useQuery<JobStatus>({
+    queryKey: ["/api/jobs", jobId],
+    queryFn: () => getJobStatus(jobId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      if (status && TERMINAL_STATUSES.has(status)) return false;
+      return 2000;
+    },
+    refetchIntervalInBackground: true,
+    refetchOnMount: "always",
+  });
 
+  // Drive the existing log-derivation effect from the polled query data.
+  // We compare against refs so we only push a log line when the upstream
+  // value changes between polls — same behavior as the previous setInterval.
   useEffect(() => {
-    const poll = async () => {
-      try {
-        const status = await getJobStatus(jobId);
-        setJob(status);
+    if (!job) return;
 
-        const { phase, tabName, passNum } = parseStep(status.currentStep);
-        const stepKey = status.currentStep;
+    const { phase, tabName, passNum } = parseStep(job.currentStep);
+    const stepKey = job.currentStep;
 
-        if (stepKey !== prevStepRef.current) {
-          prevStepRef.current = stepKey;
+    if (stepKey !== prevStepRef.current) {
+      prevStepRef.current = stepKey;
 
-          if (phase === "matching" && tabName) {
-            const passLabel = passNum && passNum > 1 ? ` (Pass ${passNum})` : "";
-            setLogs(prev => [`Processing tab: "${tabName}"${passLabel}`, ...prev].slice(0, 10));
-          } else if (phase === "ai-matching") {
-            const aiMsg = tabName ? `AI matching: "${tabName}"` : "Starting AI matching for unmatched URLs...";
-            setLogs(prev => [aiMsg, ...prev].slice(0, 10));
-          } else if (phase === "saving") {
-            setLogs(prev => ["Saving results to database...", ...prev].slice(0, 10));
-          } else if (phase === "saving-partial") {
-            setLogs(prev => ["Saving partial results...", ...prev].slice(0, 10));
-          } else if (phase === "stopping") {
-            setLogs(prev => ["Stopping job, finalizing partial results...", ...prev].slice(0, 10));
-          }
-        }
-
-        if (status.currentStep === "stopping" || status.currentStep === "saving-partial") {
-          setIsStopping(true);
-        }
-
-        if (status.matchedUrls > prevMatchedRef.current) {
-          const diff = status.matchedUrls - prevMatchedRef.current;
-          prevMatchedRef.current = status.matchedUrls;
-          setLogs(prev => [`Found ${diff} new matches (${status.matchedUrls} total)`, ...prev].slice(0, 10));
-        }
-
-        if (status.status === "completed" || status.status === "error" || status.status === "cancelled") {
-          if (pollRef.current) clearInterval(pollRef.current);
-          if (status.status === "completed") {
-            setLogs(prev => [`Completed! ${status.matchedUrls} matches found across ${status.totalUrls} URLs`, ...prev].slice(0, 10));
-          } else if (status.status === "cancelled") {
-            setLogs(prev => [`Job stopped. ${status.matchedUrls} matches found so far.`, ...prev].slice(0, 10));
-          }
-          setTimeout(onComplete, 1000);
-        }
-      } catch (err) {
-        console.error("Poll error:", err);
+      if (phase === "matching" && tabName) {
+        const passLabel = passNum && passNum > 1 ? ` (Pass ${passNum})` : "";
+        setLogs(prev => [`Processing tab: "${tabName}"${passLabel}`, ...prev].slice(0, 10));
+      } else if (phase === "ai-matching") {
+        const aiMsg = tabName ? `AI matching: "${tabName}"` : "Starting AI matching for unmatched URLs...";
+        setLogs(prev => [aiMsg, ...prev].slice(0, 10));
+      } else if (phase === "saving") {
+        setLogs(prev => ["Saving results to database...", ...prev].slice(0, 10));
+      } else if (phase === "saving-partial") {
+        setLogs(prev => ["Saving partial results...", ...prev].slice(0, 10));
+      } else if (phase === "stopping") {
+        setLogs(prev => ["Stopping job, finalizing partial results...", ...prev].slice(0, 10));
       }
-    };
+    }
 
-    poll();
-    pollRef.current = setInterval(poll, 2000);
+    if (job.currentStep === "stopping" || job.currentStep === "saving-partial") {
+      setIsStopping(true);
+    }
 
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
-  }, [jobId, onComplete]);
+    if (job.matchedUrls > prevMatchedRef.current) {
+      const diff = job.matchedUrls - prevMatchedRef.current;
+      prevMatchedRef.current = job.matchedUrls;
+      setLogs(prev => [`Found ${diff} new matches (${job.matchedUrls} total)`, ...prev].slice(0, 10));
+    }
+
+    if (TERMINAL_STATUSES.has(job.status) && !completedRef.current) {
+      completedRef.current = true;
+      if (job.status === "completed") {
+        setLogs(prev => [`Completed! ${job.matchedUrls} matches found across ${job.totalUrls} URLs`, ...prev].slice(0, 10));
+      } else if (job.status === "cancelled") {
+        setLogs(prev => [`Job stopped. ${job.matchedUrls} matches found so far.`, ...prev].slice(0, 10));
+      }
+      setTimeout(onComplete, 1000);
+    }
+  }, [job, onComplete]);
 
   const progress = job ? (job.totalUrls > 0 ? Math.round((job.processedUrls / job.totalUrls) * 100) : 0) : 0;
 
@@ -228,3 +228,10 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
     </div>
   );
 }
+
+const steps = [
+  { id: "learning", title: "Learning Patterns", icon: Search, desc: "Extracting URL patterns from reference rows..." },
+  { id: "matching", title: "URL Matching", icon: GitMerge, desc: "Constructing & verifying target URLs..." },
+  { id: "ai-matching", title: "AI Matching", icon: Brain, desc: "Using AI to match remaining URLs..." },
+  { id: "saving", title: "Saving Results", icon: Save, desc: "Writing results to database..." },
+];

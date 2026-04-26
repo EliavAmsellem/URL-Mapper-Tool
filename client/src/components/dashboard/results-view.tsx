@@ -1,6 +1,6 @@
 import { motion } from "framer-motion";
-import { Download, RotateCcw } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Download, RotateCcw, RefreshCw } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
 import { getJobResults, getJobStatus, getDownloadUrl, type MappingResultRow } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -34,6 +34,7 @@ interface ResultsViewProps {
 export function ResultsView({ jobId, onReset }: ResultsViewProps) {
   const [results, setResults] = useState<MappingResultRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [filter, setFilter] = useState<"all" | "matched" | "unmatched">("all");
   const [targetLangs, setTargetLangs] = useState<LangCode[]>(["en", "fr", "ru", "ar"]);
 
@@ -50,6 +51,25 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
       .catch(console.error)
       .finally(() => setLoading(false));
   }, [jobId]);
+
+  // Delta refresh: fetch only rows persisted after the count we already
+  // have, then append. The stable (sheet_name, row_index) ordering on the
+  // server side guarantees the OFFSET cursor stays consistent between
+  // calls. The full-fetch path on mount is unchanged.
+  const refreshDelta = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      const newRows = await getJobResults(jobId, results.length);
+      if (newRows.length > 0) {
+        setResults(prev => [...prev, ...newRows]);
+      }
+    } catch (err) {
+      console.error("Refresh error:", err);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [jobId, results.length, refreshing]);
 
   const filtered = results.filter((r) => {
     if (filter === "matched") return hasMatch(r, targetLangs);
@@ -78,6 +98,15 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
           </p>
         </div>
         <div className="flex gap-3">
+          <button
+            onClick={refreshDelta}
+            disabled={refreshing}
+            data-testid="button-refresh"
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors border border-border rounded-lg hover:bg-muted/50 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <RefreshCw className={cn("w-4 h-4", refreshing && "animate-spin")} />
+            Refresh
+          </button>
           <button onClick={onReset} data-testid="button-reset" className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors border border-border rounded-lg hover:bg-muted/50">
             <RotateCcw className="w-4 h-4" />
             Start Over

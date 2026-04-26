@@ -451,7 +451,18 @@ export async function registerRoutes(
 
   app.get("/api/jobs/:id/results", async (req: Request, res: Response) => {
     try {
-      const results = await storage.getResultsByJob(req.params.id as string);
+      // Optional `?since=<count>` cursor for delta polling. The storage
+      // layer orders rows by (sheet_name, row_index) so OFFSET is stable
+      // across calls. Default (no cursor) preserves the original full
+      // response, so existing callers (results-view single-fetch, the
+      // download endpoint) keep working byte-identically.
+      const sinceRaw = (req.query.since as string | undefined) ?? undefined;
+      let sinceCount: number | undefined;
+      if (sinceRaw !== undefined) {
+        const n = parseInt(sinceRaw, 10);
+        if (Number.isFinite(n) && n >= 0) sinceCount = n;
+      }
+      const results = await storage.getResultsByJob(req.params.id as string, sinceCount);
       res.json(results);
     } catch (error: any) {
       res.status(500).json({ message: error.message });
@@ -505,17 +516,35 @@ export async function registerRoutes(
         });
       }
 
-      const outputPath = `/tmp/uploads/${jobId}_output.xlsx`;
-      await workbook.xlsx.writeFile(outputPath);
-
+      // Stream the workbook directly into the HTTP response — no /tmp
+      // round-trip. Saves a full disk write+read+delete per download and
+      // lets large files start streaming to the client immediately.
       const outputName = job.fileName.replace(/\.xlsx?$/i, "_mapped.xlsx");
-      res.download(outputPath, outputName, () => {
-        try { fs.unlinkSync(outputPath); } catch {}
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${encodeURIComponent(outputName)}"`
+      );
+      try {
+        await workbook.xlsx.write(res);
+        res.end();
+      } finally {
+        // The source upload was previously cleaned up after `res.download`'s
+        // callback fired; preserve that behavior so re-runs don't pile up
+        // /tmp/uploads files. Best-effort: never throw out of the handler.
         try { fs.unlinkSync(filePath); } catch {}
-      });
+      }
     } catch (error: any) {
       log(`Download error: ${error.message}`);
-      res.status(500).json({ message: error.message });
+      // If headers already flushed (mid-stream), we can't send a JSON error.
+      if (!res.headersSent) {
+        res.status(500).json({ message: error.message });
+      } else {
+        try { res.end(); } catch {}
+      }
     }
   });
 

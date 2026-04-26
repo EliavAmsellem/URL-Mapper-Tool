@@ -68,8 +68,12 @@ export async function getJobStatus(jobId: string): Promise<JobStatus> {
   return res.json();
 }
 
-export async function getJobResults(jobId: string): Promise<MappingResultRow[]> {
-  const res = await fetch(`/api/jobs/${jobId}/results`);
+export async function getJobResults(
+  jobId: string,
+  since?: number,
+): Promise<MappingResultRow[]> {
+  const qs = typeof since === "number" && since > 0 ? `?since=${since}` : "";
+  const res = await fetch(`/api/jobs/${jobId}/results${qs}`);
   if (!res.ok) throw new Error("Failed to fetch results");
   return res.json();
 }

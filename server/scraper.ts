@@ -113,6 +113,15 @@ export interface VerifyResult {
 
 const urlExistenceCache = new Map<string, VerifyResult>();
 const translationCache = new Map<string, string>();
+// Job-scoped cache of the translation_cache DB table, populated lazily on the
+// first batchTranslate call per (job, lang) and reused for every subsequent
+// batch in the same job. Previously batchTranslate hit Postgres for the FULL
+// per-lang table on every call (4 langs × dozens of batches per tab × multiple
+// passes), reloading thousands of rows it had already seen. This is a
+// module-level singleton because the matchers are single-tenant inside a job
+// (clearAllCaches is called at processJob start) — the global cache is reset
+// between jobs, mirroring the lifetime of `translationCache`.
+const translationDbCacheByLang = new Map<string, Map<string, string>>();
 const HEAD_CONCURRENCY = 10;
 const HEAD_TIMEOUT = 12000;
 const HEAD_BATCH_DELAY = 200;
@@ -171,6 +180,15 @@ export function clearCaches() {
 export function clearAllCaches() {
   urlExistenceCache.clear();
   translationCache.clear();
+  translationDbCacheByLang.clear();
+}
+
+// Test hook: lets a unit test inject a fresh DB-cache map between simulated
+// jobs without going through clearAllCaches (which also blows away unrelated
+// caches). Production code path is exclusively via clearAllCaches at job
+// boundaries, so this is intentionally test-only.
+export function _resetTranslationDbCacheForTest() {
+  translationDbCacheByLang.clear();
 }
 
 function abortAwareSleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -1184,6 +1202,15 @@ export interface CrawlInventory {
   titleIndex: Map<string, string>;
   lastSegWordIndex: Map<string, Set<string>>;
   titleEmbeddings?: Map<string, number[]>;
+  // Inverted token → URL index built lazily from titleIndex. Tokens are the
+  // same `normalizeTitle(parseTitle(pageTitle).pageName)` words (length >= 2)
+  // used by titleSimilarity, so a URL is in the candidate set iff its
+  // page-name shares at least one usable token with the query. This shrinks
+  // the per-row title scan from O(|inventory|) to O(|tokens × hits|), which
+  // is the dominant cost on large tabs (1k unmatched × 10k inventory pages).
+  // Built/memoized via ensureTitleTokenIndex; cleared automatically when the
+  // inventory is rebuilt because the field is owned by the inventory object.
+  titleTokenIndex?: Map<string, Set<string>>;
 }
 
 export function mergeInventories(invs: (CrawlInventory | null | undefined)[]): CrawlInventory | null {
@@ -2450,6 +2477,43 @@ function wordSetSimilarity(a: string, b: string): number {
   return intersection / (aWords.length + bWordsSet.size - intersection);
 }
 
+// Lazily build the inverted token → URL index for a CrawlInventory. Tokens
+// are extracted with the SAME normalizeTitle pipeline used by titleSimilarity,
+// then filtered to length >= 2 (titleSimilarity also drops single-char
+// tokens). The index is stored on the inventory and only rebuilt when a fresh
+// inventory object is constructed (e.g. after a recrawl).
+function ensureTitleTokenIndex(inv: CrawlInventory): Map<string, Set<string>> {
+  if (inv.titleTokenIndex) return inv.titleTokenIndex;
+  const idx = new Map<string, Set<string>>();
+  inv.titleIndex.forEach((pageTitle, url) => {
+    const parts = parseTitle(pageTitle);
+    const tokens = normalizeTitle(parts.pageName || pageTitle).split(" ").filter(w => w.length > 1);
+    for (const tok of tokens) {
+      let bucket = idx.get(tok);
+      if (!bucket) { bucket = new Set(); idx.set(tok, bucket); }
+      bucket.add(url);
+    }
+  });
+  inv.titleTokenIndex = idx;
+  return idx;
+}
+
+// Returns the candidate URL set for a query title, or `null` to signal that
+// the caller should fall back to a full inventory scan (when the query has
+// no usable tokens, or the index is empty).
+function getTitleCandidateUrls(inv: CrawlInventory, query: string): Set<string> | null {
+  const tokens = normalizeTitle(query).split(" ").filter(w => w.length > 1);
+  if (tokens.length === 0) return null;
+  const idx = ensureTitleTokenIndex(inv);
+  if (idx.size === 0) return null;
+  const candidates = new Set<string>();
+  for (const tok of tokens) {
+    const bucket = idx.get(tok);
+    if (bucket) for (const u of bucket) candidates.add(u);
+  }
+  return candidates.size > 0 ? candidates : null;
+}
+
 function titleSimilarity(a: string, b: string): number {
   const aNorm = normalizeTitle(a);
   const bNorm = normalizeTitle(b);
@@ -2831,11 +2895,26 @@ export async function batchTranslate(
   const usesUrlContext = (text: string): boolean =>
     contextByText.has(text) && isShortHebrewText(text);
 
+  // Reuse the job-scoped DB cache if it exists; otherwise load it from
+  // Postgres ONCE and stash it. clearAllCaches() at processJob start drops
+  // this map so each job sees fresh data; within a job every batch / pass /
+  // tab hits the in-memory copy. Failure to load is non-fatal: we install
+  // an empty map so subsequent batches don't keep retrying the failed call.
   let dbCache: Map<string, string> | null = null;
   if (dbStorage) {
-    try {
-      dbCache = await dbStorage.getCachedTranslations(targetLang);
-    } catch {}
+    const existing = translationDbCacheByLang.get(targetLang);
+    if (existing) {
+      dbCache = existing;
+    } else {
+      try {
+        dbCache = await dbStorage.getCachedTranslations(targetLang);
+        translationDbCacheByLang.set(targetLang, dbCache);
+        log(`    [translate] Loaded ${dbCache.size} cached ${targetLang.toUpperCase()} translations from DB (job-scoped, will not reload)`);
+      } catch {
+        dbCache = new Map();
+        translationDbCacheByLang.set(targetLang, dbCache);
+      }
+    }
   }
 
   const needsTranslation: string[] = [];
@@ -2943,7 +3022,27 @@ export function matchByTitle(
   const translatedParentTrail = translatedParts.parents.join(" - ");
   const hasParentTrail = translatedParentTrail.length > 0;
 
-  inventory.titleIndex.forEach((pageTitle, url) => {
+  // Narrow the candidate set via the inverted token index. Token-narrowing is
+  // only safe because the entire scoring function bottoms out at zero when
+  // there is no token overlap on the page name: titleSimilarity returns 0,
+  // and the maximum sectionBonus (~0.15) is well below minSimilarity (0.60).
+  // Pages without overlap could not possibly clear the threshold, so iterating
+  // a token-narrowed superset is byte-identical to a full scan. When the query
+  // has no usable tokens (e.g. all-stopword or single-char), we fall back to
+  // a full scan to preserve behavior.
+  const candidateUrls = getTitleCandidateUrls(inventory, translatedParts.pageName || translatedTitle);
+  const iterate = (cb: (pageTitle: string, url: string) => void) => {
+    if (candidateUrls) {
+      for (const url of candidateUrls) {
+        const pageTitle = inventory.titleIndex.get(url);
+        if (pageTitle) cb(pageTitle, url);
+      }
+    } else {
+      inventory.titleIndex.forEach(cb);
+    }
+  };
+
+  iterate((pageTitle, url) => {
     if (allowedRoots && allowedRoots.length > 0) {
       try {
         const urlPath = new URL(url).pathname.toLowerCase();
@@ -4041,7 +4140,11 @@ export async function aiMatchUnmatched(
   // section is only translated once across all of its batches. Used to look
   // the section up in the breadcrumb buckets. Translation goes through the
   // existing URL-context-aware translator (cache bypass for short text).
-  const sectionTranslationByLang: Map<string, Map<TargetLang, string | null>> = new Map();
+  // We memoize the PROMISE, not the resolved value, so when the parallelized
+  // batch driver invokes prepareBatch concurrently for two batches that share
+  // a section the second caller awaits the first call's network request
+  // instead of issuing a duplicate one (Task #78).
+  const sectionTranslationByLang: Map<string, Map<TargetLang, Promise<string | null>>> = new Map();
   const getBreadcrumbHints = async (
     section: string,
     sampleSourceUrl: string,
@@ -4052,23 +4155,21 @@ export async function aiMatchUnmatched(
     if (breadcrumbBuckets[l].size === 0) return out;
     let perLang = sectionTranslationByLang.get(section);
     if (!perLang) { perLang = new Map(); sectionTranslationByLang.set(section, perLang); }
-    let translated: string | null;
-    if (perLang.has(l)) {
-      translated = perLang.get(l) || null;
-    } else {
-      try {
-        // Translate the source-section slug to the target language. The slug
-        // is often a Latin transliteration (HozrimBituah), so we pass the
-        // full source URL as context so the URL-context translator can use
-        // surrounding path segments to disambiguate.
-        // dbStorage isn't available in this scope; that's fine — the in-memory
-        // translationCache plus a single network call per (section, lang) is
-        // cheap enough and avoids polluting the persistent cache (Regression #10).
-        const tx = await batchTranslate([section], l, undefined, signal, [sampleSourceUrl]);
-        translated = tx.get(section) || null;
-      } catch { translated = null; }
-      perLang.set(l, translated);
+    let translatedPromise = perLang.get(l);
+    if (!translatedPromise) {
+      // Translate the source-section slug to the target language. The slug
+      // is often a Latin transliteration (HozrimBituah), so we pass the
+      // full source URL as context so the URL-context translator can use
+      // surrounding path segments to disambiguate.
+      // dbStorage isn't available in this scope; that's fine — the in-memory
+      // translationCache plus a single network call per (section, lang) is
+      // cheap enough and avoids polluting the persistent cache (Regression #10).
+      translatedPromise = batchTranslate([section], l, undefined, signal, [sampleSourceUrl])
+        .then(tx => tx.get(section) || null)
+        .catch(() => null);
+      perLang.set(l, translatedPromise);
     }
+    const translated = await translatedPromise;
     if (!translated) return out;
     const normTranslated = normalizeTitle(translated);
     if (!normTranslated) return out;
@@ -4093,15 +4194,42 @@ export async function aiMatchUnmatched(
     return out;
   };
 
-  for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
-    if (signal?.aborted) {
-      log(`  AI matching ABORTED by user before batch ${batchIdx + 1}/${batches.length}`);
-      break;
-    }
+  // Task #78: parallelize the per-batch OpenAI calls with a sliding window of
+  // up to MAX_PARALLEL_AI_BATCHES in-flight requests. Network latency on the
+  // chat-completions call dominates wall-clock here, and the per-batch work
+  // (prompt build + commit) is independent enough to overlap. To preserve
+  // determinism we still COMMIT batches in their original order — `usedUrls`,
+  // `aiStats`, `siblingFence`, the `results` map, and the early-exit /
+  // consecutive-zero counters are all updated serially in commitBatch().
+  //
+  // Tradeoff: a worker building batch N+k's prompt sees the snapshot of
+  // `usedUrls` at launch time, which excludes commits from batches still
+  // in flight. The bounded window (4) keeps that window of staleness small,
+  // and the commit-time hard-rejects (`already-used`, `not-in-inventory`,
+  // sibling-scope fence) preserve correctness either way.
+  //
+  // Buffered logs: the prep + call phases write to a per-prep `deferredLogs`
+  // array which is flushed by commitBatch() right before its own logs, so
+  // the on-disk log ordering still matches the batch-index ordering.
+  const MAX_PARALLEL_AI_BATCHES = parseInt(process.env.LINGUAMAP_AI_PARALLEL || "4", 10) || 4;
+
+  type BatchPrep = {
+    batchIdx: number;
+    batch: AiMatchInput[];
+    batchSection: string;
+    batchScope: Record<TargetLang, string | null>;
+    visibleStats: Array<{ lang: TargetLang; total: number; available: number; shown: number; sectionHint: number; urlBucket: number; breadcrumbBucket: number; both: number }>;
+    systemPrompt: string;
+    userPrompt: string;
+    deferredLogs: string[];
+  };
+
+  const prepareBatch = async (batchIdx: number): Promise<BatchPrep> => {
     const batchEntry = batches[batchIdx];
     const batch = batchEntry.rows;
     const batchSection = batchEntry.section;
     const batchScope = batchEntry.scopeKey;
+    const deferredLogs: string[] = [];
     // Hard-fence at the batch level is implicit in the batching decision:
     // batches are sub-bucketed by scopeKey above, so any lang with a
     // non-null batchScope[l] is uniformly scoped for every row in this
@@ -4250,7 +4378,7 @@ export async function aiMatchUnmatched(
     const hintBreakdown = visibleStats.map(v =>
       `${v.lang}:hint=${v.sectionHint}(url=${v.urlBucket} bc=${v.breadcrumbBucket} both=${v.both})`
     ).join(" ");
-    log(`    [diag] batch ${batchIdx + 1}/${batches.length} section=${batchSection} ${hintBreakdown}`);
+    deferredLogs.push(`    [diag] batch ${batchIdx + 1}/${batches.length} section=${batchSection} ${hintBreakdown}`);
 
     // Tiny reminder block: only the generic /Pages/default.aspx-style index
     // pages that have already been taken. The model has a strong bias toward
@@ -4323,11 +4451,14 @@ Return ONLY the JSON array, no other text.`;
         const t = allTranslations[l].get(sampleRow.title);
         return `${l}="${(t || "").slice(0, 60)}"`;
       }).join(" ");
-      log(`    [diag] batch ${batchIdx + 1}/${batches.length} sample: heb="${heb}" ${xlated}`);
+      deferredLogs.push(`    [diag] batch ${batchIdx + 1}/${batches.length} sample: heb="${heb}" ${xlated}`);
     }
 
-    // One-shot prompt dump for manual inspection.
-    if (process.env.AI_PROMPT_DUMP === "1" && !promptDumped) {
+    // One-shot prompt dump for manual inspection. Restricted to batchIdx 0
+    // so that, in the parallelized driver, only one worker performs the
+    // dump even if the env flag stays set across re-runs (the previous
+    // `promptDumped` flag races between concurrent workers).
+    if (process.env.AI_PROMPT_DUMP === "1" && batchIdx === 0 && !promptDumped) {
       try {
         const fs = await import("fs/promises");
         const ts = new Date().toISOString().replace(/[:.]/g, "-");
@@ -4337,14 +4468,19 @@ Return ONLY the JSON array, no other text.`;
           `langs=${activeLangs.join(",")} visible=${visibleStats.map(v => `${v.lang}:${v.shown}/${v.available}(hint=${v.sectionHint} urlBucket=${v.urlBucket} breadcrumbBucket=${v.breadcrumbBucket} both=${v.both})`).join(" ")}\n\n` +
           `--- SYSTEM PROMPT ---\n${systemPrompt}\n\n--- USER PROMPT ---\n${userPrompt}\n`;
         await fs.writeFile(dumpPath, dumpContent, "utf8");
-        log(`    [diag] AI prompt dumped to ${dumpPath} (${dumpContent.length} chars)`);
+        deferredLogs.push(`    [diag] AI prompt dumped to ${dumpPath} (${dumpContent.length} chars)`);
         promptDumped = true;
       } catch (e: any) {
-        log(`    [diag] prompt dump failed: ${e?.message?.substring(0, 120)}`);
+        deferredLogs.push(`    [diag] prompt dump failed: ${e?.message?.substring(0, 120)}`);
         promptDumped = true; // do not retry every batch
       }
     }
 
+    return { batchIdx, batch, batchSection, batchScope, visibleStats, systemPrompt, userPrompt, deferredLogs };
+  };
+
+  const callAi = async (prep: BatchPrep): Promise<{ content: string | null; callError?: any }> => {
+    const { batchIdx, deferredLogs, systemPrompt, userPrompt } = prep;
     try {
       let content: string | null = null;
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -4360,13 +4496,14 @@ Return ONLY the JSON array, no other text.`;
             max_completion_tokens: 8192,
           }, { signal });
           content = response.choices[0]?.message?.content || null;
-          consecutiveAuthFailures = 0;
+          // Note: consecutiveAuthFailures is NOT reset here in the parallel
+          // driver; commitBatch owns the counter so updates stay serialized.
           break;
         } catch (retryErr: any) {
           const status = retryErr?.status || retryErr?.response?.status;
           if (status === 401 || status === 429) {
             const delay = (attempt + 1) * 2000;
-            log(`    AI batch ${batchIdx + 1}/${batches.length}: ${status} error, retrying in ${delay}ms (attempt ${attempt + 1}/3)`);
+            deferredLogs.push(`    AI batch ${batchIdx + 1}/${batches.length}: ${status} error, retrying in ${delay}ms (attempt ${attempt + 1}/3)`);
             await abortAwareSleep(delay, signal);
             if (signal?.aborted) { content = null; break; }
             continue;
@@ -4374,29 +4511,78 @@ Return ONLY the JSON array, no other text.`;
           throw retryErr;
         }
       }
+      return { content };
+    } catch (err: any) {
+      return { content: null, callError: err };
+    }
+  };
 
-      if (!content) {
-        log(`    AI batch ${batchIdx + 1}/${batches.length}: failed after 3 retries (likely auth/rate-limit issue)`);
-        consecutiveAuthFailures++;
-        consecutiveZeroBatches = 0;
-        if (consecutiveAuthFailures >= 3) {
-          log(`  AI matching ABORTED: ${consecutiveAuthFailures} consecutive batches failed with auth errors. Skipping remaining ${batches.length - batchIdx - 1} batches.`);
-          break;
+  const commitBatch = (prep: BatchPrep, content: string | null, callError: any): { earlyExit: boolean } => {
+    const { batchIdx, batch, batchSection } = prep;
+    // Flush the prep + call deferredLogs first so that on-disk ordering is
+    // still by batch index even though calls ran concurrently.
+    for (const line of prep.deferredLogs) log(line);
+
+    if (callError) {
+      const error: any = callError;
+      const status = error?.status || error?.response?.status;
+      const msg = String(error?.message || "");
+      const errCode = error?.code || error?.error?.code || error?.response?.data?.error?.code;
+      const errType = error?.type || error?.error?.type || error?.response?.data?.error?.type;
+      const errMsg = error?.error?.message || error?.response?.data?.error?.message || "";
+      const ctxRegex = /context length|maximum context|too many tokens|context_length|context window/i;
+      const isContextLen = status === 400 && (
+        ctxRegex.test(msg) ||
+        ctxRegex.test(String(errMsg)) ||
+        String(errCode || "") === "context_length_exceeded" ||
+        String(errType || "") === "context_length_exceeded"
+      );
+      if (isContextLen) {
+        log(`  AI batch ${batchIdx + 1}/${batches.length} [${batchSection}] CONTEXT-LENGTH error (${chatModel}): ${msg.substring(0, 200)}`);
+        consecutiveZeroBatches++;
+        const minBatchesBeforeEarlyExit = Math.max(8, Math.floor(batches.length / 3));
+        if (
+          consecutiveZeroBatches >= ZERO_BATCH_EARLY_EXIT &&
+          batchIdx + 1 >= minBatchesBeforeEarlyExit &&
+          batchIdx < batches.length - 1
+        ) {
+          const remaining = batches.length - batchIdx - 1;
+          log(`  AI matching EARLY EXIT: ${consecutiveZeroBatches} consecutive batches yielded 0 matches (incl. context-length errors) after ${batchIdx + 1}/${batches.length}. Skipping remaining ${remaining} batches.`);
+          return { earlyExit: true };
         }
-        continue;
-      }
-
-      let suggestions: AiSuggestion[] = [];
-      try {
-        const parsed = JSON.parse(content);
-        suggestions = Array.isArray(parsed) ? parsed : (parsed.matches || parsed.results || parsed.urls || []);
-      } catch {
-        log(`    AI batch ${batchIdx + 1}/${batches.length}: failed to parse response`);
+      } else {
+        log(`  AI batch ${batchIdx + 1}/${batches.length} [${batchSection}] error: ${msg.substring(0, 200)}`);
         consecutiveZeroBatches = 0;
-        continue;
       }
+      return { earlyExit: false };
+    }
 
-      let batchMatches = 0;
+    const visibleStats = prep.visibleStats;
+
+    if (content) consecutiveAuthFailures = 0;
+
+    if (!content) {
+      log(`    AI batch ${batchIdx + 1}/${batches.length}: failed after 3 retries (likely auth/rate-limit issue)`);
+      consecutiveAuthFailures++;
+      consecutiveZeroBatches = 0;
+      if (consecutiveAuthFailures >= 3) {
+        log(`  AI matching ABORTED: ${consecutiveAuthFailures} consecutive batches failed with auth errors. Skipping remaining ${batches.length - batchIdx - 1} batches.`);
+        return { earlyExit: true };
+      }
+      return { earlyExit: false };
+    }
+
+    let suggestions: AiSuggestion[] = [];
+    try {
+      const parsed = JSON.parse(content);
+      suggestions = Array.isArray(parsed) ? parsed : (parsed.matches || parsed.results || parsed.urls || []);
+    } catch {
+      log(`    AI batch ${batchIdx + 1}/${batches.length}: failed to parse response`);
+      consecutiveZeroBatches = 0;
+      return { earlyExit: false };
+    }
+
+    let batchMatches = 0;
 
       // Count attempts up-front from the batch (not from model suggestions),
       // so rows the model omits entirely are still counted. Track handled
@@ -4563,62 +4749,89 @@ Return ONLY the JSON array, no other text.`;
       const visibleStr = visibleStats.map(v => `${v.lang.toUpperCase()}:${v.shown}/${v.available}(hint=${v.sectionHint} urlBucket=${v.urlBucket} breadcrumbBucket=${v.breadcrumbBucket} both=${v.both})`).join(" ");
       log(`  AI batch ${batchIdx + 1}/${batches.length} [${batchSection}] (${chatModel}): ${batchMatches} matches from ${batch.length} URLs (visible inventory ${visibleStr})`);
 
-      if (batchMatches === 0) {
-        consecutiveZeroBatches++;
-        // Guard: don't early-exit too soon. Require we've already worked
-        // through at least 1/3 of the planned batches (or 8, whichever is
-        // larger), so a slow start on a long run doesn't bail prematurely.
-        const minBatchesBeforeEarlyExit = Math.max(8, Math.floor(batches.length / 3));
-        if (
-          consecutiveZeroBatches >= ZERO_BATCH_EARLY_EXIT &&
-          batchIdx + 1 >= minBatchesBeforeEarlyExit &&
-          batchIdx < batches.length - 1
-        ) {
-          const remaining = batches.length - batchIdx - 1;
-          log(`  AI matching EARLY EXIT: ${consecutiveZeroBatches} consecutive batches yielded 0 matches after ${batchIdx + 1}/${batches.length} batches. Skipping remaining ${remaining} batches.`);
-          break;
-        }
-      } else {
-        consecutiveZeroBatches = 0;
+    if (batchMatches === 0) {
+      consecutiveZeroBatches++;
+      // Guard: don't early-exit too soon. Require we've already worked
+      // through at least 1/3 of the planned batches (or 8, whichever is
+      // larger), so a slow start on a long run doesn't bail prematurely.
+      const minBatchesBeforeEarlyExit = Math.max(8, Math.floor(batches.length / 3));
+      if (
+        consecutiveZeroBatches >= ZERO_BATCH_EARLY_EXIT &&
+        batchIdx + 1 >= minBatchesBeforeEarlyExit &&
+        batchIdx < batches.length - 1
+      ) {
+        const remaining = batches.length - batchIdx - 1;
+        log(`  AI matching EARLY EXIT: ${consecutiveZeroBatches} consecutive batches yielded 0 matches after ${batchIdx + 1}/${batches.length} batches. Skipping remaining ${remaining} batches.`);
+        return { earlyExit: true };
       }
-    } catch (error: any) {
-      const status = error?.status || error?.response?.status;
-      const msg = String(error?.message || "");
-      const errCode = error?.code || error?.error?.code || error?.response?.data?.error?.code;
-      const errType = error?.type || error?.error?.type || error?.response?.data?.error?.type;
-      const errMsg = error?.error?.message || error?.response?.data?.error?.message || "";
-      const ctxRegex = /context length|maximum context|too many tokens|context_length|context window/i;
-      const isContextLen = status === 400 && (
-        ctxRegex.test(msg) ||
-        ctxRegex.test(String(errMsg)) ||
-        String(errCode || "") === "context_length_exceeded" ||
-        String(errType || "") === "context_length_exceeded"
-      );
-      if (isContextLen) {
-        log(`  AI batch ${batchIdx + 1}/${batches.length} [${batchSection}] CONTEXT-LENGTH error (${chatModel}): ${msg.substring(0, 200)}`);
-        // Treat context-length failures as "0-match completed" batches so the
-        // existing early-exit kicks in if they keep happening — otherwise a
-        // mis-sized prompt would silently burn through every batch.
-        consecutiveZeroBatches++;
-        const minBatchesBeforeEarlyExit = Math.max(8, Math.floor(batches.length / 3));
-        if (
-          consecutiveZeroBatches >= ZERO_BATCH_EARLY_EXIT &&
-          batchIdx + 1 >= minBatchesBeforeEarlyExit &&
-          batchIdx < batches.length - 1
-        ) {
-          const remaining = batches.length - batchIdx - 1;
-          log(`  AI matching EARLY EXIT: ${consecutiveZeroBatches} consecutive batches yielded 0 matches (incl. context-length errors) after ${batchIdx + 1}/${batches.length}. Skipping remaining ${remaining} batches.`);
-          break;
-        }
-      } else {
-        log(`  AI batch ${batchIdx + 1}/${batches.length} [${batchSection}] error: ${msg.substring(0, 200)}`);
-        consecutiveZeroBatches = 0;
-      }
+    } else {
+      consecutiveZeroBatches = 0;
+    }
+    return { earlyExit: false };
+  };
+
+  // Sliding-window driver. Launch up to MAX_PARALLEL_AI_BATCHES prepare+call
+  // tasks concurrently, but always commit (and update shared state) in
+  // strict batch-index order. We track in-flight tasks by batchIdx so the
+  // smallest-index pending task can be awaited next without losing work.
+  type InFlight = Promise<{ idx: number; prep: BatchPrep; content: string | null; callError: any }>;
+  const inflight = new Map<number, InFlight>();
+  let nextToLaunch = 0;
+  let earlyExit = false;
+  let abortAnnounced = false;
+
+  while (true) {
+    while (
+      !earlyExit &&
+      !signal?.aborted &&
+      inflight.size < MAX_PARALLEL_AI_BATCHES &&
+      nextToLaunch < batches.length
+    ) {
+      const idx = nextToLaunch++;
+      inflight.set(idx, (async (): Promise<{ idx: number; prep: BatchPrep; content: string | null; callError: any }> => {
+        const prep = await prepareBatch(idx);
+        const { content, callError } = await callAi(prep);
+        return { idx, prep, content, callError };
+      })());
+    }
+    if (inflight.size === 0) break;
+
+    if (signal?.aborted && !abortAnnounced) {
+      log(`  AI matching ABORTED by user; draining ${inflight.size} in-flight batch(es) before stopping.`);
+      abortAnnounced = true;
     }
 
-    if (batchIdx < batches.length - 1) {
-      await abortAwareSleep(500, signal);
+    // Await the smallest-idx in-flight task to preserve commit order. Any
+    // higher-idx tasks that finish first remain in `inflight` and will be
+    // picked up by subsequent iterations.
+    let minIdx = Infinity;
+    for (const k of inflight.keys()) if (k < minIdx) minIdx = k;
+    const result = await inflight.get(minIdx)!;
+    inflight.delete(minIdx);
+
+    if (signal?.aborted) {
+      // Don't commit results from a cancelled job — flush only the deferred
+      // logs so the cancellation telemetry is still visible, then drop the
+      // in-flight commits and stop launching new batches.
+      for (const line of result.prep.deferredLogs) log(line);
+      continue;
     }
+
+    if (earlyExit) {
+      // A previously-committed batch tripped the early-exit threshold (zero
+      // matches or auth failure). The original serial loop `break`'d
+      // immediately, so any batches that happened to be in flight when the
+      // threshold tripped MUST NOT be committed here — committing them
+      // would diverge from the byte-identical-output contract by mutating
+      // usedUrls / aiStats / siblingFence / results past the cutoff. Flush
+      // the deferred logs so debugging telemetry is still visible, but
+      // skip the commit entirely.
+      for (const line of result.prep.deferredLogs) log(line);
+      continue;
+    }
+
+    const { earlyExit: ee } = commitBatch(result.prep, result.content, result.callError);
+    if (ee) earlyExit = true;
   }
 
   log(`  AI matching complete: ${aiMatches} total matches from ${unmatchedRows.length} unmatched URLs`);
