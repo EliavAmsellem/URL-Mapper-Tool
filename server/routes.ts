@@ -43,6 +43,7 @@ import {
   harvestAlternateLinks,
   type AlternateLinkCache,
   mineSegmentsFromInventory,
+  computeSiblingScope,
 } from "./scraper";
 import { log } from "./index";
 
@@ -1859,6 +1860,154 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
     }
   }
 
+  // Per-tab counters for the new sibling-scope + exclusion summary log.
+  // Populated incrementally by detectHeOnlyExclusions() and by the AI
+  // commit loop below; surfaced once per tab inside the multipass loop.
+  const tabExcludedAutoCount: Record<string, Record<TargetLang, number>> = {};
+  const tabSiblingAiAccepted: Record<string, Record<TargetLang, number>> = {};
+  function bumpExcludedAuto(tabName: string, lang: TargetLang, n = 1) {
+    if (!tabExcludedAutoCount[tabName]) tabExcludedAutoCount[tabName] = { en: 0, fr: 0, ru: 0, ar: 0 };
+    tabExcludedAutoCount[tabName][lang] += n;
+  }
+  function bumpSiblingAi(tabName: string, lang: TargetLang) {
+    if (!tabSiblingAiAccepted[tabName]) tabSiblingAiAccepted[tabName] = { en: 0, fr: 0, ru: 0, ar: 0 };
+    tabSiblingAiAccepted[tabName][lang] += 1;
+  }
+
+  // HE-only auto-detect helper. Runs as a SAFETY NET *before* match
+  // commits and again after AI to cover any false positives that slip
+  // through. For each (tab, lang) it groups source URLs by their 3-segment
+  // HE prefix and marks the prefix excluded only when BOTH negative
+  // signals hold:
+  //   (A) no reference row under the prefix has a translation for `lang`
+  //   (B) no constructed candidate from a sample of ≤5 unmatched rows
+  //       under the prefix is present in the inventory
+  // When marked excluded-auto, this helper:
+  //   * sets needs[lang]=false on every row under the prefix so all
+  //     subsequent passes / AI / save block skip it,
+  //   * CLEARS any existing match in matchResults / globalMatchResults
+  //     for that row+lang (the false positive that motivated this fix),
+  //   * records "excluded-auto" in tabData.excludedMethods.
+  // Returns the count of newly-excluded row+lang combinations and the
+  // count of cleared false-positive matches. Idempotent — re-running on
+  // the same tab won't double-count.
+  function detectHeOnlyExclusions(
+    tabData: TabData,
+    inv: { inventories: Record<TargetLang, CrawlInventory | null>; tabPatterns: TabPatterns; usedUrls: Record<TargetLang, Set<string>> },
+    extraResults?: Map<number, BatchMatchResult>,
+  ): { excluded: number; cleared: number; scannedPrefixes: number } {
+    const refUrlByPair: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = {
+      en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl",
+    };
+    const sheetGlobal = globalMatchResults.get(tabData.sheetName);
+    let excluded = 0;
+    let cleared = 0;
+    let scannedPrefixes = 0;
+    for (const l of allLangs) {
+      if (!targetLangs.includes(l)) continue;
+      const inventory = inv.inventories[l];
+      if (!inventory) continue;
+      const invSet = new Set<string>();
+      inventory.urls.forEach(u => invSet.add(u));
+
+      // Group ALL rows by 3-segment HE source prefix — not just unmatched —
+      // so a false positive committed in an earlier pass still gets
+      // re-evaluated and cleared.
+      const groups = new Map<string, RowData[]>();
+      for (const row of tabData.allRows) {
+        const excl = tabData.excludedMethods?.get(row.rowIndex);
+        if (excl?.has(l)) continue;
+        const orig = l === "en" ? row.originalEn
+                   : l === "fr" ? row.originalFr
+                   : l === "ru" ? row.originalRu
+                   : row.originalAr;
+        if (orig) continue;
+        let segs: string[];
+        try { segs = new URL(row.sourceUrl).pathname.split("/").filter(Boolean); }
+        catch { continue; }
+        if (segs.length < 3) continue;
+        const prefix = "/" + segs.slice(0, 3).join("/").toLowerCase() + "/";
+        let arr = groups.get(prefix);
+        if (!arr) { arr = []; groups.set(prefix, arr); }
+        arr.push(row);
+      }
+
+      for (const [prefix, rows] of Array.from(groups.entries())) {
+        scannedPrefixes++;
+
+        // Negative signal A
+        let refHit = false;
+        for (const ref of tabData.tabRefRows) {
+          try {
+            const refPath = new URL(ref.sourceUrl).pathname.toLowerCase();
+            if (!refPath.startsWith(prefix)) continue;
+            if (ref[refUrlByPair[l]]) { refHit = true; break; }
+          } catch {}
+        }
+        if (refHit) continue;
+
+        // Negative signal B (sample up to 5 rows)
+        let invHit = false;
+        const sample = rows.slice(0, 5);
+        for (const r of sample) {
+          const cands = constructAllTargetUrls(r.sourceUrl, l, inv.tabPatterns);
+          for (const c of cands) {
+            if (invSet.has(c)) { invHit = true; break; }
+          }
+          if (invHit) break;
+        }
+        if (invHit) continue;
+
+        // Both signals negative → HE-only prefix for this language.
+        if (!tabData.excludedMethods) tabData.excludedMethods = new Map();
+        for (const r of rows) {
+          let perRow = tabData.excludedMethods.get(r.rowIndex);
+          if (!perRow) { perRow = new Map(); tabData.excludedMethods.set(r.rowIndex, perRow); }
+          if (!perRow.has(l)) {
+            perRow.set(l, "excluded-auto");
+            excluded++;
+            bumpExcludedAuto(tabData.sheetName, l, 1);
+          }
+          // Drop needs[lang] so subsequent passes skip this row entirely.
+          switch (l) {
+            case "en": r.needsEn = false; break;
+            case "fr": r.needsFr = false; break;
+            case "ru": r.needsRu = false; break;
+            case "ar": r.needsAr = false; break;
+          }
+          // Clear any false-positive match already committed for this
+          // row+lang in either the in-flight extraResults map (current
+          // pass's matchResults, before commit) or the globalMatchResults.
+          if (extraResults) {
+            const m = extraResults.get(r.rowIndex);
+            const exUrl = m ? getResultUrl(m, l) : null;
+            if (m && exUrl) {
+              clearResultMatch(m, l);
+              // matchTab populates usedUrls inline as matches are made,
+              // so by the time we see this in matchResults the URL is
+              // already claimed. Release it so other rows in this tab
+              // can still claim it in the same pass.
+              inv.usedUrls[l].delete(exUrl);
+              cleared++;
+            }
+          }
+          if (sheetGlobal) {
+            const gm = sheetGlobal.get(r.rowIndex);
+            if (gm && getResultUrl(gm, l)) {
+              const url = getResultUrl(gm, l)!;
+              clearResultMatch(gm, l);
+              cleared++;
+              // Free the URL so other rows can claim it.
+              inv.usedUrls[l].delete(url);
+            }
+          }
+        }
+        log(`  Auto-exclude (${l.toUpperCase()}) prefix="${prefix}" rows=${rows.length} (no ref translation, no inventory hit)`);
+      }
+    }
+    return { excluded, cleared, scannedPrefixes };
+  }
+
   let globalRefRows = rebuildGlobalRefRows();
   let globalPatterns = learnTabPatterns(globalRefRows, activeLangs, { silent: true, label: "[global]" });
   logGlobalRegistrySnapshot("seed");
@@ -1902,6 +2051,21 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       const incomingFeedback = feedbackAnchorsByTab.get(tabData.sheetName);
       const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed, newFeedbackAnchors, minedSegments } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns, incomingFeedback);
       tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
+
+      // HE-only auto-detect: applied IMMEDIATELY after the per-tab inventory
+      // is built and BEFORE this pass's matchResults are merged into the
+      // global state. Any false-positive matches inside matchResults that
+      // fall under a freshly-detected HE-only prefix are cleared in-place,
+      // and rows under the prefix have their needs[lang] flipped off so all
+      // later passes / the AI stage / the save block skip them.
+      const autoDet = detectHeOnlyExclusions(
+        tabData,
+        { inventories: tabInv, tabPatterns, usedUrls: tabUsed },
+        matchResults,
+      );
+      if (autoDet.excluded > 0 || autoDet.cleared > 0) {
+        log(`  HE-only auto-detect (pre-commit, "${tabData.sheetName}"): excluded ${autoDet.excluded} row+lang, cleared ${autoDet.cleared} false-positive match(es) across ${autoDet.scannedPrefixes} prefix×lang group(s)`);
+      }
 
       // Track new feedback anchors / mined segments so the multi-pass loop
       // continues even when this pass produced 0 new matches but DID surface
@@ -2187,6 +2351,20 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
                 setResultMatch(existing, l, url, getResultConf(aiResult, l) || 0, method);
                 inv.usedUrls[l].add(url);
                 aiAccepted++;
+                // Per-tab sibling-AI accept telemetry: when this row's source
+                // URL is covered by a per-pair sibling scope and the chosen
+                // AI URL is under that scoped target subtree, count it. This
+                // is what closes the loop on the sibling-scope "soft hint"
+                // we plant in aiMatchUnmatched.
+                const scope = computeSiblingScope(srcUrl, l, inv.tabPatterns);
+                if (scope) {
+                  const tgtPrefix = ("/" + scope.mappedTgtDir.join("/") + "/").toLowerCase();
+                  try {
+                    if (new URL(url).pathname.toLowerCase().startsWith(tgtPrefix)) {
+                      bumpSiblingAi(tabData.sheetName, l);
+                    }
+                  } catch {}
+                }
               }
             }
           }
@@ -2195,108 +2373,47 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         matchedCount += aiAccepted;
         log(`  AI results: ${aiAccepted} accepted, ${aiDepthRejected} depth-rejected${aiDepthWarned > 0 ? `, ${aiDepthWarned} depth-warned (RU/AR soft gate)` : ''}`);
         await storage.updateJob(jobId, { matchedUrls: matchedCount });
+
+        // Re-run HE-only auto-detect after AI commits to nuke any AI false
+        // positives that fell under a freshly-detected HE-only prefix
+        // (e.g. AI obeyed a soft section hint into a subtree that the
+        // pattern/title passes had no inventory hits for).
+        const postAiDet = detectHeOnlyExclusions(tabData, inv);
+        if (postAiDet.excluded > 0 || postAiDet.cleared > 0) {
+          log(`  HE-only auto-detect (post-AI, "${tabData.sheetName}"): excluded ${postAiDet.excluded} row+lang, cleared ${postAiDet.cleared} false-positive AI match(es)`);
+          if (postAiDet.cleared > 0) matchedCount = Math.max(0, matchedCount - postAiDet.cleared);
+        }
       }
+    }
+  }
+
+  // Per-tab final summary: sibling-scope AI accepts + exclusion counts.
+  // Title sibling-scope counts are surfaced inside scraper.ts's
+  // titleMatchUnmatched. We aggregate the AI side and the two exclusion
+  // methods here, where we know per-tab boundaries.
+  for (const tabData of allTabData) {
+    const aiCounts = tabSiblingAiAccepted[tabData.sheetName];
+    const autoCounts = tabExcludedAutoCount[tabData.sheetName];
+    let configCount = 0;
+    if (tabData.excludedMethods) {
+      for (const perRow of Array.from(tabData.excludedMethods.values())) {
+        for (const m of Array.from(perRow.values())) if (m === "excluded-config") configCount++;
+      }
+    }
+    const aiSummary = aiCounts
+      ? allLangs.filter(l => aiCounts[l] > 0).map(l => `${l.toUpperCase()}=${aiCounts[l]}`).join(", ")
+      : "";
+    const autoSummary = autoCounts
+      ? allLangs.filter(l => autoCounts[l] > 0).map(l => `${l.toUpperCase()}=${autoCounts[l]}`).join(", ")
+      : "";
+    if (aiSummary || autoSummary || configCount > 0) {
+      log(`Tab "${tabData.sheetName}" sibling/excludes summary: sibling-AI accepted{${aiSummary || "none"}}, excluded-config=${configCount}, excluded-auto{${autoSummary || "none"}}`);
     }
   }
 
   await storage.updateJob(jobId, { currentStep: control.cancel ? "saving-partial" : "saving" });
   if (control.cancel) {
     log(`Job ${jobId} cancelled — saving partial results from passes already completed.`);
-  }
-
-  // HE-only auto-detect: any source-path prefix where every constructed
-  // candidate URL misses the target inventory AND no reference row under
-  // that prefix has a translation for the target language is treated as a
-  // HE-only subtree (e.g. /benefits/HozrimGimlaot/). Mark its rows with
-  // method="excluded-auto" so they aren't reported as missing matches.
-  if (!control.cancel) {
-    let excludedAutoCount = 0;
-    let autoPrefixesScanned = 0;
-    for (const tabData of allTabData) {
-      const inv = tabInventories.get(tabData.sheetName);
-      if (!inv) continue;
-      const sheetGlobal = globalMatchResults.get(tabData.sheetName) || new Map();
-      const refUrlByPair: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = {
-        en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl",
-      };
-
-      for (const l of allLangs) {
-        if (!targetLangs.includes(l)) continue;
-        const inventory = inv.inventories[l];
-        if (!inventory) continue;
-        const invSet = new Set<string>();
-        inventory.urls.forEach(u => invSet.add(u));
-
-        // Group still-unmatched rows for this language by 3-segment HE
-        // source prefix. Only consider rows that the matching pipeline
-        // actually attempted (not already excluded-config).
-        const groups = new Map<string, RowData[]>();
-        for (const row of tabData.allRows) {
-          const excl = tabData.excludedMethods?.get(row.rowIndex);
-          if (excl?.has(l)) continue;
-          const m = sheetGlobal.get(row.rowIndex);
-          if (m && getResultUrl(m, l)) continue;
-          const orig = l === "en" ? row.originalEn
-                     : l === "fr" ? row.originalFr
-                     : l === "ru" ? row.originalRu
-                     : row.originalAr;
-          if (orig) continue;
-          let segs: string[];
-          try { segs = new URL(row.sourceUrl).pathname.split("/").filter(Boolean); }
-          catch { continue; }
-          if (segs.length < 3) continue;
-          const prefix = "/" + segs.slice(0, 3).join("/").toLowerCase() + "/";
-          let arr = groups.get(prefix);
-          if (!arr) { arr = []; groups.set(prefix, arr); }
-          arr.push(row);
-        }
-
-        for (const [prefix, rows] of Array.from(groups.entries())) {
-          autoPrefixesScanned++;
-          // Negative signal A: any reference row whose source falls under
-          // this prefix already has a translation for this language → the
-          // subtree IS translated, do NOT auto-exclude.
-          let refHit = false;
-          for (const ref of tabData.tabRefRows) {
-            try {
-              const refPath = new URL(ref.sourceUrl).pathname.toLowerCase();
-              if (!refPath.startsWith(prefix)) continue;
-              if (ref[refUrlByPair[l]]) { refHit = true; break; }
-            } catch {}
-          }
-          if (refHit) continue;
-
-          // Negative signal B: any constructed target candidate (sample up
-          // to 5 rows under this prefix) is present in the inventory →
-          // the subtree IS translated, do NOT auto-exclude.
-          let invHit = false;
-          const sample = rows.slice(0, 5);
-          for (const r of sample) {
-            const cands = constructAllTargetUrls(r.sourceUrl, l, inv.tabPatterns);
-            for (const c of cands) {
-              if (invSet.has(c)) { invHit = true; break; }
-            }
-            if (invHit) break;
-          }
-          if (invHit) continue;
-
-          // Both signals negative → HE-only prefix for this language.
-          if (!tabData.excludedMethods) tabData.excludedMethods = new Map();
-          for (const r of rows) {
-            let perRow = tabData.excludedMethods.get(r.rowIndex);
-            if (!perRow) { perRow = new Map(); tabData.excludedMethods.set(r.rowIndex, perRow); }
-            if (!perRow.has(l)) {
-              perRow.set(l, "excluded-auto");
-              excludedAutoCount++;
-            }
-          }
-          log(`  Auto-exclude (${l.toUpperCase()}) prefix="${prefix}" rows=${rows.length} (no ref translation, no inventory hit)`);
-        }
-      }
-    }
-    if (autoPrefixesScanned > 0) {
-      log(`Job ${jobId}: HE-only auto-detect scanned ${autoPrefixesScanned} prefix×lang groups, excluded ${excludedAutoCount} row+lang combinations`);
-    }
   }
 
   await storage.deleteResultsByJob(jobId);
