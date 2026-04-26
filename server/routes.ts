@@ -28,8 +28,10 @@ import {
   getResultUrl,
   getResultConf,
   getResultMethod,
+  getResultFlags,
   setResultMatch,
   clearResultMatch,
+  type MatchFlags,
   langRoot,
   langSrcRoot,
   langCrawlScope,
@@ -355,9 +357,15 @@ export async function registerRoutes(
 
       const threshold = parseInt(req.body?.threshold as string) || 85;
 
+      // Single-tenant safeguard: matchers share global in-process caches
+      // (translation cache, alternate-link cache, inventory caches) which are
+      // reset at the start of each processJob via clearAllCaches(). Allowing
+      // two jobs to run concurrently would corrupt those caches mid-run, so
+      // any previously-active job is cancelled before a new one starts. See
+      // replit.md "Job concurrency" for the full rationale.
       for (const [existingJobId, existingControl] of Array.from(activeJobs.entries())) {
         if (existingJobId !== jobId) {
-          log(`Cancelling previous job ${existingJobId} before starting new job ${jobId}`);
+          log(`Cancelling previous job ${existingJobId} before starting new job ${jobId} (matchers share global caches; only one job can run at a time)`);
           existingControl.cancel = true;
           existingControl.abortController.abort();
           await storage.updateJob(existingJobId, { status: "cancelled", currentStep: "done" });
@@ -372,10 +380,22 @@ export async function registerRoutes(
 
       res.json({ message: "Processing started" });
 
-      processJob(jobId, threshold, control).catch((err) => {
-        log(`Job processing error: ${err.message}`);
-        storage.updateJob(jobId, { status: "error", currentStep: err.message });
-      });
+      // try/finally guarantees activeJobs is cleared even if processJob throws
+      // before reaching its own activeJobs.delete() at the end of the success
+      // path. Without this, a thrown error would leave a stale entry that
+      // forces the next job-start to issue a spurious cancel log.
+      (async () => {
+        try {
+          await processJob(jobId, threshold, control);
+        } catch (err: any) {
+          log(`Job processing error: ${err.message}`);
+          await storage.updateJob(jobId, { status: "error", currentStep: err.message }).catch(() => {});
+        } finally {
+          if (activeJobs.get(jobId) === control) {
+            activeJobs.delete(jobId);
+          }
+        }
+      })();
     } catch (error: any) {
       res.status(500).json({ message: error.message });
     }
@@ -2623,6 +2643,10 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         }
       }
 
+      // Per-tab cross-script detection mirrors the title-stage call so AI
+      // matches can be tagged with the same flag in mapping_results.details.
+      const aiCrossScriptLangs = detectCrossScriptLangs(tabData.tabRefRows, allLangs);
+
       const aiOutput = await aiMatchUnmatched(
         unmatchedForAi,
         effectiveInventories,
@@ -2631,6 +2655,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         allTranslations,
         knownUrlSets,
         control.signal,
+        aiCrossScriptLangs,
       );
       const aiMatches = aiOutput.matches;
       // Fold the AI matcher's sibling-scope fence rejections into this tab's
@@ -2941,6 +2966,37 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       const rowHasAnyActive = activeLangsForCount.some(l => !!rowFinalUrls[l]);
       if (rowHasAnyActive) finalMatchedCount++;
 
+      // Per-language diagnostic block stored in mapping_results.details JSONB.
+      // Captures the matcher stage (derived from the method string), plus the
+      // per-(row,lang) scoped/crossScript flags recorded at match time. Used
+      // for post-hoc auditing only — the user-facing Excel export is unchanged.
+      const stageOf = (method: string | null): string | null => {
+        if (!method) return null;
+        if (method === "existing") return "existing";
+        if (method.startsWith("excluded")) return "excluded";
+        if (method === "ai-match") return "ai";
+        if (method.startsWith("title")) return "title";
+        if (method.includes("tail") || method.startsWith("crawl") || method.startsWith("inventory")) return "inventory";
+        if (method === "pattern" || method.includes("pattern")) return "pattern";
+        return method;
+      };
+      const perLangDetails: Record<string, Record<string, unknown>> = {};
+      const langPairs: Array<[TargetLang, string | null, MatchFlags | null]> = [
+        ["en", matchMethodEn, match ? getResultFlags(match, "en") : null],
+        ["fr", matchMethodFr, match ? getResultFlags(match, "fr") : null],
+        ["ru", matchMethodRu, match ? getResultFlags(match, "ru") : null],
+        ["ar", matchMethodAr, match ? getResultFlags(match, "ar") : null],
+      ];
+      for (const [l, method, flags] of langPairs) {
+        const stage = stageOf(method);
+        if (!stage && !flags?.scoped && !flags?.crossScript) continue;
+        const entry: Record<string, unknown> = {};
+        if (stage) entry.stage = stage;
+        if (flags?.scoped) entry.scoped = true;
+        if (flags?.crossScript) entry.crossScript = true;
+        perLangDetails[l] = entry;
+      }
+
       resultBatch.push({
         jobId,
         sheetName: tabData.sheetName,
@@ -2953,9 +3009,13 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         arabicUrl: arUrl,
         confidenceEn,
         confidenceFr,
+        confidenceRu,
+        confidenceAr,
         matchMethodEn,
         matchMethodFr,
-        details: {},
+        matchMethodRu,
+        matchMethodAr,
+        details: perLangDetails,
       });
 
       if (resultBatch.length >= DB_BATCH_SIZE) {

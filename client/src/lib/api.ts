@@ -23,8 +23,12 @@ export interface MappingResultRow {
   arabicUrl: string | null;
   confidenceEn: number | null;
   confidenceFr: number | null;
+  confidenceRu: number | null;
+  confidenceAr: number | null;
   matchMethodEn: string | null;
   matchMethodFr: string | null;
+  matchMethodRu: string | null;
+  matchMethodAr: string | null;
   details: any;
 }
 

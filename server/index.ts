@@ -59,7 +59,29 @@ app.use((req, res, next) => {
   next();
 });
 
+async function reconcileStuckJobs() {
+  // Server restarts (deploys, crashes) leave any in-flight jobs orphaned with
+  // status="processing" or "pending" but no controller in memory. Mark them
+  // cancelled at boot so the UI doesn't show a phantom progress bar and the
+  // next upload can start cleanly.
+  try {
+    const { storage } = await import("./storage");
+    const stuck = await storage.getStuckJobs();
+    if (stuck.length === 0) return;
+    for (const job of stuck) {
+      await storage.updateJob(job.id, {
+        status: "cancelled",
+        currentStep: "interrupted (server restarted)",
+      });
+    }
+    log(`Reconciled ${stuck.length} stuck job(s) on startup: ${stuck.map(j => j.id).join(", ")}`);
+  } catch (err: any) {
+    log(`Stuck-job reconciler skipped: ${err.message}`);
+  }
+}
+
 (async () => {
+  await reconcileStuckJobs();
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {

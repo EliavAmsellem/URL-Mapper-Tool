@@ -1084,6 +1084,11 @@ export async function validatePatterns(
   return result as Record<TargetLang, number>;
 }
 
+export interface MatchFlags {
+  scoped?: boolean;
+  crossScript?: boolean;
+}
+
 export interface BatchMatchResult {
   enUrl: string | null;
   frUrl: string | null;
@@ -1097,6 +1102,10 @@ export interface BatchMatchResult {
   matchMethodFr: string | null;
   matchMethodRu: string | null;
   matchMethodAr: string | null;
+  // Per-language diagnostic flags captured at match time. Persisted into the
+  // mapping_results.details JSONB column for post-hoc auditing. Not part of
+  // the user-facing Excel export.
+  flags: Partial<Record<TargetLang, MatchFlags>>;
 }
 
 export function emptyBatchResult(): BatchMatchResult {
@@ -1104,6 +1113,7 @@ export function emptyBatchResult(): BatchMatchResult {
     enUrl: null, frUrl: null, ruUrl: null, arUrl: null,
     confidenceEn: null, confidenceFr: null, confidenceRu: null, confidenceAr: null,
     matchMethodEn: null, matchMethodFr: null, matchMethodRu: null, matchMethodAr: null,
+    flags: {},
   };
 }
 
@@ -1116,17 +1126,27 @@ export function getResultConf(r: BatchMatchResult, lang: TargetLang): number | n
 export function getResultMethod(r: BatchMatchResult, lang: TargetLang): string | null {
   return { en: r.matchMethodEn, fr: r.matchMethodFr, ru: r.matchMethodRu, ar: r.matchMethodAr }[lang];
 }
-export function setResultMatch(r: BatchMatchResult, lang: TargetLang, url: string, confidence: number, method: string) {
+export function getResultFlags(r: BatchMatchResult, lang: TargetLang): MatchFlags | null {
+  return r.flags?.[lang] ?? null;
+}
+export function setResultMatch(r: BatchMatchResult, lang: TargetLang, url: string, confidence: number, method: string, flags?: MatchFlags) {
   if (lang === "en") { r.enUrl = url; r.confidenceEn = confidence; r.matchMethodEn = method; }
   else if (lang === "fr") { r.frUrl = url; r.confidenceFr = confidence; r.matchMethodFr = method; }
   else if (lang === "ru") { r.ruUrl = url; r.confidenceRu = confidence; r.matchMethodRu = method; }
   else if (lang === "ar") { r.arUrl = url; r.confidenceAr = confidence; r.matchMethodAr = method; }
+  if (!r.flags) r.flags = {};
+  if (flags && (flags.scoped || flags.crossScript)) {
+    r.flags[lang] = { ...(flags.scoped ? { scoped: true } : {}), ...(flags.crossScript ? { crossScript: true } : {}) };
+  } else {
+    delete r.flags[lang];
+  }
 }
 export function clearResultMatch(r: BatchMatchResult, lang: TargetLang) {
   if (lang === "en") { r.enUrl = null; r.confidenceEn = null; r.matchMethodEn = null; }
   else if (lang === "fr") { r.frUrl = null; r.confidenceFr = null; r.matchMethodFr = null; }
   else if (lang === "ru") { r.ruUrl = null; r.confidenceRu = null; r.matchMethodRu = null; }
   else if (lang === "ar") { r.arUrl = null; r.confidenceAr = null; r.matchMethodAr = null; }
+  if (r.flags) delete r.flags[lang];
 }
 
 export function batchConstructUrls(
@@ -3486,7 +3506,10 @@ export async function titleMatchUnmatched(
           log(`    Title match REJECTED (already known ${lang.toUpperCase()} ref): ${match.url}`);
           rejected.knownUrl++;
         } else {
-          setResultMatch(result, lang, match.url, match.confidence, match.method);
+          setResultMatch(result, lang, match.url, match.confidence, match.method, {
+            scoped: rowScoped.get(candidate.rowIndex)?.[lang] === true,
+            crossScript: isCrossScript[lang] === true,
+          });
           usedUrls[lang].add(match.url);
           hasResult = true;
           if ((match.method || "").includes("semantic")) {
@@ -3623,6 +3646,7 @@ export async function aiMatchUnmatched(
   allTranslations: Record<TargetLang, Map<string, string>>,
   knownUrls: Record<TargetLang, Set<string>>,
   signal?: AbortSignal,
+  crossScriptLangs?: Record<TargetLang, boolean>,
 ): Promise<AiMatchOutput> {
   const results = new Map<number, BatchMatchResult>();
   const siblingFence: Record<TargetLang, SiblingFenceStats> = {
@@ -4503,7 +4527,10 @@ Return ONLY the JSON array, no other text.`;
                 // Unscoped RU/AR: keep the legacy soft-warn path unchanged.
                 log(`    AI WARN (${l.toUpperCase()} section/category mismatch, accepting): ${suggestedUrl} ⟵ ${row.sourceUrl}`);
               }
-              setResultMatch(result, l, suggestedUrl, 82, "ai-match");
+              setResultMatch(result, l, suggestedUrl, 82, "ai-match", {
+                scoped: scopeActive === true,
+                crossScript: crossScriptLangs?.[l] === true,
+              });
               usedUrls[l].add(suggestedUrl);
               aiStats[l].accepted++;
               hasMatch = true;

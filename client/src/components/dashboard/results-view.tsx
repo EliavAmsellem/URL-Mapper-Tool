@@ -7,8 +7,8 @@ import { cn } from "@/lib/utils";
 const LANG_CONFIG = {
   en: { label: "English URL", urlKey: "englishUrl" as const, confKey: "confidenceEn" as const, methodKey: "matchMethodEn" as const },
   fr: { label: "French URL", urlKey: "frenchUrl" as const, confKey: "confidenceFr" as const, methodKey: "matchMethodFr" as const },
-  ru: { label: "Russian URL", urlKey: "russianUrl" as const, confKey: null, methodKey: null },
-  ar: { label: "Arabic URL", urlKey: "arabicUrl" as const, confKey: null, methodKey: null },
+  ru: { label: "Russian URL", urlKey: "russianUrl" as const, confKey: "confidenceRu" as const, methodKey: "matchMethodRu" as const },
+  ar: { label: "Arabic URL", urlKey: "arabicUrl" as const, confKey: "confidenceAr" as const, methodKey: "matchMethodAr" as const },
 } as const;
 
 type LangCode = keyof typeof LANG_CONFIG;
@@ -16,8 +16,7 @@ type LangCode = keyof typeof LANG_CONFIG;
 function hasMatch(row: MappingResultRow, langs: LangCode[]): boolean {
   return langs.some(l => {
     const cfg = LANG_CONFIG[l];
-    if (cfg.confKey) return row[cfg.confKey] !== null;
-    return !!row[cfg.urlKey];
+    return row[cfg.confKey] !== null;
   });
 }
 

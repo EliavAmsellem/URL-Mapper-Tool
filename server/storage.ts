@@ -4,11 +4,12 @@ import {
   mappingJobs, mappingResults, translationCache,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, and } from "drizzle-orm";
+import { eq, and, inArray } from "drizzle-orm";
 
 export interface IStorage {
   createJob(job: InsertMappingJob): Promise<MappingJob>;
   getJob(id: string): Promise<MappingJob | undefined>;
+  getStuckJobs(): Promise<MappingJob[]>;
   updateJob(id: string, updates: Partial<InsertMappingJob>): Promise<MappingJob | undefined>;
   createResult(result: InsertMappingResult): Promise<MappingResult>;
   createResults(results: InsertMappingResult[]): Promise<void>;
@@ -28,6 +29,11 @@ export class DatabaseStorage implements IStorage {
   async getJob(id: string): Promise<MappingJob | undefined> {
     const [job] = await db.select().from(mappingJobs).where(eq(mappingJobs.id, id));
     return job;
+  }
+
+  async getStuckJobs(): Promise<MappingJob[]> {
+    return db.select().from(mappingJobs)
+      .where(inArray(mappingJobs.status, ["processing", "pending"]));
   }
 
   async updateJob(id: string, updates: Partial<InsertMappingJob>): Promise<MappingJob | undefined> {
