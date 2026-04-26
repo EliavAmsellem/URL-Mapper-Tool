@@ -1690,6 +1690,13 @@ async function matchTab(
           usedUrls[l].add(tUrl);
           titleAcceptedTotal++;
           titleMethodCounts[taggedMethod] = (titleMethodCounts[taggedMethod] || 0) + 1;
+        } else if (tUrl) {
+          // Title produced a candidate but the post-candidate commit gates
+          // (slot-already-filled by an earlier stage, or URL-already-used by
+          // another row's earlier commit) blocked it. These are non-fence
+          // commit failures and must mark the row so the strict
+          // "fence-only" telemetry doesn't misattribute them.
+          titleNonFenceFailureMarks[l].add(rowIndex);
         }
       }
     }
