@@ -619,6 +619,7 @@ async function matchTab(
   usedUrls: Record<TargetLang, Set<string>>;
   newFeedbackAnchors: Record<TargetLang, string[]>;
   minedSegments: Record<TargetLang, Map<string, string>>;
+  coverageStats: Record<TargetLang, { totalInventory: number; mappedSubtrees: number; sparseBefore: number; sparseAfter: number; backfilledUrls: number }>;
 }> {
   const { sheetName, allRows, tabRefRows } = tabData;
   const allLangsLocal: TargetLang[] = ["en", "fr", "ru", "ar"];
@@ -674,6 +675,12 @@ async function matchTab(
       matchResults, inventories, tabPatterns, usedUrls,
       newFeedbackAnchors: { en: [], fr: [], ru: [], ar: [] },
       minedSegments: { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() },
+      coverageStats: {
+        en: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
+        fr: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
+        ru: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
+        ar: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
+      },
     };
   }
 
@@ -1043,6 +1050,142 @@ async function matchTab(
     const total = inventories[l]?.urls.size ?? 0;
     const titles = inventories[l]?.titleIndex.size ?? 0;
     log(`  ${langLabels[l]} inventory total: ${total} URLs (${titles} titled) across ${perLangInvs[l].length} anchor crawl(s)`);
+  }
+
+  // ---- MAPPED-SUBTREE COVERAGE AUDIT + BACKFILL ----
+  // For every learned per-pair (sourceRoot → targetRoot) mapping, count how
+  // many inventory URLs sit under the mapped target subtree. Any subtree with
+  // fewer than COVERAGE_MIN_THRESHOLD URLs is sparse — typically the result
+  // of the link extractor having no inbound links to its leaf pages other
+  // than via the SharePoint folder-listing UI. For each sparse subtree we
+  // run a bounded targeted re-crawl pass scoped to the subtree itself,
+  // seeding `Pages/`, `Pages/default.aspx`, and `Pages/Forms/AllItems.aspx`
+  // (the listing page now exposes its child links since the scraper change).
+  const COVERAGE_MIN_THRESHOLD = 3;
+  const BACKFILL_CAP_PER_SUBTREE = 200;
+  const MAX_BACKFILL_SUBTREES_PER_LANG = 50;
+  const coverageStats: Record<TargetLang, { totalInventory: number; mappedSubtrees: number; sparseBefore: number; sparseAfter: number; backfilledUrls: number }> = {
+    en: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
+    fr: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
+    ru: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
+    ar: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
+  };
+
+  function countUrlsUnder(inv: CrawlInventory, prefix: string): number {
+    const lower = prefix.toLowerCase();
+    let n = 0;
+    for (const u of Array.from(inv.urls)) {
+      try {
+        const p = new URL(u).pathname.toLowerCase();
+        if (p === lower || p.startsWith(lower)) n++;
+      } catch {}
+    }
+    return n;
+  }
+
+  function findSourceRowForMapping(targetRoot: string[], lang: TargetLang): string | null {
+    const tgtKey = "/" + targetRoot.map(s => s.toLowerCase()).join("/") + "/";
+    for (const ref of tabRefRows) {
+      const url = ref[refUrlKey[lang]];
+      if (!url) continue;
+      try {
+        const p = new URL(url).pathname.toLowerCase();
+        if (p === tgtKey || p.startsWith(tgtKey)) return ref.sourceUrl;
+      } catch {}
+    }
+    return null;
+  }
+
+  if (origin) {
+    for (const l of langs) {
+      if (control.cancel) break;
+      const inv = inventories[l];
+      if (!inv) continue;
+      const pairMappings = tabPatterns.rootMappings.get(l) || [];
+      if (pairMappings.length === 0) continue;
+
+      const seenTgt = new Set<string>();
+      const subtrees: { targetRoot: string[]; pathPrefix: string }[] = [];
+      for (const m of pairMappings) {
+        if (m.targetRoot.length === 0) continue;
+        const key = m.targetRoot.map(s => s.toLowerCase()).join("/");
+        if (seenTgt.has(key)) continue;
+        seenTgt.add(key);
+        subtrees.push({ targetRoot: m.targetRoot, pathPrefix: "/" + m.targetRoot.join("/") + "/" });
+      }
+      coverageStats[l].mappedSubtrees = subtrees.length;
+      if (subtrees.length === 0) continue;
+
+      const sparseSubtrees: { targetRoot: string[]; pathPrefix: string; before: number }[] = [];
+      for (const st of subtrees) {
+        const before = countUrlsUnder(inv, st.pathPrefix);
+        if (before < COVERAGE_MIN_THRESHOLD) {
+          sparseSubtrees.push({ ...st, before });
+          const sourceRow = findSourceRowForMapping(st.targetRoot, l);
+          log(`  ${langLabels[l]} coverage WARN: mapped subtree ${st.pathPrefix} has only ${before} inventory URL(s)${sourceRow ? ` (e.g. source row ${sourceRow})` : ""}`);
+        }
+      }
+      coverageStats[l].sparseBefore = sparseSubtrees.length;
+      if (sparseSubtrees.length === 0) continue;
+
+      const cappedSparse = sparseSubtrees.slice(0, MAX_BACKFILL_SUBTREES_PER_LANG);
+      if (cappedSparse.length < sparseSubtrees.length) {
+        log(`  ${langLabels[l]} coverage backfill: ${sparseSubtrees.length} sparse subtree(s) found, backfilling first ${cappedSparse.length} (per-lang cap)`);
+      } else {
+        log(`  ${langLabels[l]} coverage backfill: re-crawling ${cappedSparse.length} sparse subtree(s) (cap ${BACKFILL_CAP_PER_SUBTREE} pages each)`);
+      }
+
+      const backfillInvs: CrawlInventory[] = [];
+      let addedTotal = 0;
+      for (const st of cappedSparse) {
+        if (control.cancel) break;
+        const subtreeOriginPath = origin + st.pathPrefix;
+        const seeds = [
+          subtreeOriginPath + "Pages/",
+          subtreeOriginPath + "Pages/default.aspx",
+          subtreeOriginPath + "Pages/Forms/AllItems.aspx",
+        ];
+        try {
+          const subInv = await crawlDirectory(
+            origin,
+            st.targetRoot,
+            undefined,
+            seeds,
+            control.signal,
+            BACKFILL_CAP_PER_SUBTREE,
+          );
+          if (subInv.urls.size > 0) {
+            backfillInvs.push(subInv);
+            addedTotal += subInv.urls.size;
+          }
+        } catch (e) {
+          log(`    ${langLabels[l]} backfill failed for ${st.pathPrefix}: ${(e as Error).message}`);
+        }
+      }
+
+      if (backfillInvs.length > 0) {
+        const before = inv.urls.size;
+        const merged = mergeInventories([inv, ...backfillInvs]);
+        if (merged) inventories[l] = merged;
+        const after = inventories[l]?.urls.size ?? before;
+        coverageStats[l].backfilledUrls = after - before;
+        log(`  ${langLabels[l]} coverage backfill complete: discovered ${addedTotal} URL(s) across ${backfillInvs.length} subtree(s); inventory ${before} → ${after} (+${after - before} unique)`);
+      }
+
+      const newInv = inventories[l]!;
+      let stillSparse = 0;
+      for (const st of subtrees) {
+        if (countUrlsUnder(newInv, st.pathPrefix) < COVERAGE_MIN_THRESHOLD) stillSparse++;
+      }
+      coverageStats[l].sparseAfter = stillSparse;
+      if (stillSparse > 0) {
+        log(`  ${langLabels[l]} coverage post-backfill: ${stillSparse} mapped subtree(s) STILL below threshold (${COVERAGE_MIN_THRESHOLD} URLs)`);
+      }
+    }
+  }
+
+  for (const l of langs) {
+    coverageStats[l].totalInventory = inventories[l]?.urls.size ?? 0;
   }
 
   // ---- COVERAGE DIAGNOSTIC ----
@@ -1595,7 +1738,7 @@ async function matchTab(
     log(`  Deduplication removed ${summary} duplicate target assignments`);
   }
 
-  return { matchResults, inventories, tabPatterns, usedUrls, newFeedbackAnchors, minedSegments };
+  return { matchResults, inventories, tabPatterns, usedUrls, newFeedbackAnchors, minedSegments, coverageStats };
 }
 
 async function processJob(jobId: string, _threshold: number, control: JobControl) {
@@ -1744,6 +1887,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
 
   const globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
   const tabInventories = new Map<string, { inventories: Record<TargetLang, CrawlInventory | null>; tabPatterns: TabPatterns; usedUrls: Record<TargetLang, Set<string>> }>();
+  const tabCoverageStats = new Map<string, Record<TargetLang, { totalInventory: number; mappedSubtrees: number; sparseBefore: number; sparseAfter: number; backfilledUrls: number }>>();
 
   function getRowExisting(row: RowData, lang: TargetLang): string {
     switch (lang) { case "en": return row.existingEn; case "fr": return row.existingFr; case "ru": return row.existingRu; case "ar": return row.existingAr; }
@@ -2067,8 +2211,9 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
       const incomingFeedback = feedbackAnchorsByTab.get(tabData.sheetName);
-      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed, newFeedbackAnchors, minedSegments } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns, incomingFeedback);
+      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed, newFeedbackAnchors, minedSegments, coverageStats } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns, incomingFeedback);
       tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
+      tabCoverageStats.set(tabData.sheetName, coverageStats);
 
       // HE-only auto-detect: applied IMMEDIATELY after the per-tab inventory
       // is built and BEFORE this pass's matchResults are merged into the
@@ -2426,6 +2571,28 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       : "";
     if (aiSummary || autoSummary || configCount > 0) {
       log(`Tab "${tabData.sheetName}" sibling/excludes summary: sibling-AI accepted{${aiSummary || "none"}}, excluded-config=${configCount}, excluded-auto{${autoSummary || "none"}}`);
+    }
+
+    // Coverage telemetry: per-language inventory size and number of mapped
+    // subtrees still below the threshold AFTER the backfill pass. A non-zero
+    // sparse-after count means the matcher is missing target-language pages
+    // that the workbook's reference rows say should exist.
+    const cov = tabCoverageStats.get(tabData.sheetName);
+    if (cov) {
+      const invLine = allLangs
+        .filter(l => cov[l].mappedSubtrees > 0 || cov[l].totalInventory > 0)
+        .map(l => `${l.toUpperCase()}=${cov[l].totalInventory}`)
+        .join(", ");
+      const sparseLine = allLangs
+        .filter(l => cov[l].sparseAfter > 0 || cov[l].backfilledUrls > 0)
+        .map(l => `${l.toUpperCase()}: ${cov[l].sparseAfter}/${cov[l].mappedSubtrees} sparse (backfill +${cov[l].backfilledUrls})`)
+        .join("; ");
+      if (invLine) {
+        log(`Tab "${tabData.sheetName}" inventory totals: ${invLine}`);
+      }
+      if (sparseLine) {
+        log(`Tab "${tabData.sheetName}" mapped-subtree coverage: ${sparseLine}`);
+      }
     }
   }
 

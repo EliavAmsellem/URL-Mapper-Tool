@@ -1401,22 +1401,29 @@ export async function crawlDirectory(
       }
 
       if (html) {
-        // Skip SharePoint folder-listing UI pages. They all share the generic
-        // site-wide title ("דף הבית, הביטוח הלאומי") regardless of language,
-        // which pollutes the inventory shown to the AI matcher: ~14% of the
-        // RU prompt was these indistinguishable junk entries. They are admin
-        // UI, not user-facing content, and have no Hebrew→target equivalent.
+        // SharePoint folder-listing UI pages (`Forms/AllItems.aspx`) all share
+        // the generic site-wide title regardless of language and have no
+        // user-facing content, so they must NOT enter the inventory. However,
+        // their HTML is the SharePoint folder index — it is the only inbound
+        // link source for many leaf `/Pages/*.aspx` siblings. We therefore
+        // still parse the HTML and enqueue any in-scope child links found,
+        // we just skip `addToInventory` and title indexing for the listing
+        // URL itself.
         const lowerUrlPath = (() => {
           try { return new URL(url).pathname.toLowerCase(); }
           catch { return url.toLowerCase(); }
         })();
         const isSharePointListing = /\/forms\/allitems\.aspx$/i.test(lowerUrlPath);
+
         if (isSharePointListing) {
           removeFromInventory(inventory, url);
         } else {
           addToInventory(inventory, url);
+        }
 
-          const $ = cheerio.load(html);
+        const $ = cheerio.load(html);
+
+        if (!isSharePointListing) {
           const pageTitle = $("title").first().text().trim();
           const lowerTitle = (pageTitle || "").toLowerCase();
           const titleIsError = lowerTitle.includes("page not found") ||
@@ -1443,17 +1450,22 @@ export async function crawlDirectory(
               inventory.titleIndex.set(url, effectiveTitle);
             }
           }
+        }
 
-          const links = extractLinks(html, url, scopePrefix);
-          for (const link of links) {
-            // Don't enqueue the SharePoint folder-listing UI URLs; they pollute
-            // the inventory with identically-titled pages (see filter above).
-            if (/\/forms\/allitems\.aspx$/i.test(link)) continue;
-            if (!visited.has(link)) {
-              queue.push(link);
-            }
+        // Extract in-scope child links for BOTH content pages AND folder-listing
+        // pages. We still skip enqueuing further folder-listing URLs we find as
+        // links — only seeded folder-listing URLs (and ones added via the
+        // mapped-subtree backfill) should ever be fetched, otherwise we'd loop
+        // through the SharePoint admin UI.
+        const links = extractLinks(html, url, scopePrefix);
+        for (const link of links) {
+          if (/\/forms\/allitems\.aspx$/i.test(link)) continue;
+          if (!visited.has(link)) {
+            queue.push(link);
           }
+        }
 
+        if (!isSharePointListing) {
           try {
             const parsed = new URL(url);
             const lowerPath = parsed.pathname.toLowerCase();
@@ -1463,8 +1475,10 @@ export async function crawlDirectory(
               if (!visited.has(pagesDirUrl)) {
                 queue.push(pagesDirUrl);
               }
-              // Intentionally NOT enqueuing Forms/AllItems.aspx anymore — those
-              // are SharePoint admin listing pages with no real content.
+              // Intentionally NOT enqueuing Forms/AllItems.aspx as a discovered
+              // link — those URLs are seeded explicitly when a mapped subtree
+              // is sparse (see backfill pass in routes.ts). Discovered listing
+              // URLs would loop through admin UI.
             }
           } catch {}
         }
