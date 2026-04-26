@@ -77,5 +77,18 @@ Example:
 
 When a `(tab, lang)` cell is filled, that path becomes the **sole** crawl anchor for that tab + language; auto-inferred anchors falling outside it are dropped (no cross-tab leakage), and the "no learned root → skip whole tab" early-return is bypassed. Empty cells fall back to today's auto-derivation. Tab names that don't match any data sheet are warned about and ignored. If the `Seeds` sheet is absent, the workbook works exactly as before.
 
+### Performance tuning
+
+- `LINGUAMAP_AI_PARALLEL` (default `1`): number of OpenAI batch calls
+  to overlap during the AI matching phase. The default of `1` runs the
+  AI stage as a strict serial pipeline, which guarantees byte-identical
+  match output across runs (the canonical mode for reproducibility runs
+  and regression comparisons). Setting it to `3`–`5` overlaps the
+  network latency of the OpenAI calls and is recommended for routine
+  production runs where the wall-clock win matters more than
+  bit-for-bit determinism. Commit-time hard rejects keep the output
+  *correct* in either mode, but the model's visible inventory differs
+  when batches are in flight, so picks can diverge.
+
 ### Target Languages
 The system supports four target languages: English (EN), French (FR), Russian (RU), and Arabic (AR). Source language is always Hebrew. Excel columns: 0=Title, 1=Source, 2=EN, 3=FR, 4=RU, 5=AR. The `TargetLang` type alias (`"en" | "fr" | "ru" | "ar"`) and helper functions (`langRoot`, `langSrcRoot`, `langCrawlScope`, `getResultUrl`, `getResultConf`, `getResultMethod`, `setResultMatch`, `clearResultMatch`, `emptyBatchResult`) centralize language-specific access to pattern data and match results, avoiding duplicated EN/FR ternaries.
