@@ -2694,11 +2694,30 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         const m = sheetGlobal.get(row.rowIndex);
         const needs: Record<TargetLang, boolean> = { en: false, fr: false, ru: false, ar: false };
         let hasAnyNeed = false;
+        // Track langs the user originally wanted (per the workbook header)
+        // separately from `needs` (which excludes langs already filled by
+        // earlier stages). The two sets diverge for "no-needs" rows where
+        // every wanted lang has already been satisfied — we still want a
+        // trace entry for those wanted langs so the AI gate is visible.
+        const wantsByLang: Record<TargetLang, boolean> = { en: false, fr: false, ru: false, ar: false };
         for (const l of allLangs) {
+          wantsByLang[l] = !!row[needsKey[l]];
           needs[l] = !!(row[needsKey[l]] && (!m || !getResultUrl(m, l)));
           if (needs[l]) hasAnyNeed = true;
         }
-        if (!hasAnyNeed) continue;
+        if (!hasAnyNeed) {
+          // Task #89 — record `ai-no-needs` only when no prior stage has
+          // already written a trace for this (row, lang). That preserves
+          // the more authoritative `matched` / `known-url` / etc. outcomes
+          // from earlier stages while still filling genuine gaps.
+          const existingForRow = tabTraceForAi.get(row.rowIndex);
+          for (const l of allLangs) {
+            if (wantsByLang[l] && !(existingForRow && existingForRow[l])) {
+              setTrace(tabTraceForAi, row.rowIndex, l, { stage: "ai", outcome: "ai-no-needs" });
+            }
+          }
+          continue;
+        }
         if (!row.title) {
           for (const l of allLangs) {
             if (needs[l]) {

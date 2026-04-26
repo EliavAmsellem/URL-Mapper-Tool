@@ -725,9 +725,10 @@ export type TraceOutcome =
   | "ai-null"
   | "ai-section-mismatch"
   // Task #89 — instrumentation for the five "AI silently skipped this row" leak sites.
-  | "ai-no-title"          // routes.ts: row dropped from unmatchedForAi because row.title is empty
-  | "ai-no-inventory"      // scraper.ts: lang dropped from activeLangs because inventoryUrls[l] is empty
-  | "ai-omitted-by-model"  // scraper.ts: model's response did not include this (sourceUrl, lang) pair
+  | "ai-no-title"            // routes.ts: row dropped from unmatchedForAi because row.title is empty
+  | "ai-no-needs"            // routes.ts: row dropped from unmatchedForAi because no lang needed AI work
+  | "ai-no-inventory"        // scraper.ts: lang dropped from activeLangs because inventoryUrls[l] is empty
+  | "ai-omitted-by-model"    // scraper.ts: model's response did not include this (sourceUrl, lang) pair
   | "ai-early-exit-skipped"; // scraper.ts: consecutive-zero-batches early-exit dropped this row's batch
 
 export interface RowLangTrace {
@@ -5133,13 +5134,19 @@ Return ONLY the JSON array, no other text.`;
       // suggestions counts as a null reject (silent omission). Task #89 —
       // also record a per-row trace so model-omitted rows are visible in
       // `details.<lang>.trace`; previously this site only updated counters,
-      // leaving the trace stuck at the title stage's last verdict.
+      // leaving the trace stuck at the title stage's last verdict. Trace
+      // is gated on `activeLangs` so the earlier `ai-no-inventory` marker
+      // for dropped langs stays terminal — those langs were never asked of
+      // the model, so labeling them `ai-omitted-by-model` would be wrong
+      // and would erase the more accurate `ai-no-inventory` attribution.
       for (const r of batch) {
         for (const l of langs) {
           if (r.needs[l] && !handled[l].has(r.sourceUrl)) {
             aiStats[l].rejNull++;
             siblingFence[l].nonFenceFailureRowIndices.add(r.rowIndex);
-            setTrace(traceOut, r.rowIndex, l, { stage: "ai", outcome: "ai-omitted-by-model" });
+            if (activeLangs.includes(l)) {
+              setTrace(traceOut, r.rowIndex, l, { stage: "ai", outcome: "ai-omitted-by-model" });
+            }
           }
         }
       }
@@ -5230,9 +5237,11 @@ Return ONLY the JSON array, no other text.`;
       // so the early-exit cutoff is visible in `details.<lang>.trace`. Without
       // this, the rows below the cutoff inherit whatever the title stage's
       // last verdict was and the AI funnel looks like it just "didn't try".
+      // Gated on `activeLangs` so the earlier `ai-no-inventory` marker stays
+      // terminal — those langs were never going to be asked anyway.
       for (const r of result.prep.batch) {
         for (const l of langs) {
-          if (r.needs[l]) {
+          if (r.needs[l] && activeLangs.includes(l)) {
             setTrace(traceOut, r.rowIndex, l, { stage: "ai", outcome: "ai-early-exit-skipped" });
           }
         }
@@ -5248,12 +5257,13 @@ Return ONLY the JSON array, no other text.`;
   // were never launched at all (no `prep` was created). Walk the unlaunched
   // slice of `batches` directly and record the same trace outcome so the
   // per-(row, lang) funnel includes the entire skipped tail, not just the
-  // batches that happened to be mid-flight.
+  // batches that happened to be mid-flight. Same `activeLangs` gate as
+  // above — preserve the earlier `ai-no-inventory` marker for dropped langs.
   if (earlyExit && nextToLaunch < batches.length) {
     for (let idx = nextToLaunch; idx < batches.length; idx++) {
       for (const r of batches[idx].rows) {
         for (const l of langs) {
-          if (r.needs[l]) {
+          if (r.needs[l] && activeLangs.includes(l)) {
             setTrace(traceOut, r.rowIndex, l, { stage: "ai", outcome: "ai-early-exit-skipped" });
           }
         }
