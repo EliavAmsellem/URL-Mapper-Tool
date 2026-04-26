@@ -1951,6 +1951,26 @@ export function computeSiblingScope(
 }
 
 /**
+ * Hard sibling-scope fence predicate: does the candidate URL's path live
+ * under the mapped target directory? Uses normalized path segments (same
+ * normalization used elsewhere in the matcher) so case/whitespace/diacritic
+ * variation in inventory slugs does not produce false rejections. An empty
+ * `tgtDir` returns true (no fence). Returns false on URL parse error so a
+ * malformed candidate cannot escape the fence.
+ */
+export function isUrlUnderTgtDir(url: string, tgtDir: string[]): boolean {
+  if (!tgtDir || tgtDir.length === 0) return true;
+  try {
+    const parts = new URL(url).pathname.split("/").filter(Boolean);
+    if (parts.length < tgtDir.length) return false;
+    for (let i = 0; i < tgtDir.length; i++) {
+      if (normalizeSegment(parts[i]) !== normalizeSegment(tgtDir[i])) return false;
+    }
+    return true;
+  } catch { return false; }
+}
+
+/**
  * Detect tabs/languages where source URL slugs and target inventory slugs are in
  * different writing systems / vocabularies (e.g. EN source `/benefits/Disability`
  * vs RU inventory `/Benefits_ru/Nehut_ru/` — Hebrew transliterations). For these
@@ -3036,6 +3056,15 @@ export function matchByTitle(
   return finalMatch;
 }
 
+export interface SiblingFenceStats {
+  rejected: number;
+}
+
+export interface TitleMatchOutput {
+  matches: Map<number, BatchMatchResult>;
+  siblingFence: Record<TargetLang, SiblingFenceStats>;
+}
+
 export async function titleMatchUnmatched(
   unmatchedRows: { rowIndex: number; title: string; sourceUrl: string; needs: Record<TargetLang, boolean> }[],
   inventories: Record<TargetLang, CrawlInventory | null>,
@@ -3046,16 +3075,19 @@ export async function titleMatchUnmatched(
   signal?: AbortSignal,
   crossScriptLangs?: Record<TargetLang, boolean>,
   tabPatterns?: TabPatterns,
-): Promise<Map<number, BatchMatchResult>> {
+): Promise<TitleMatchOutput> {
   const results = new Map<number, BatchMatchResult>();
+  const siblingFence: Record<TargetLang, SiblingFenceStats> = {
+    en: { rejected: 0 }, fr: { rejected: 0 }, ru: { rejected: 0 }, ar: { rejected: 0 },
+  };
   const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
   const langNames: Record<TargetLang, string> = { en: "English", fr: "French", ru: "Russian", ar: "Arabic" };
   const isCrossScript: Record<TargetLang, boolean> = crossScriptLangs ?? { en: false, fr: false, ru: false, ar: false };
 
-  if (unmatchedRows.length === 0) return results;
+  if (unmatchedRows.length === 0) return { matches: results, siblingFence };
 
   const titles = unmatchedRows.map((r) => r.title).filter(Boolean);
-  if (titles.length === 0) return results;
+  if (titles.length === 0) return { matches: results, siblingFence };
 
   const translations: Record<TargetLang, Map<string, string>> = { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() };
 
@@ -3246,6 +3278,28 @@ export async function titleMatchUnmatched(
             }
           }
         }
+
+        // ---- HARD SIBLING-SCOPE FENCE (commit-time) ----
+        // When this row has a confirmed per-pair (sourceRoot → targetRoot)
+        // mapping, the chosen candidate URL MUST live under the mapped target
+        // subtree. This is a hard architectural fence: out-of-scope candidates
+        // are dropped even when they have higher title similarity or higher
+        // semantic cosine. Disambig/segment-rail branches inside matchByTitle
+        // bypass `allowedRoots`, and when scopedPool == 0 the matcher falls
+        // back to baseRoots — both paths could escape scope without this gate.
+        // Blank > wrong: leaving the row unmatched here is correct behavior.
+        if (rowMatches[lang] && siblingScope) {
+          if (!isUrlUnderTgtDir(rowMatches[lang]!.url, siblingScope.mappedTgtDir)) {
+            const tgtPrefix = "/" + siblingScope.mappedTgtDir.join("/") + "/";
+            log(`    Title FENCE REJECTED ${lang.toUpperCase()} (out-of-scope): "${rowMatches[lang]!.url}" not under ${tgtPrefix} (row ${row.rowIndex} src=${row.sourceUrl})`);
+            rowMatches[lang] = null;
+            siblingFence[lang].rejected++;
+            // Recompute hasMatch — the fence may have eliminated the only
+            // surviving lang for this row, in which case it should not be
+            // pushed onto the candidates list at all.
+            hasMatch = langs.some(l => rowMatches[l] !== null);
+          }
+        }
       }
     }
 
@@ -3402,7 +3456,14 @@ export async function titleMatchUnmatched(
     const semRejectedDownstream = semanticAttempted - semRejectedThreshold - semanticAccepted;
     log(`  Semantic title-match: ${semanticAccepted} accepted out of ${semanticAttempted} attempted [${perLang || "none"}] rejected: threshold/ambiguity=${semRejectedThreshold}, downstream(crossVal/known/dedup)=${Math.max(0, semRejectedDownstream)} (~${semanticTokens} tokens, ~$${cost.toFixed(4)})`);
   }
-  return results;
+  const fenceSummary = langs
+    .filter(l => siblingFence[l].rejected > 0)
+    .map(l => `${l.toUpperCase()}=${siblingFence[l].rejected}`)
+    .join(", ");
+  if (fenceSummary) {
+    log(`  Sibling-scope title fence: ${fenceSummary} candidate(s) rejected (out-of-scope)`);
+  }
+  return { matches: results, siblingFence };
 }
 
 const AI_BATCH_SIZE = 15;
@@ -3424,6 +3485,11 @@ interface AiSuggestion {
   reasoning: string;
 }
 
+export interface AiMatchOutput {
+  matches: Map<number, BatchMatchResult>;
+  siblingFence: Record<TargetLang, SiblingFenceStats>;
+}
+
 export async function aiMatchUnmatched(
   unmatchedRows: AiMatchInput[],
   inventories: Record<TargetLang, CrawlInventory | null>,
@@ -3432,13 +3498,16 @@ export async function aiMatchUnmatched(
   allTranslations: Record<TargetLang, Map<string, string>>,
   knownUrls: Record<TargetLang, Set<string>>,
   signal?: AbortSignal,
-): Promise<Map<number, BatchMatchResult>> {
+): Promise<AiMatchOutput> {
   const results = new Map<number, BatchMatchResult>();
+  const siblingFence: Record<TargetLang, SiblingFenceStats> = {
+    en: { rejected: 0 }, fr: { rejected: 0 }, ru: { rejected: 0 }, ar: { rejected: 0 },
+  };
   const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
   const langLabels: Record<TargetLang, string> = { en: "English", fr: "French", ru: "Russian", ar: "Arabic" };
   const suggestionKeys: Record<TargetLang, keyof AiSuggestion> = { en: "englishUrl", fr: "frenchUrl", ru: "russianUrl", ar: "arabicUrl" };
 
-  if (unmatchedRows.length === 0) return results;
+  if (unmatchedRows.length === 0) return { matches: results, siblingFence };
 
   const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
@@ -3712,14 +3781,62 @@ export async function aiMatchUnmatched(
     rowsBySection.set(seg, arr);
   }
 
-  type SectionBatch = { section: string; rows: AiMatchInput[] };
+  // Scope key per (lang, row): "/<mappedTgtDir>/" lowercase, or null if the
+  // row has no confirmed sibling scope for that lang. A batch with a UNIFORM
+  // non-null scope key for a lang means every row in the batch has the same
+  // mappedTgtDir for that lang, so the AI can be safely fenced at prompt
+  // time AND at commit time. Mixed-scope rows still go through the matcher
+  // but only get the per-row commit fence — they don't get a restricted
+  // inventory because there is no single subtree to restrict to.
+  const rowScopeKey = (row: AiMatchInput, l: TargetLang): string | null => {
+    const scope = computeSiblingScope(row.sourceUrl, l, tabPatterns);
+    if (!scope) return null;
+    return ("/" + scope.mappedTgtDir.join("/") + "/").toLowerCase();
+  };
+  const batchScopeKey = (rows: AiMatchInput[]): Record<TargetLang, string | null> => {
+    const out: Record<TargetLang, string | null> = { en: null, fr: null, ru: null, ar: null };
+    for (const l of langs) {
+      let unified: string | null | undefined = undefined;
+      for (const r of rows) {
+        if (!r.needs[l]) continue;
+        const k = rowScopeKey(r, l);
+        if (unified === undefined) unified = k;
+        else if (unified !== k) { unified = "__mixed__"; break; }
+      }
+      out[l] = (unified === undefined || unified === "__mixed__") ? null : unified;
+    }
+    return out;
+  };
+
+  type SectionBatch = { section: string; rows: AiMatchInput[]; scopeKey: Record<TargetLang, string | null> };
   const batches: SectionBatch[] = [];
   // Iterate sections in deterministic order (largest first, then alpha) so logs are stable
   const sectionOrder = Array.from(rowsBySection.entries())
     .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
   for (const [section, rows] of sectionOrder) {
-    for (let i = 0; i < rows.length; i += AI_BATCH_SIZE) {
-      batches.push({ section, rows: rows.slice(i, i + AI_BATCH_SIZE) });
+    // Sub-bucket rows in this section by their combined per-language scope
+    // signature so each batch is internally uniform and the inventory the
+    // model sees can be restricted to in-scope URLs only. Rows missing a
+    // scope for a given lang use the literal string "_" so unscoped rows
+    // group together and don't dilute scoped ones.
+    const sigBuckets = new Map<string, AiMatchInput[]>();
+    for (const r of rows) {
+      const sig = langs.map(l => {
+        if (!r.needs[l]) return "-";
+        const k = rowScopeKey(r, l);
+        return k === null ? "_" : k;
+      }).join("|");
+      const arr = sigBuckets.get(sig) || [];
+      arr.push(r);
+      sigBuckets.set(sig, arr);
+    }
+    const sigOrder = Array.from(sigBuckets.entries())
+      .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+    for (const [, sigRows] of sigOrder) {
+      for (let i = 0; i < sigRows.length; i += AI_BATCH_SIZE) {
+        const slice = sigRows.slice(i, i + AI_BATCH_SIZE);
+        batches.push({ section, rows: slice, scopeKey: batchScopeKey(slice) });
+      }
     }
   }
 
@@ -3750,11 +3867,11 @@ export async function aiMatchUnmatched(
 
   // Per-language AI telemetry: counts attempts, accepts, and each rejection reason
   // so prompt tuning is measurable across runs.
-  const aiStats: Record<TargetLang, { attempted: number; accepted: number; rejNull: number; rejNotInInv: number; rejAlreadyUsed: number; rejOutsideRoot: number; rejSection: number }> = {
-    en: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0 },
-    fr: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0 },
-    ru: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0 },
-    ar: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0 },
+  const aiStats: Record<TargetLang, { attempted: number; accepted: number; rejNull: number; rejNotInInv: number; rejAlreadyUsed: number; rejOutsideRoot: number; rejSection: number; rejSiblingScope: number }> = {
+    en: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0 },
+    fr: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0 },
+    ru: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0 },
+    ar: { attempted: 0, accepted: 0, rejNull: 0, rejNotInInv: 0, rejAlreadyUsed: 0, rejOutsideRoot: 0, rejSection: 0, rejSiblingScope: 0 },
   };
 
   const langNeedLabel: Record<TargetLang, string> = { en: "English URL", fr: "French URL", ru: "Russian URL", ar: "Arabic URL" };
@@ -3823,6 +3940,13 @@ export async function aiMatchUnmatched(
     const batchEntry = batches[batchIdx];
     const batch = batchEntry.rows;
     const batchSection = batchEntry.section;
+    const batchScope = batchEntry.scopeKey;
+    // Hard-fence enabled for a lang in this batch ONLY when every needing
+    // row shares the same non-null mappedTgtDir. In that case the visible
+    // inventory is restricted to URLs under that subtree, the prompt drops
+    // the cross-section allowance for that lang, and the commit-time fence
+    // rejects any out-of-scope picks.
+    const hardFenceLangs = new Set<TargetLang>(langs.filter(l => batchScope[l] !== null));
 
     const urlsBlock = batch.map(row => {
       const parts = [`- Source URL: ${row.sourceUrl}`];
@@ -3892,10 +4016,32 @@ export async function aiMatchUnmatched(
       let bothCount = 0;
       urlBucketSet.forEach(idx => { if (breadcrumbBucketSet.has(idx)) bothCount++; });
 
+      // When a uniform sibling scope is in effect for this lang, restrict the
+      // candidate pool to URLs whose path is under the scoped target subtree.
+      // The model is told this list is the ONLY valid choice for this lang,
+      // matching the commit-time fence below — there is no point showing
+      // candidates the matcher will reject. Use isUrlUnderTgtDir so visible-
+      // inventory filtering and commit-time enforcement use the same
+      // segment-normalized comparison (no recall regression from cosmetic
+      // URL variants like trailing slashes or case differences).
+      const fenceKey = batchScope[l];
+      const fenceTgtDir = fenceKey !== null && batch[0]
+        ? computeSiblingScope(batch[0].sourceUrl, l, tabPatterns)?.mappedTgtDir ?? null
+        : null;
+      const inFenceIdx = new Set<number>();
+      if (fenceTgtDir !== null) {
+        for (let i = 0; i < inventoryUrls[l].length; i++) {
+          if (isUrlUnderTgtDir(inventoryUrls[l][i], fenceTgtDir)) {
+            inFenceIdx.add(i);
+          }
+        }
+      }
+
       const hintAvailable: string[] = [];
       const restAvailable: string[] = [];
       for (let i = 0; i < inventoryUrls[l].length; i++) {
         if (usedUrls[l].has(inventoryUrls[l][i])) continue;
+        if (fenceKey !== null && !inFenceIdx.has(i)) continue;
         if (sectionHintSet.has(i)) hintAvailable.push(inventoryEntries[l][i]);
         else restAvailable.push(inventoryEntries[l][i]);
       }
@@ -3907,13 +4053,19 @@ export async function aiMatchUnmatched(
       const truncatedNote = available.length > shown.length
         ? `\n... (${available.length - shown.length} more available; not shown to keep prompt size sane)`
         : "";
-      const hintNote = hintAvailable.length > 0
+      // When the sibling-scope hard fence is active for this lang, label the
+      // block STRICTLY RESTRICTED so the model treats it as a closed-world
+      // pool — there is no "preferred but not required" allowance here.
+      const fenceLabel = fenceKey !== null
+        ? ` — STRICTLY RESTRICTED to the per-pair sibling-scope subtree (${fenceKey}). Pick from this list only or return null; out-of-list picks will be rejected.`
+        : "";
+      const hintNote = fenceKey === null && hintAvailable.length > 0
         ? ` (the first ${hintAvailable.length} entries are same-section candidates — preferred but not required)`
         : "";
       const list = shown.length > 0
         ? shown.join("\n") + truncatedNote
-        : `(no ${langLabels[l]} URLs left in inventory — all candidates already matched)`;
-      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs (${availableCount} unused of ${totalCount} total)${hintNote}. Each line is a JSON object {"i":<index>,"url":"<url>","title":"<page H1>","parents":[<breadcrumb labels>]} where "parents" is omitted when empty. When you choose, return the value of the "url" field verbatim:\n${list}`);
+        : `(no ${langLabels[l]} URLs left in inventory${fenceKey !== null ? " under the scoped subtree" : ""} — all candidates already matched)`;
+      inventoryBlocks.push(`AVAILABLE ${langLabels[l].toUpperCase()} URLs (${availableCount} unused of ${totalCount} total)${fenceLabel}${hintNote}. Each line is a JSON object {"i":<index>,"url":"<url>","title":"<page H1>","parents":[<breadcrumb labels>]} where "parents" is omitted when empty. When you choose, return the value of the "url" field verbatim:\n${list}`);
       visibleStats.push({
         lang: l,
         total: totalCount,
@@ -3965,7 +4117,7 @@ CRITICAL RULES:
 3. Each target URL should only be used ONCE across all matches in this batch. Do not assign the same target URL to multiple source URLs.
 4. The AVAILABLE lists already exclude URLs that have been matched in earlier batches — every URL in those lists is fresh and unused. Do not propose a URL that is not in the AVAILABLE list.
 5. PRIMARY signal: compare the source page title (translated) against the "title" field of each candidate inventory entry. A match should make sense as a same-topic page in the other language. The "title" field is the page H1 (bare page name); the optional "parents" array is the breadcrumb context (parent and grandparent section labels) — match on "title", and use "parents" only as section context to disambiguate generic page names. URL slug similarity is only a secondary hint.
-6. Strongly prefer candidates whose URL path starts with the target language section root shown in WEBSITE STRUCTURE, and prefer the same-section hint candidates listed first in each AVAILABLE block. Cross-section matches are allowed only when the title match is unambiguous and no in-section candidate fits.
+6. Strongly prefer candidates whose URL path starts with the target language section root shown in WEBSITE STRUCTURE, and prefer the same-section hint candidates listed first in each AVAILABLE block. Cross-section matches are allowed only when the title match is unambiguous and no in-section candidate fits — EXCEPT for any AVAILABLE block labelled "STRICTLY RESTRICTED": for those languages you MUST pick from the listed inventory or return null. Do not propose a URL outside that subtree under any circumstance, even if a same-titled page exists elsewhere; the matcher will reject it and you will lose the match.
 7. If the source title is a generic page like "contact us", "home", or "about", only match it to a clearly equivalent target page (same generic concept). When in doubt, return null — EXCEPT when the translated source title clearly maps to exactly one inventory candidate's title (high word/concept overlap, no other comparably good candidate). In that unambiguous case, prefer committing to that match over returning null.
 8. NEVER fall back to a section's index page (URLs ending in "/Pages/default.aspx", "/default.aspx", or "/Pages/") just because nothing more specific looks plausible. Index pages should only be returned when the SOURCE itself is clearly the section's index page (matching title like "default" / "home" / the section name). Otherwise return null. The ALREADY-TAKEN INDEX PAGES block lists index pages that have already been used — never propose those.
 9. When a candidate's title is a clear semantic equivalent of the translated source title — even if the URL slug is opaque transliteration or otherwise unrelated-looking — return that candidate. The crawl inventory is closed-world (it lists every available target URL), so if a confident title match exists you should commit to it rather than returning null.${transliterationNote}
@@ -4153,6 +4305,25 @@ Return ONLY the JSON array, no other text.`;
             } else if (!validateSectionContext(suggestedUrl, row.sourceUrl, l, tabPatterns) && !softGates) {
               log(`    AI REJECTED (section/category mismatch with source): ${l.toUpperCase()} ${suggestedUrl} ⟵ ${row.sourceUrl}`);
               aiStats[l].rejSection++;
+            } else if (
+              // Per-row sibling-scope hard fence (Task #70). When this row's
+              // source URL is covered by a confirmed (sourceRoot →
+              // targetRoot) per-pair mapping for this language, the suggested
+              // URL MUST live under that mapped target subtree. A blank cell
+              // is preferred over a wrong-section commit. This runs for
+              // EVERY language (no soft-gate downgrade) because the fence is
+              // an architectural constraint, not a heuristic. Independent of
+              // the batch-level hardFenceLangs gate above so mixed-scope
+              // batches still get the per-row check.
+              (() => {
+                const scope = computeSiblingScope(row.sourceUrl, l, tabPatterns);
+                if (!scope) return false;
+                return !isUrlUnderTgtDir(suggestedUrl as string, scope.mappedTgtDir);
+              })()
+            ) {
+              log(`    AI REJECTED (sibling-scope fence): ${l.toUpperCase()} ${suggestedUrl} ⟵ ${row.sourceUrl}`);
+              aiStats[l].rejSiblingScope++;
+              siblingFence[l].rejected++;
             } else {
               if (outsideRoot && softGates) {
                 log(`    AI WARN (outside ${l.toUpperCase()} root ${rootBase}, accepting): ${suggestedUrl}`);
@@ -4254,9 +4425,16 @@ Return ONLY the JSON array, no other text.`;
   for (const l of activeLangs) {
     const s = aiStats[l];
     if (s.attempted === 0) continue;
-    const accountedFor = s.accepted + s.rejNull + s.rejNotInInv + s.rejAlreadyUsed + s.rejOutsideRoot + s.rejSection;
+    const accountedFor = s.accepted + s.rejNull + s.rejNotInInv + s.rejAlreadyUsed + s.rejOutsideRoot + s.rejSection + s.rejSiblingScope;
     const invariantNote = accountedFor === s.attempted ? "" : ` [WARN: counter drift, accounted=${accountedFor} != attempted]`;
-    log(`    AI ${l.toUpperCase()} stats: attempted=${s.attempted} accepted=${s.accepted} | rejected: null=${s.rejNull}, not-in-inv=${s.rejNotInInv}, already-used=${s.rejAlreadyUsed}, outside-root=${s.rejOutsideRoot}, section-mismatch=${s.rejSection}${invariantNote}`);
+    log(`    AI ${l.toUpperCase()} stats: attempted=${s.attempted} accepted=${s.accepted} | rejected: null=${s.rejNull}, not-in-inv=${s.rejNotInInv}, already-used=${s.rejAlreadyUsed}, outside-root=${s.rejOutsideRoot}, section-mismatch=${s.rejSection}, sibling-scope=${s.rejSiblingScope}${invariantNote}`);
   }
-  return results;
+  const aiFenceSummary = langs
+    .filter(l => siblingFence[l].rejected > 0)
+    .map(l => `${l.toUpperCase()}=${siblingFence[l].rejected}`)
+    .join(", ");
+  if (aiFenceSummary) {
+    log(`  Sibling-scope AI fence: ${aiFenceSummary} candidate(s) rejected (out-of-scope)`);
+  }
+  return { matches: results, siblingFence };
 }

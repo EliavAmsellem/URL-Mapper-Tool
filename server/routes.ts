@@ -44,6 +44,7 @@ import {
   type AlternateLinkCache,
   mineSegmentsFromInventory,
   computeSiblingScope,
+  isUrlUnderTgtDir,
 } from "./scraper";
 import { log } from "./index";
 
@@ -620,12 +621,19 @@ async function matchTab(
   newFeedbackAnchors: Record<TargetLang, string[]>;
   minedSegments: Record<TargetLang, Map<string, string>>;
   coverageStats: Record<TargetLang, { totalInventory: number; mappedSubtrees: number; sparseBefore: number; sparseAfter: number; backfilledUrls: number }>;
+  fenceStats: Record<TargetLang, { titleRejected: number; aiRejected: number }>;
 }> {
   const { sheetName, allRows, tabRefRows } = tabData;
   const allLangsLocal: TargetLang[] = ["en", "fr", "ru", "ar"];
   const langs: TargetLang[] = allLangsLocal.filter(l => targetLangs.includes(l));
   const langLabels: Record<TargetLang, string> = { en: "EN", fr: "FR", ru: "RU", ar: "AR" };
   const refUrlKey: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = { en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl" };
+
+  // Sibling-scope title-fence rejection counter (Task #70). Declared at the
+  // top of matchTab so the pattern+crawl and HEAD commit paths (which run
+  // before the title-match stage) can both increment it; aggregated into the
+  // returned fenceStats. The AI-stage fence is tracked outside matchTab.
+  const titleFenceRejected: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
 
   const tabPatterns = learnTabPatterns(tabRefRows, langs);
   const preMergeSegCounts: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
@@ -680,6 +688,12 @@ async function matchTab(
         fr: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
         ru: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
         ar: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
+      },
+      fenceStats: {
+        en: { titleRejected: 0, aiRejected: 0 },
+        fr: { titleRejected: 0, aiRejected: 0 },
+        ru: { titleRejected: 0, aiRejected: 0 },
+        ar: { titleRejected: 0, aiRejected: 0 },
       },
     };
   }
@@ -1367,7 +1381,22 @@ async function matchTab(
     for (const l of langs) {
       if (row[needsKey[l]] && tabPatterns.patternValidated[l] && inventories[l]) {
         const match = matchAgainstInventory(row.sourceUrl, l, tabPatterns, inventories[l]!);
-        if (match && !usedUrls[l].has(match.url)) {
+        // Sibling-scope hard fence (Task #70). When this row's source URL is
+        // covered by a confirmed (sourceRoot → targetRoot) per-pair mapping,
+        // the matched URL MUST live under the mapped target subtree even when
+        // pattern+crawl produced it. A blank cell is preferred over a
+        // wrong-section commit. Fall through to the candidate construction
+        // path so HEAD/AI can still try other in-scope URLs.
+        let scopeBlocked = false;
+        if (match) {
+          const scope = computeSiblingScope(row.sourceUrl, l, tabPatterns);
+          if (scope && !isUrlUnderTgtDir(match.url, scope.mappedTgtDir)) {
+            scopeBlocked = true;
+            titleFenceRejected[l]++;
+            log(`    Pattern+crawl REJECTED (sibling-scope fence): ${l.toUpperCase()} ${match.url} ⟵ ${row.sourceUrl}`);
+          }
+        }
+        if (match && !scopeBlocked && !usedUrls[l].has(match.url)) {
           setResultMatch(result, l, match.url, match.confidence, match.method);
           usedUrls[l].add(match.url);
           methodCounts[match.method] = (methodCounts[match.method] || 0) + 1;
@@ -1386,10 +1415,17 @@ async function matchTab(
             }
             debugSamples[l]++;
           }
+          // Sibling-scope hard fence (Task #70). Pre-filter constructed
+          // candidates so HEAD only verifies in-scope URLs. This both
+          // prevents double-counting rejections (the pattern stage already
+          // counted any out-of-scope dedup-blocked URL via scopeBlocked) and
+          // saves needless HEAD requests against URLs that would be rejected
+          // at commit time anyway.
+          const headScope = computeSiblingScope(row.sourceUrl, l, tabPatterns);
           for (const candidate of allCandidates) {
-            if (!usedUrls[l].has(candidate)) {
-              unmatchedForHead.push({ index: row.rowIndex, lang: l, constructedUrl: candidate, sourceUrl: row.sourceUrl });
-            }
+            if (usedUrls[l].has(candidate)) continue;
+            if (headScope && !isUrlUnderTgtDir(candidate, headScope.mappedTgtDir)) continue;
+            unmatchedForHead.push({ index: row.rowIndex, lang: l, constructedUrl: candidate, sourceUrl: row.sourceUrl });
           }
         }
       }
@@ -1575,11 +1611,15 @@ async function matchTab(
       }
     }
 
-    const titleMatches = await titleMatchUnmatched(
+    const titleOutput = await titleMatchUnmatched(
       unmatchedForTitle, inventories, storage,
       allowedRoots, refDepths, knownUrlSets, control.signal, crossScriptLangs,
       tabPatterns,
     );
+    const titleMatches = titleOutput.matches;
+    for (const l of langs) {
+      titleFenceRejected[l] += titleOutput.siblingFence[l].rejected;
+    }
 
     for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
       let result = matchResults.get(rowIndex);
@@ -1671,6 +1711,17 @@ async function matchTab(
 
         if (usedUrls[item.lang].has(verifiedUrl)) continue;
 
+        // Sibling-scope hard fence (Task #70). HEAD-verified candidates were
+        // constructed by the pattern path and may live outside the per-pair
+        // mappedTgtDir; reject those before commit so a wrong-section URL is
+        // never written to the workbook even if the page exists.
+        const scope = computeSiblingScope(item.sourceUrl, item.lang, tabPatterns);
+        if (scope && !isUrlUnderTgtDir(verifiedUrl, scope.mappedTgtDir)) {
+          titleFenceRejected[item.lang]++;
+          log(`    HEAD REJECTED (sibling-scope fence): ${item.lang.toUpperCase()} ${verifiedUrl} ⟵ ${item.sourceUrl}`);
+          continue;
+        }
+
         const result = matchResults.get(item.index);
         if (result && !getResultUrl(result, item.lang)) {
           const method = wasRedirected ? "head-verified+redirect" : "head-verified";
@@ -1738,7 +1789,16 @@ async function matchTab(
     log(`  Deduplication removed ${summary} duplicate target assignments`);
   }
 
-  return { matchResults, inventories, tabPatterns, usedUrls, newFeedbackAnchors, minedSegments, coverageStats };
+  // matchTab only fills in the title-stage fence here. aiRejected is left at
+  // 0 and the AI-stage caller (processJob) accumulates into tabFenceStats
+  // directly after each aiMatchUnmatched call.
+  const fenceStats: Record<TargetLang, { titleRejected: number; aiRejected: number }> = {
+    en: { titleRejected: titleFenceRejected.en, aiRejected: 0 },
+    fr: { titleRejected: titleFenceRejected.fr, aiRejected: 0 },
+    ru: { titleRejected: titleFenceRejected.ru, aiRejected: 0 },
+    ar: { titleRejected: titleFenceRejected.ar, aiRejected: 0 },
+  };
+  return { matchResults, inventories, tabPatterns, usedUrls, newFeedbackAnchors, minedSegments, coverageStats, fenceStats };
 }
 
 async function processJob(jobId: string, _threshold: number, control: JobControl) {
@@ -1888,6 +1948,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
   const globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
   const tabInventories = new Map<string, { inventories: Record<TargetLang, CrawlInventory | null>; tabPatterns: TabPatterns; usedUrls: Record<TargetLang, Set<string>> }>();
   const tabCoverageStats = new Map<string, Record<TargetLang, { totalInventory: number; mappedSubtrees: number; sparseBefore: number; sparseAfter: number; backfilledUrls: number }>>();
+  const tabFenceStats = new Map<string, Record<TargetLang, { titleRejected: number; aiRejected: number }>>();
 
   function getRowExisting(row: RowData, lang: TargetLang): string {
     switch (lang) { case "en": return row.existingEn; case "fr": return row.existingFr; case "ru": return row.existingRu; case "ar": return row.existingAr; }
@@ -2211,9 +2272,21 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
       const incomingFeedback = feedbackAnchorsByTab.get(tabData.sheetName);
-      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed, newFeedbackAnchors, minedSegments, coverageStats } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns, incomingFeedback);
+      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed, newFeedbackAnchors, minedSegments, coverageStats, fenceStats } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns, incomingFeedback);
       tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
       tabCoverageStats.set(tabData.sheetName, coverageStats);
+      // Sibling-scope fence accumulator across passes within this tab. Each
+      // pass calls matchTab once; sum so the per-tab summary log reflects the
+      // total commit-time rejections caused by the fence over the whole job.
+      const prevFence = tabFenceStats.get(tabData.sheetName);
+      if (prevFence) {
+        for (const l of allLangs) {
+          prevFence[l].titleRejected += fenceStats[l].titleRejected;
+          prevFence[l].aiRejected += fenceStats[l].aiRejected;
+        }
+      } else {
+        tabFenceStats.set(tabData.sheetName, fenceStats);
+      }
 
       // HE-only auto-detect: applied IMMEDIATELY after the per-tab inventory
       // is built and BEFORE this pass's matchResults are merged into the
@@ -2452,7 +2525,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         }
       }
 
-      const aiMatches = await aiMatchUnmatched(
+      const aiOutput = await aiMatchUnmatched(
         unmatchedForAi,
         effectiveInventories,
         inv.tabPatterns,
@@ -2461,6 +2534,23 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         knownUrlSets,
         control.signal,
       );
+      const aiMatches = aiOutput.matches;
+      // Fold the AI matcher's sibling-scope fence rejections into this tab's
+      // running totals so the per-tab summary log captures them alongside the
+      // title-stage fence numbers from matchTab.
+      const aiFenceForTab = tabFenceStats.get(tabData.sheetName);
+      if (aiFenceForTab) {
+        for (const l of allLangs) {
+          aiFenceForTab[l].aiRejected += aiOutput.siblingFence[l].rejected;
+        }
+      } else {
+        tabFenceStats.set(tabData.sheetName, {
+          en: { titleRejected: 0, aiRejected: aiOutput.siblingFence.en.rejected },
+          fr: { titleRejected: 0, aiRejected: aiOutput.siblingFence.fr.rejected },
+          ru: { titleRejected: 0, aiRejected: aiOutput.siblingFence.ru.rejected },
+          ar: { titleRejected: 0, aiRejected: aiOutput.siblingFence.ar.rejected },
+        });
+      }
 
       if (aiMatches.size > 0) {
         // AI picks come from the crawled inventory, which is already proof of
@@ -2592,6 +2682,26 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       }
       if (sparseLine) {
         log(`Tab "${tabData.sheetName}" mapped-subtree coverage: ${sparseLine}`);
+      }
+    }
+
+    // Sibling-scope fence telemetry (Task #70). Reports candidates that the
+    // matcher rejected at commit time because they fell outside the per-pair
+    // mappedTgtDir for a row whose source row had a confirmed sibling scope.
+    // A blank result is preferred over a wrong-section URL, so non-zero
+    // numbers here are expected and healthy — they show the fence working.
+    const fence = tabFenceStats.get(tabData.sheetName);
+    if (fence) {
+      const titleLine = activeLangs
+        .filter(l => fence[l].titleRejected > 0)
+        .map(l => `${l.toUpperCase()}=${fence[l].titleRejected}`)
+        .join(", ");
+      const aiLine = activeLangs
+        .filter(l => fence[l].aiRejected > 0)
+        .map(l => `${l.toUpperCase()}=${fence[l].aiRejected}`)
+        .join(", ");
+      if (titleLine || aiLine) {
+        log(`Tab "${tabData.sheetName}" sibling-scope fence: title-stage{${titleLine || "none"}}, AI-stage{${aiLine || "none"}}`);
       }
     }
   }
