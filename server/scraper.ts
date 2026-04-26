@@ -702,6 +702,126 @@ function stripSuffix(parts: string[]): string[] {
   return parts;
 }
 
+// ---------------------------------------------------------------------------
+// Per-row "why" trace (Task #84). A lightweight side-channel that lets each
+// matcher record which stage last considered a (rowIndex, lang) pair and the
+// outcome. Persisted as JSONB into mapping_results.details so the UI/DB can
+// surface "what happened to this row" without re-running the job. No schema
+// change: piggy-backs on the existing `details` column.
+// ---------------------------------------------------------------------------
+export type TraceStage = "inventory" | "title" | "title-semantic" | "ai" | "excluded";
+export type TraceOutcome =
+  | "matched"
+  | "no-candidates"
+  | "below-threshold"
+  | "ambiguous"
+  | "cross-validation"
+  | "sibling-fence"
+  | "section-mismatch"
+  | "known-url"
+  | "ai-not-in-inventory"
+  | "ai-already-used"
+  | "ai-outside-root"
+  | "ai-null"
+  | "ai-section-mismatch";
+
+export interface RowLangTrace {
+  stage: TraceStage;
+  outcome: TraceOutcome;
+  topUrl?: string;
+  topScore?: number;
+  note?: string;
+}
+
+export type MatchTrace = Map<number, Partial<Record<TargetLang, RowLangTrace>>>;
+
+export function setTrace(
+  trace: MatchTrace | undefined,
+  rowIndex: number,
+  lang: TargetLang,
+  entry: RowLangTrace,
+): void {
+  if (!trace) return;
+  let row = trace.get(rowIndex);
+  if (!row) {
+    row = {};
+    trace.set(rowIndex, row);
+  }
+  // Always overwrite — later stages have more authoritative info than earlier ones.
+  row[lang] = entry;
+}
+
+// Pair-mapping section guard (Task #84). Uses learned per-pair (sourceRoot →
+// targetRoot) mappings as ground truth — these are derived from rows the user
+// has already aligned, so they are direct evidence of the correct sub-section,
+// not a heuristic. Returns:
+//   - true  : a learned pair-mapping fires AND the candidate sits under the
+//             correct target subtree.
+//   - false : a learned pair-mapping fires AND the candidate is in the WRONG
+//             target subtree (e.g. /benefits/Mobility/... → /Benefits_ru/imahut_ru/...
+//             when prefilled rows clearly say Mobility → nayadut_ru).
+//   - null  : no learned pair-mapping fires for this source URL — abstain so we
+//             do not over-reject when prior data is silent.
+//
+// Conservative by design: only rejects when there is direct prior evidence of
+// the correct sub-section. Never invents constraints from segment-name
+// translation alone (which is unreliable for RU/AR transliterated slugs).
+export function checkPairMappingSection(
+  candidateUrl: string,
+  sourceUrl: string,
+  lang: TargetLang,
+  tabPatterns: TabPatterns,
+): boolean | null {
+  const sourceRoot = langSrcRoot(tabPatterns, lang);
+  const pairMappings = tabPatterns.rootMappings.get(lang) || [];
+  if (pairMappings.length === 0) return null;
+  try {
+    const sourceParts = new URL(sourceUrl).pathname.split("/").filter(Boolean);
+    const cleanSrc = stripSuffix(sourceParts);
+    // Collect ALL fully-matching pair-mappings, then keep only those tied for
+    // the most specific (longest) sourceRoot match. If two mappings tie on
+    // length but disagree on targetRoot, prior data is ambiguous for this
+    // row — abstain rather than risk a false reject.
+    let bestPairMatchLen = 0;
+    const bestTgtRoots: string[][] = [];
+    for (const mapping of pairMappings) {
+      if (mapping.sourceRoot.length < bestPairMatchLen) continue;
+      let matchLen = 0;
+      for (let i = 0; i < mapping.sourceRoot.length && i < cleanSrc.length; i++) {
+        if (normalizeSegment(cleanSrc[i]) === normalizeSegment(mapping.sourceRoot[i])) {
+          matchLen++;
+        } else break;
+      }
+      if (matchLen !== mapping.sourceRoot.length) continue;
+      if (matchLen > bestPairMatchLen) {
+        bestPairMatchLen = matchLen;
+        bestTgtRoots.length = 0;
+        bestTgtRoots.push(mapping.targetRoot);
+      } else if (matchLen === bestPairMatchLen) {
+        bestTgtRoots.push(mapping.targetRoot);
+      }
+    }
+    // Only fire when the matched pair is more specific than the common source
+    // root (otherwise it is just the trivial "everything is under /benefits"
+    // mapping that doesn't tell us anything about sub-section).
+    if (bestTgtRoots.length === 0 || bestPairMatchLen <= sourceRoot.length) return null;
+    // Ambiguity check: if multiple equally-specific mappings disagree on
+    // target subtree, abstain.
+    const distinctTgtKeys = new Set(
+      bestTgtRoots.map((r) => r.map((s) => normalizeSegment(s)).join("/"))
+    );
+    if (distinctTgtKeys.size > 1) return null;
+    const bestPairTgtRoot = bestTgtRoots[0];
+    const candidateParts = new URL(candidateUrl).pathname.split("/").filter(Boolean);
+    if (candidateParts.length < bestPairTgtRoot.length) return false;
+    const candidateNorm = candidateParts.slice(0, bestPairTgtRoot.length).map((s) => normalizeSegment(s)).join("/");
+    const pairTgtNorm = bestPairTgtRoot.map((s) => normalizeSegment(s)).join("/");
+    return candidateNorm === pairTgtNorm;
+  } catch {
+    return null;
+  }
+}
+
 function computeRootMapping(
   pairs: { src: string[]; tgt: string[] }[],
   segMap: Map<string, string>
@@ -3210,6 +3330,7 @@ export async function titleMatchUnmatched(
   signal?: AbortSignal,
   crossScriptLangs?: Record<TargetLang, boolean>,
   tabPatterns?: TabPatterns,
+  traceOut?: MatchTrace,
 ): Promise<TitleMatchOutput> {
   const results = new Map<number, BatchMatchResult>();
   const siblingFence: Record<TargetLang, SiblingFenceStats> = {
@@ -3604,6 +3725,29 @@ export async function titleMatchUnmatched(
         if (knownUrls && knownUrls[lang].has(match.url)) {
           log(`    Title match REJECTED (already known ${lang.toUpperCase()} ref): ${match.url}`);
           rejected.knownUrl++;
+          setTrace(traceOut, candidate.rowIndex, lang, {
+            stage: (match.method || "").includes("semantic") ? "title-semantic" : "title",
+            outcome: "known-url",
+            topUrl: match.url,
+            topScore: match.similarity,
+          });
+        } else if (
+          // Task #84: pair-mapping section guard. When the user's prefilled
+          // rows establish that source.subSection X maps to target.subTree Y
+          // (e.g. Mobility → nayadut_ru), reject any title-stage commit that
+          // crosses into a different sub-tree. The guard returns null when
+          // there is no learned evidence — in that case we accept as before.
+          tabPatterns && checkPairMappingSection(match.url, candidate.sourceUrl, lang, tabPatterns) === false
+        ) {
+          log(`    Title match REJECTED (pair-mapping section mismatch ${lang.toUpperCase()}): ${match.url} ⟵ ${candidate.sourceUrl}`);
+          rejected.crossValidation++;
+          setTrace(traceOut, candidate.rowIndex, lang, {
+            stage: (match.method || "").includes("semantic") ? "title-semantic" : "title",
+            outcome: "section-mismatch",
+            topUrl: match.url,
+            topScore: match.similarity,
+            note: "learned pair-mapping says target sub-tree differs",
+          });
         } else {
           setResultMatch(result, lang, match.url, match.confidence, match.method, {
             scoped: rowScoped.get(candidate.rowIndex)?.[lang] === true,
@@ -3611,6 +3755,12 @@ export async function titleMatchUnmatched(
           });
           usedUrls[lang].add(match.url);
           hasResult = true;
+          setTrace(traceOut, candidate.rowIndex, lang, {
+            stage: (match.method || "").includes("semantic") ? "title-semantic" : "title",
+            outcome: "matched",
+            topUrl: match.url,
+            topScore: match.similarity,
+          });
           if ((match.method || "").includes("semantic")) {
             semanticAccepted++;
             semAcceptedByLang[lang]++;
@@ -3746,6 +3896,7 @@ export async function aiMatchUnmatched(
   knownUrls: Record<TargetLang, Set<string>>,
   signal?: AbortSignal,
   crossScriptLangs?: Record<TargetLang, boolean>,
+  traceOut?: MatchTrace,
 ): Promise<AiMatchOutput> {
   const results = new Map<number, BatchMatchResult>();
   const siblingFence: Record<TargetLang, SiblingFenceStats> = {
@@ -4632,6 +4783,7 @@ Return ONLY the JSON array, no other text.`;
             if (!suggestedUrl) {
               aiStats[l].rejNull++;
               siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
+              setTrace(traceOut, row.rowIndex, l, { stage: "ai", outcome: "ai-null" });
               continue;
             }
             const rootPath = langRoot(tabPatterns, l);
@@ -4666,22 +4818,43 @@ Return ONLY the JSON array, no other text.`;
             const rowScope = computeSiblingScope(row.sourceUrl, l, tabPatterns);
             const scopeActive = rowScope !== null;
             const sectionFails = !validateSectionContext(suggestedUrl, row.sourceUrl, l, tabPatterns);
+            // Task #84: pair-mapping section guard. Even on the AI commit
+            // path (which historically downgrades section gates to soft for
+            // RU/AR), reject when the user's prefilled rows establish a
+            // sub-section mapping that the AI's pick violates. The guard
+            // returns null when there is no learned evidence — in that case
+            // we fall through to the existing logic.
+            const pairMappingViolation = checkPairMappingSection(suggestedUrl as string, row.sourceUrl, l, tabPatterns) === false;
             if (!inventories[l]?.urls.has(suggestedUrl)) {
               log(`    AI REJECTED (not in inventory): ${l.toUpperCase()} ${suggestedUrl}`);
               aiStats[l].rejNotInInv++;
               siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
+              setTrace(traceOut, row.rowIndex, l, { stage: "ai", outcome: "ai-not-in-inventory", topUrl: suggestedUrl as string });
             } else if (usedUrls[l].has(suggestedUrl)) {
               log(`    AI REJECTED (already used): ${l.toUpperCase()} ${suggestedUrl}`);
               aiStats[l].rejAlreadyUsed++;
               siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
+              setTrace(traceOut, row.rowIndex, l, { stage: "ai", outcome: "ai-already-used", topUrl: suggestedUrl as string });
+            } else if (pairMappingViolation) {
+              log(`    AI REJECTED (pair-mapping section mismatch ${l.toUpperCase()}): ${suggestedUrl} ⟵ ${row.sourceUrl}`);
+              aiStats[l].rejSection++;
+              siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
+              setTrace(traceOut, row.rowIndex, l, {
+                stage: "ai",
+                outcome: "ai-section-mismatch",
+                topUrl: suggestedUrl as string,
+                note: "learned pair-mapping says target sub-tree differs",
+              });
             } else if (outsideRoot && !softGates && !scopeActive) {
               log(`    AI REJECTED (outside ${l.toUpperCase()} root ${rootBase}): ${suggestedUrl}`);
               aiStats[l].rejOutsideRoot++;
               siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
+              setTrace(traceOut, row.rowIndex, l, { stage: "ai", outcome: "ai-outside-root", topUrl: suggestedUrl as string });
             } else if (sectionFails && !softGates && !scopeActive) {
               log(`    AI REJECTED (section/category mismatch with source): ${l.toUpperCase()} ${suggestedUrl} ⟵ ${row.sourceUrl}`);
               aiStats[l].rejSection++;
               siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
+              setTrace(traceOut, row.rowIndex, l, { stage: "ai", outcome: "ai-section-mismatch", topUrl: suggestedUrl as string });
             } else if (
               // Per-row sibling-scope hard fence (Task #70). When this row's
               // source URL is covered by a confirmed (sourceRoot →
@@ -4698,6 +4871,7 @@ Return ONLY the JSON array, no other text.`;
               aiStats[l].rejSiblingScope++;
               siblingFence[l].rejected++;
               siblingFence[l].markedRowIndices.add(row.rowIndex);
+              setTrace(traceOut, row.rowIndex, l, { stage: "ai", outcome: "sibling-fence", topUrl: suggestedUrl as string });
             } else {
               // Task #74: bookkeeping for "scope skipped a hard-gate
               // rejection". Applied uniformly to EN/FR/RU/AR per the task
@@ -4728,6 +4902,12 @@ Return ONLY the JSON array, no other text.`;
               usedUrls[l].add(suggestedUrl);
               aiStats[l].accepted++;
               hasMatch = true;
+              setTrace(traceOut, row.rowIndex, l, {
+                stage: "ai",
+                outcome: "matched",
+                topUrl: suggestedUrl as string,
+                topScore: 82,
+              });
             }
           }
         }

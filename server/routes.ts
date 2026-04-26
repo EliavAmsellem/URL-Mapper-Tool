@@ -47,6 +47,8 @@ import {
   mineSegmentsFromInventory,
   computeSiblingScope,
   isUrlUnderTgtDir,
+  type MatchTrace,
+  type RowLangTrace,
 } from "./scraper";
 import { log } from "./index";
 
@@ -691,6 +693,10 @@ async function matchTab(
   // scope-active relaxed floors that the pre-loosening cascade would have
   // rejected. Accumulated across all title-stage calls inside this tab.
   titleLoosenedAccepted: Record<TargetLang, number>;
+  // Task #84: per-row "why" trace accumulated across the title-stage calls in
+  // this tab. The AI stage runs outside matchTab and writes into the same
+  // map (passed by reference from processJob).
+  matchTrace: MatchTrace;
 }> {
   const { sheetName, allRows, tabRefRows } = tabData;
   const allLangsLocal: TargetLang[] = ["en", "fr", "ru", "ar"];
@@ -703,6 +709,10 @@ async function matchTab(
   // before the title-match stage) can both increment it; aggregated into the
   // returned fenceStats. The AI-stage fence is tracked outside matchTab.
   const titleFenceRejected: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+
+  // Task #84: per-row "why" trace for this tab. Title-stage calls below pass
+  // this in; the AI stage (in processJob) appends to the same map by ref.
+  const matchTrace: MatchTrace = new Map();
   // Task #74: per-lang count of title-stage matches admitted under the
   // relaxed (scope-active) floors that the pre-loosening cascade would have
   // rejected. Accumulated across the title-stage call and projected into
@@ -776,7 +786,7 @@ async function matchTab(
   });
   if (needsMatching.length === 0 || !hasAnyRoot) {
     return {
-      matchResults, inventories, tabPatterns, usedUrls,
+      matchResults, inventories, tabPatterns, usedUrls, matchTrace,
       newFeedbackAnchors: { en: [], fr: [], ru: [], ar: [] },
       minedSegments: { en: new Map(), fr: new Map(), ru: new Map(), ar: new Map() },
       coverageStats: {
@@ -1737,7 +1747,7 @@ async function matchTab(
     const titleOutput = await titleMatchUnmatched(
       unmatchedForTitle, inventories, storage,
       allowedRoots, refDepths, knownUrlSets, control.signal, crossScriptLangs,
-      tabPatterns,
+      tabPatterns, matchTrace,
     );
     const titleMatches = titleOutput.matches;
     for (const l of langs) {
@@ -1951,7 +1961,7 @@ async function matchTab(
     ru: { titleRejected: titleFenceRejected.ru, aiRejected: 0, markedRowIndices: titleFenceMarks.ru, nonFenceFailureRowIndices: titleNonFenceFailureMarks.ru },
     ar: { titleRejected: titleFenceRejected.ar, aiRejected: 0, markedRowIndices: titleFenceMarks.ar, nonFenceFailureRowIndices: titleNonFenceFailureMarks.ar },
   };
-  return { matchResults, inventories, tabPatterns, usedUrls, newFeedbackAnchors, minedSegments, coverageStats, fenceStats, titleLoosenedAccepted };
+  return { matchResults, inventories, tabPatterns, usedUrls, newFeedbackAnchors, minedSegments, coverageStats, fenceStats, titleLoosenedAccepted, matchTrace };
 }
 
 async function processJob(jobId: string, _threshold: number, control: JobControl) {
@@ -2099,6 +2109,10 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
   const refUrlKey: Record<TargetLang, "enUrl" | "frUrl" | "ruUrl" | "arUrl"> = { en: "enUrl", fr: "frUrl", ru: "ruUrl", ar: "arUrl" };
 
   const globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
+  // Task #84: per-tab "why" trace map. Populated by matchTab (title stage) and
+  // appended to by the AI stage below; consulted at result-write to attach a
+  // per-(row,lang) explanation into the mapping_results.details JSONB.
+  const tabMatchTraces = new Map<string, MatchTrace>();
   const tabInventories = new Map<string, { inventories: Record<TargetLang, CrawlInventory | null>; tabPatterns: TabPatterns; usedUrls: Record<TargetLang, Set<string>> }>();
   const tabCoverageStats = new Map<string, Record<TargetLang, { totalInventory: number; mappedSubtrees: number; sparseBefore: number; sparseAfter: number; backfilledUrls: number }>>();
   const tabFenceStats = new Map<string, Record<TargetLang, { titleRejected: number; aiRejected: number; markedRowIndices: Set<number>; nonFenceFailureRowIndices: Set<number> }>>();
@@ -2431,7 +2445,21 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       await storage.updateJob(jobId, { currentStep: stepLabel });
 
       const incomingFeedback = feedbackAnchorsByTab.get(tabData.sheetName);
-      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed, newFeedbackAnchors, minedSegments, coverageStats, fenceStats, titleLoosenedAccepted } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns, incomingFeedback);
+      const { matchResults, inventories: tabInv, tabPatterns, usedUrls: tabUsed, newFeedbackAnchors, minedSegments, coverageStats, fenceStats, titleLoosenedAccepted, matchTrace } = await matchTab(tabData, crawlCache, control, activeLangs, effectiveCap, seedMap.get(tabData.sheetName), alternateLinkCache, globalPatterns, incomingFeedback);
+      // Task #84: merge per-pass trace into the per-tab accumulator so the AI
+      // stage and result-write can see entries from earlier passes too.
+      const existingTrace = tabMatchTraces.get(tabData.sheetName);
+      if (existingTrace) {
+        for (const [rowIdx, langMap] of Array.from(matchTrace.entries())) {
+          const existingRow = existingTrace.get(rowIdx) || {};
+          for (const [l, entry] of Object.entries(langMap)) {
+            if (entry) existingRow[l as TargetLang] = entry;
+          }
+          existingTrace.set(rowIdx, existingRow);
+        }
+      } else {
+        tabMatchTraces.set(tabData.sheetName, matchTrace);
+      }
       tabInventories.set(tabData.sheetName, { inventories: tabInv, tabPatterns, usedUrls: tabUsed });
       tabCoverageStats.set(tabData.sheetName, coverageStats);
       // Sibling-scope fence accumulator across passes within this tab. Each
@@ -2710,6 +2738,11 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       // matches can be tagged with the same flag in mapping_results.details.
       const aiCrossScriptLangs = detectCrossScriptLangs(tabData.tabRefRows, allLangs);
 
+      const tabTraceForAi = tabMatchTraces.get(tabData.sheetName) ?? (() => {
+        const t: MatchTrace = new Map();
+        tabMatchTraces.set(tabData.sheetName, t);
+        return t;
+      })();
       const aiOutput = await aiMatchUnmatched(
         unmatchedForAi,
         effectiveInventories,
@@ -2719,6 +2752,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         knownUrlSets,
         control.signal,
         aiCrossScriptLangs,
+        tabTraceForAi,
       );
       const aiMatches = aiOutput.matches;
       // Fold the AI matcher's sibling-scope fence rejections into this tab's
@@ -2982,6 +3016,11 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
 
   for (const tabData of allTabData) {
     const sheetGlobal = globalMatchResults.get(tabData.sheetName) || new Map();
+    // Task #84: per-tab "why" trace assembled by the title and AI matchers.
+    // Read at result-write to attach a per-(row,lang) explanation into the
+    // mapping_results.details JSONB. May be undefined if no matching pass ran
+    // for this tab (e.g. tab fully prefilled).
+    const sheetTrace = tabMatchTraces.get(tabData.sheetName);
     const resultBatch: any[] = [];
 
     for (const row of tabData.allRows) {
@@ -3067,16 +3106,34 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         ["ru", matchMethodRu, match ? getResultFlags(match, "ru") : null],
         ["ar", matchMethodAr, match ? getResultFlags(match, "ar") : null],
       ];
+      // Task #84: per-row "why" trace, recorded by the title and AI matchers
+      // for both committed and rejected (rowIndex, lang) pairs.
+      const rowTrace = sheetTrace?.get(row.rowIndex);
       for (const [l, method, flags] of langPairs) {
         const stage = stageOf(method);
         const reason = reasonOf(method);
-        if (!stage && !flags?.scoped && !flags?.crossScript) continue;
+        const trace: RowLangTrace | undefined = rowTrace?.[l];
+        if (!stage && !flags?.scoped && !flags?.crossScript && !trace) continue;
         const entry: Record<string, unknown> = {
           stage: stage,
           reason: reason,
           scoped: !!flags?.scoped,
           crossScript: !!flags?.crossScript,
         };
+        if (trace) {
+          // Compact form so the JSONB row stays small. Always carries the
+          // last stage that considered this (row, lang) and its outcome;
+          // top candidate URL/score and a short note are included only when
+          // the matcher had something to say.
+          const traceEntry: Record<string, unknown> = {
+            stage: trace.stage,
+            outcome: trace.outcome,
+          };
+          if (trace.topUrl) traceEntry.topUrl = trace.topUrl;
+          if (typeof trace.topScore === "number") traceEntry.topScore = Math.round(trace.topScore * 1000) / 1000;
+          if (trace.note) traceEntry.note = trace.note;
+          entry.trace = traceEntry;
+        }
         perLangDetails[l] = entry;
       }
 
