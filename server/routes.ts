@@ -695,6 +695,14 @@ async function matchTab(
   const titleNonFenceFailureMarks: Record<TargetLang, Set<number>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
 
   const tabPatterns = learnTabPatterns(tabRefRows, langs);
+  // Tabs whose source slugs are in a different script/vocabulary from the
+  // target inventory slugs (e.g. EN sources `/benefits/Disability` vs RU
+  // inventory `/Benefits_ru/Nehut_ru/`) make the title-match "no shared
+  // segments → reject" rail a false-positive generator. Detect once per tab
+  // from reference rows and disable the rail per-lang downstream.
+  // Declared early so pattern+crawl/alt-link/HEAD commits can stamp the
+  // crossScript flag onto BatchMatchResult before downstream merges.
+  const crossScriptLangs = detectCrossScriptLangs(tabRefRows, langs);
   const preMergeSegCounts: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
   const preMergePairCounts: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
   for (const l of langs) {
@@ -1458,7 +1466,12 @@ async function matchTab(
           }
         }
         if (match && !scopeBlocked && !usedUrls[l].has(match.url)) {
-          setResultMatch(result, l, match.url, match.confidence, match.method);
+          // Pass crossScript so AI/title flags can later distinguish
+          // genuine cross-script matches from same-script ones; pattern+crawl
+          // commits don't run inside a sibling-scope context here so scoped=false.
+          setResultMatch(result, l, match.url, match.confidence, match.method, {
+            crossScript: crossScriptLangs[l] === true,
+          });
           usedUrls[l].add(match.url);
           methodCounts[match.method] = (methodCounts[match.method] || 0) + 1;
           inventoryMatchCount++;
@@ -1520,14 +1533,6 @@ async function matchTab(
       log(`    ${sec}: ${parts.join(" | ")}`);
     }
   }
-
-  // ---- CROSS-SCRIPT DETECTION ----
-  // Tabs whose source slugs are in a different script/vocabulary from the
-  // target inventory slugs (e.g. EN sources `/benefits/Disability` vs RU
-  // inventory `/Benefits_ru/Nehut_ru/`) make the title-match "no shared
-  // segments → reject" rail a false-positive generator. Detect once per tab
-  // from reference rows and disable the rail per-lang downstream.
-  const crossScriptLangs = detectCrossScriptLangs(tabRefRows, langs);
 
   // ---- PASS 1.5: ALTERNATE-LINK HARVEST ----
   // For rows that Pattern+Crawl couldn't place, fetch the source HTML once
@@ -1614,7 +1619,12 @@ async function matchTab(
               log(`    Pass 1.5 alt-link REJECTED (sibling-scope fence): ${l.toUpperCase()} ${url} ⟵ ${sourceUrl}`);
               continue;
             }
-            setResultMatch(result, l, url, 95, "alternate-link");
+            // alt-link: scoped reflects whether a sibling scope was active
+            // for this row+lang; crossScript carries the per-tab flag.
+            setResultMatch(result, l, url, 95, "alternate-link", {
+              scoped: scope !== null,
+              crossScript: crossScriptLangs[l] === true,
+            });
             usedUrls[l].add(url);
             harvestApplied++;
           }
@@ -1736,7 +1746,8 @@ async function matchTab(
           else if (method === "title-semantic") taggedMethod = "inventory-title-semantic";
           else if (method === "title-semantic+disambig") taggedMethod = "inventory-title-semantic+disambig";
           else taggedMethod = `inventory-${method}`;
-          setResultMatch(result, l, tUrl, getResultConf(titleResult, l) || 0, taggedMethod);
+          // Preserve scoped/crossScript flags captured by the title matcher.
+          setResultMatch(result, l, tUrl, getResultConf(titleResult, l) || 0, taggedMethod, getResultFlags(titleResult, l) ?? undefined);
           usedUrls[l].add(tUrl);
           titleAcceptedTotal++;
           titleMethodCounts[taggedMethod] = (titleMethodCounts[taggedMethod] || 0) + 1;
@@ -1833,7 +1844,12 @@ async function matchTab(
         const result = matchResults.get(item.index);
         if (result && !getResultUrl(result, item.lang)) {
           const method = wasRedirected ? "head-verified+redirect" : "head-verified";
-          setResultMatch(result, item.lang, verifiedUrl, 90, method);
+          // HEAD-verified candidates carry their per-row sibling-scope status
+          // and the per-tab cross-script flag for the target language.
+          setResultMatch(result, item.lang, verifiedUrl, 90, method, {
+            scoped: scope !== null,
+            crossScript: crossScriptLangs[item.lang] === true,
+          });
           usedUrls[item.lang].add(verifiedUrl);
           headMatched++;
           if (wasRedirected) headRedirRescued++;
@@ -2479,7 +2495,9 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
           for (const l of allLangs) {
             const url = getResultUrl(result, l);
             if (url && !getResultUrl(existing, l)) {
-              setResultMatch(existing, l, url, getResultConf(result, l) || 0, getResultMethod(result, l) || "");
+              // Preserve scoped/crossScript flags so they survive the multi-pass
+              // merge into the durable per-tab result map.
+              setResultMatch(existing, l, url, getResultConf(result, l) || 0, getResultMethod(result, l) || "", getResultFlags(result, l) ?? undefined);
               tabNewMatches++;
             }
           }
@@ -2763,7 +2781,8 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
               if (!url) continue;
               if (!getResultUrl(existing, l) && !inv.usedUrls[l].has(url)) {
                 const method = getResultMethod(aiResult, l) || "";
-                setResultMatch(existing, l, url, getResultConf(aiResult, l) || 0, method);
+                // Preserve scoped/crossScript flags captured by the AI matcher.
+                setResultMatch(existing, l, url, getResultConf(aiResult, l) || 0, method, getResultFlags(aiResult, l) ?? undefined);
                 inv.usedUrls[l].add(url);
                 aiAccepted++;
                 // Per-tab sibling-AI accept telemetry: when this row's source
