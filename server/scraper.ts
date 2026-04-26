@@ -3058,7 +3058,16 @@ export function matchByTitle(
 
 export interface SiblingFenceStats {
   rejected: number;
+  // rowIndices for which this stage rejected at least one candidate via the
+  // sibling-scope fence.
   markedRowIndices: Set<number>;
+  // rowIndices for which this stage failed to commit a match for a non-fence
+  // reason (e.g. matcher returned no candidate, AI rejected for null /
+  // not-in-inv / dedup / outside-root / section-mismatch). Used downstream
+  // to compute the strict "fence rejected the only candidate" metric: a
+  // row qualifies iff it is in markedRowIndices AND NOT in
+  // nonFenceFailureRowIndices AND has no final URL.
+  nonFenceFailureRowIndices: Set<number>;
 }
 
 export interface TitleMatchOutput {
@@ -3079,10 +3088,10 @@ export async function titleMatchUnmatched(
 ): Promise<TitleMatchOutput> {
   const results = new Map<number, BatchMatchResult>();
   const siblingFence: Record<TargetLang, SiblingFenceStats> = {
-    en: { rejected: 0, markedRowIndices: new Set() },
-    fr: { rejected: 0, markedRowIndices: new Set() },
-    ru: { rejected: 0, markedRowIndices: new Set() },
-    ar: { rejected: 0, markedRowIndices: new Set() },
+    en: { rejected: 0, markedRowIndices: new Set(), nonFenceFailureRowIndices: new Set() },
+    fr: { rejected: 0, markedRowIndices: new Set(), nonFenceFailureRowIndices: new Set() },
+    ru: { rejected: 0, markedRowIndices: new Set(), nonFenceFailureRowIndices: new Set() },
+    ar: { rejected: 0, markedRowIndices: new Set(), nonFenceFailureRowIndices: new Set() },
   };
   const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
   const langNames: Record<TargetLang, string> = { en: "English", fr: "French", ru: "Russian", ar: "Arabic" };
@@ -3308,6 +3317,18 @@ export async function titleMatchUnmatched(
       }
     }
 
+    // Strict "fence-only" telemetry (Task #70): for every (row, lang) where
+    // the matcher produced NO candidate AND the fence did NOT reject one,
+    // record a non-fence failure. Distinguishing this from fence rejection
+    // lets the per-tab summary report exactly the rows whose only obstacle
+    // was the fence (markedRowIndices ∖ nonFenceFailureRowIndices).
+    for (const l of langs) {
+      if (!row.needs[l]) continue;
+      if (rowMatches[l] !== null) continue;
+      if (siblingFence[l].markedRowIndices.has(row.rowIndex)) continue;
+      siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
+    }
+
     if (hasMatch) {
       candidates.push({ rowIndex: row.rowIndex, sourceUrl: row.sourceUrl, matches: rowMatches });
     }
@@ -3506,10 +3527,10 @@ export async function aiMatchUnmatched(
 ): Promise<AiMatchOutput> {
   const results = new Map<number, BatchMatchResult>();
   const siblingFence: Record<TargetLang, SiblingFenceStats> = {
-    en: { rejected: 0, markedRowIndices: new Set() },
-    fr: { rejected: 0, markedRowIndices: new Set() },
-    ru: { rejected: 0, markedRowIndices: new Set() },
-    ar: { rejected: 0, markedRowIndices: new Set() },
+    en: { rejected: 0, markedRowIndices: new Set(), nonFenceFailureRowIndices: new Set() },
+    fr: { rejected: 0, markedRowIndices: new Set(), nonFenceFailureRowIndices: new Set() },
+    ru: { rejected: 0, markedRowIndices: new Set(), nonFenceFailureRowIndices: new Set() },
+    ar: { rejected: 0, markedRowIndices: new Set(), nonFenceFailureRowIndices: new Set() },
   };
   const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
   const langLabels: Record<TargetLang, string> = { en: "English", fr: "French", ru: "Russian", ar: "Arabic" };
@@ -4277,6 +4298,7 @@ Return ONLY the JSON array, no other text.`;
             handled[l].add(row.sourceUrl);
             if (!suggestedUrl) {
               aiStats[l].rejNull++;
+              siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
               continue;
             }
             const rootPath = langRoot(tabPatterns, l);
@@ -4304,15 +4326,19 @@ Return ONLY the JSON array, no other text.`;
             if (!inventories[l]?.urls.has(suggestedUrl)) {
               log(`    AI REJECTED (not in inventory): ${l.toUpperCase()} ${suggestedUrl}`);
               aiStats[l].rejNotInInv++;
+              siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
             } else if (usedUrls[l].has(suggestedUrl)) {
               log(`    AI REJECTED (already used): ${l.toUpperCase()} ${suggestedUrl}`);
               aiStats[l].rejAlreadyUsed++;
+              siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
             } else if (outsideRoot && !softGates) {
               log(`    AI REJECTED (outside ${l.toUpperCase()} root ${rootBase}): ${suggestedUrl}`);
               aiStats[l].rejOutsideRoot++;
+              siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
             } else if (!validateSectionContext(suggestedUrl, row.sourceUrl, l, tabPatterns) && !softGates) {
               log(`    AI REJECTED (section/category mismatch with source): ${l.toUpperCase()} ${suggestedUrl} ⟵ ${row.sourceUrl}`);
               aiStats[l].rejSection++;
+              siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
             } else if (
               // Per-row sibling-scope hard fence (Task #70). When this row's
               // source URL is covered by a confirmed (sourceRoot →
@@ -4364,6 +4390,7 @@ Return ONLY the JSON array, no other text.`;
         for (const l of langs) {
           if (r.needs[l] && !handled[l].has(r.sourceUrl)) {
             aiStats[l].rejNull++;
+            siblingFence[l].nonFenceFailureRowIndices.add(r.rowIndex);
           }
         }
       }
