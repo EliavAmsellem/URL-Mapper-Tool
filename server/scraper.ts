@@ -3058,6 +3058,7 @@ export function matchByTitle(
 
 export interface SiblingFenceStats {
   rejected: number;
+  markedRowIndices: Set<number>;
 }
 
 export interface TitleMatchOutput {
@@ -3078,7 +3079,10 @@ export async function titleMatchUnmatched(
 ): Promise<TitleMatchOutput> {
   const results = new Map<number, BatchMatchResult>();
   const siblingFence: Record<TargetLang, SiblingFenceStats> = {
-    en: { rejected: 0 }, fr: { rejected: 0 }, ru: { rejected: 0 }, ar: { rejected: 0 },
+    en: { rejected: 0, markedRowIndices: new Set() },
+    fr: { rejected: 0, markedRowIndices: new Set() },
+    ru: { rejected: 0, markedRowIndices: new Set() },
+    ar: { rejected: 0, markedRowIndices: new Set() },
   };
   const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
   const langNames: Record<TargetLang, string> = { en: "English", fr: "French", ru: "Russian", ar: "Arabic" };
@@ -3294,6 +3298,7 @@ export async function titleMatchUnmatched(
             log(`    Title FENCE REJECTED ${lang.toUpperCase()} (out-of-scope): "${rowMatches[lang]!.url}" not under ${tgtPrefix} (row ${row.rowIndex} src=${row.sourceUrl})`);
             rowMatches[lang] = null;
             siblingFence[lang].rejected++;
+            siblingFence[lang].markedRowIndices.add(row.rowIndex);
             // Recompute hasMatch — the fence may have eliminated the only
             // surviving lang for this row, in which case it should not be
             // pushed onto the candidates list at all.
@@ -3501,7 +3506,10 @@ export async function aiMatchUnmatched(
 ): Promise<AiMatchOutput> {
   const results = new Map<number, BatchMatchResult>();
   const siblingFence: Record<TargetLang, SiblingFenceStats> = {
-    en: { rejected: 0 }, fr: { rejected: 0 }, ru: { rejected: 0 }, ar: { rejected: 0 },
+    en: { rejected: 0, markedRowIndices: new Set() },
+    fr: { rejected: 0, markedRowIndices: new Set() },
+    ru: { rejected: 0, markedRowIndices: new Set() },
+    ar: { rejected: 0, markedRowIndices: new Set() },
   };
   const langs: TargetLang[] = ["en", "fr", "ru", "ar"];
   const langLabels: Record<TargetLang, string> = { en: "English", fr: "French", ru: "Russian", ar: "Arabic" };
@@ -4324,6 +4332,7 @@ Return ONLY the JSON array, no other text.`;
               log(`    AI REJECTED (sibling-scope fence): ${l.toUpperCase()} ${suggestedUrl} ⟵ ${row.sourceUrl}`);
               aiStats[l].rejSiblingScope++;
               siblingFence[l].rejected++;
+              siblingFence[l].markedRowIndices.add(row.rowIndex);
             } else {
               if (outsideRoot && softGates) {
                 log(`    AI WARN (outside ${l.toUpperCase()} root ${rootBase}, accepting): ${suggestedUrl}`);

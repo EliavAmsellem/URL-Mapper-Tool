@@ -621,7 +621,7 @@ async function matchTab(
   newFeedbackAnchors: Record<TargetLang, string[]>;
   minedSegments: Record<TargetLang, Map<string, string>>;
   coverageStats: Record<TargetLang, { totalInventory: number; mappedSubtrees: number; sparseBefore: number; sparseAfter: number; backfilledUrls: number }>;
-  fenceStats: Record<TargetLang, { titleRejected: number; aiRejected: number }>;
+  fenceStats: Record<TargetLang, { titleRejected: number; aiRejected: number; markedRowIndices: Set<number> }>;
 }> {
   const { sheetName, allRows, tabRefRows } = tabData;
   const allLangsLocal: TargetLang[] = ["en", "fr", "ru", "ar"];
@@ -634,6 +634,11 @@ async function matchTab(
   // before the title-match stage) can both increment it; aggregated into the
   // returned fenceStats. The AI-stage fence is tracked outside matchTab.
   const titleFenceRejected: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+  // Per-row marks for the sibling fence (Task #70 row-level telemetry):
+  // remember which rowIndices had at least one candidate rejected by the
+  // fence in this tab × language. processJob diffs these against the final
+  // committed results to compute "rows blocked by fence only".
+  const titleFenceMarks: Record<TargetLang, Set<number>> = { en: new Set(), fr: new Set(), ru: new Set(), ar: new Set() };
 
   const tabPatterns = learnTabPatterns(tabRefRows, langs);
   const preMergeSegCounts: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
@@ -690,10 +695,10 @@ async function matchTab(
         ar: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
       },
       fenceStats: {
-        en: { titleRejected: 0, aiRejected: 0 },
-        fr: { titleRejected: 0, aiRejected: 0 },
-        ru: { titleRejected: 0, aiRejected: 0 },
-        ar: { titleRejected: 0, aiRejected: 0 },
+        en: { titleRejected: 0, aiRejected: 0, markedRowIndices: new Set() },
+        fr: { titleRejected: 0, aiRejected: 0, markedRowIndices: new Set() },
+        ru: { titleRejected: 0, aiRejected: 0, markedRowIndices: new Set() },
+        ar: { titleRejected: 0, aiRejected: 0, markedRowIndices: new Set() },
       },
     };
   }
@@ -1393,6 +1398,7 @@ async function matchTab(
           if (scope && !isUrlUnderTgtDir(match.url, scope.mappedTgtDir)) {
             scopeBlocked = true;
             titleFenceRejected[l]++;
+            titleFenceMarks[l].add(row.rowIndex);
             log(`    Pattern+crawl REJECTED (sibling-scope fence): ${l.toUpperCase()} ${match.url} ⟵ ${row.sourceUrl}`);
           }
         }
@@ -1619,6 +1625,9 @@ async function matchTab(
     const titleMatches = titleOutput.matches;
     for (const l of langs) {
       titleFenceRejected[l] += titleOutput.siblingFence[l].rejected;
+      for (const idx of Array.from(titleOutput.siblingFence[l].markedRowIndices)) {
+        titleFenceMarks[l].add(idx);
+      }
     }
 
     for (const [rowIndex, titleResult] of Array.from(titleMatches.entries())) {
@@ -1718,6 +1727,7 @@ async function matchTab(
         const scope = computeSiblingScope(item.sourceUrl, item.lang, tabPatterns);
         if (scope && !isUrlUnderTgtDir(verifiedUrl, scope.mappedTgtDir)) {
           titleFenceRejected[item.lang]++;
+          titleFenceMarks[item.lang].add(item.index);
           log(`    HEAD REJECTED (sibling-scope fence): ${item.lang.toUpperCase()} ${verifiedUrl} ⟵ ${item.sourceUrl}`);
           continue;
         }
@@ -1792,11 +1802,11 @@ async function matchTab(
   // matchTab only fills in the title-stage fence here. aiRejected is left at
   // 0 and the AI-stage caller (processJob) accumulates into tabFenceStats
   // directly after each aiMatchUnmatched call.
-  const fenceStats: Record<TargetLang, { titleRejected: number; aiRejected: number }> = {
-    en: { titleRejected: titleFenceRejected.en, aiRejected: 0 },
-    fr: { titleRejected: titleFenceRejected.fr, aiRejected: 0 },
-    ru: { titleRejected: titleFenceRejected.ru, aiRejected: 0 },
-    ar: { titleRejected: titleFenceRejected.ar, aiRejected: 0 },
+  const fenceStats: Record<TargetLang, { titleRejected: number; aiRejected: number; markedRowIndices: Set<number> }> = {
+    en: { titleRejected: titleFenceRejected.en, aiRejected: 0, markedRowIndices: titleFenceMarks.en },
+    fr: { titleRejected: titleFenceRejected.fr, aiRejected: 0, markedRowIndices: titleFenceMarks.fr },
+    ru: { titleRejected: titleFenceRejected.ru, aiRejected: 0, markedRowIndices: titleFenceMarks.ru },
+    ar: { titleRejected: titleFenceRejected.ar, aiRejected: 0, markedRowIndices: titleFenceMarks.ar },
   };
   return { matchResults, inventories, tabPatterns, usedUrls, newFeedbackAnchors, minedSegments, coverageStats, fenceStats };
 }
@@ -1948,7 +1958,7 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
   const globalMatchResults = new Map<string, Map<number, BatchMatchResult>>();
   const tabInventories = new Map<string, { inventories: Record<TargetLang, CrawlInventory | null>; tabPatterns: TabPatterns; usedUrls: Record<TargetLang, Set<string>> }>();
   const tabCoverageStats = new Map<string, Record<TargetLang, { totalInventory: number; mappedSubtrees: number; sparseBefore: number; sparseAfter: number; backfilledUrls: number }>>();
-  const tabFenceStats = new Map<string, Record<TargetLang, { titleRejected: number; aiRejected: number }>>();
+  const tabFenceStats = new Map<string, Record<TargetLang, { titleRejected: number; aiRejected: number; markedRowIndices: Set<number> }>>();
 
   function getRowExisting(row: RowData, lang: TargetLang): string {
     switch (lang) { case "en": return row.existingEn; case "fr": return row.existingFr; case "ru": return row.existingRu; case "ar": return row.existingAr; }
@@ -2283,6 +2293,9 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         for (const l of allLangs) {
           prevFence[l].titleRejected += fenceStats[l].titleRejected;
           prevFence[l].aiRejected += fenceStats[l].aiRejected;
+          for (const idx of Array.from(fenceStats[l].markedRowIndices)) {
+            prevFence[l].markedRowIndices.add(idx);
+          }
         }
       } else {
         tabFenceStats.set(tabData.sheetName, fenceStats);
@@ -2542,13 +2555,16 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
       if (aiFenceForTab) {
         for (const l of allLangs) {
           aiFenceForTab[l].aiRejected += aiOutput.siblingFence[l].rejected;
+          for (const idx of Array.from(aiOutput.siblingFence[l].markedRowIndices)) {
+            aiFenceForTab[l].markedRowIndices.add(idx);
+          }
         }
       } else {
         tabFenceStats.set(tabData.sheetName, {
-          en: { titleRejected: 0, aiRejected: aiOutput.siblingFence.en.rejected },
-          fr: { titleRejected: 0, aiRejected: aiOutput.siblingFence.fr.rejected },
-          ru: { titleRejected: 0, aiRejected: aiOutput.siblingFence.ru.rejected },
-          ar: { titleRejected: 0, aiRejected: aiOutput.siblingFence.ar.rejected },
+          en: { titleRejected: 0, aiRejected: aiOutput.siblingFence.en.rejected, markedRowIndices: new Set(aiOutput.siblingFence.en.markedRowIndices) },
+          fr: { titleRejected: 0, aiRejected: aiOutput.siblingFence.fr.rejected, markedRowIndices: new Set(aiOutput.siblingFence.fr.markedRowIndices) },
+          ru: { titleRejected: 0, aiRejected: aiOutput.siblingFence.ru.rejected, markedRowIndices: new Set(aiOutput.siblingFence.ru.markedRowIndices) },
+          ar: { titleRejected: 0, aiRejected: aiOutput.siblingFence.ar.rejected, markedRowIndices: new Set(aiOutput.siblingFence.ar.markedRowIndices) },
         });
       }
 
@@ -2700,8 +2716,29 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         .filter(l => fence[l].aiRejected > 0)
         .map(l => `${l.toUpperCase()}=${fence[l].aiRejected}`)
         .join(", ");
-      if (titleLine || aiLine) {
-        log(`Tab "${tabData.sheetName}" sibling-scope fence: title-stage{${titleLine || "none"}}, AI-stage{${aiLine || "none"}}`);
+      // Row-level fence-only blocked counter (Task #70 acceptance criterion).
+      // A row counts as "blocked by fence only" for a given language if the
+      // sibling-scope fence rejected at least one candidate for that row in
+      // that language AND the row's final committed result still has no URL
+      // for that language. This isolates rows where the fence was the
+      // proximate cause of an unmatched cell, distinct from rows that simply
+      // had no candidate at all.
+      const finalResults = globalMatchResults.get(tabData.sheetName);
+      const rowOnlyBlocked: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+      if (finalResults) {
+        for (const l of activeLangs) {
+          for (const idx of Array.from(fence[l].markedRowIndices)) {
+            const r = finalResults.get(idx);
+            if (!r || !getResultUrl(r, l)) rowOnlyBlocked[l]++;
+          }
+        }
+      }
+      const rowsLine = activeLangs
+        .filter(l => rowOnlyBlocked[l] > 0)
+        .map(l => `${l.toUpperCase()}=${rowOnlyBlocked[l]}`)
+        .join(", ");
+      if (titleLine || aiLine || rowsLine) {
+        log(`Tab "${tabData.sheetName}" sibling-scope fence: title-stage{${titleLine || "none"}}, AI-stage{${aiLine || "none"}}, rows-blocked-by-fence-only{${rowsLine || "none"}}`);
       }
     }
   }
