@@ -44,6 +44,33 @@ The system supports multi-pass processing, where newly matched URLs in each pass
 -   **Sibling-Scoped Matching + HE-Only Excludes (Task #65, Apr 2026)**: Two changes that together fix RU mapping for sibling pages under confirmed directory mappings while preventing false matches under HE-only subpaths. (1) `computeSiblingScope(sourceUrl, lang, tabPatterns)` finds the most-specific per-pair (sourceRoot → targetRoot) mapping covering a row's source URL. When more specific than `langSrcRoot`, the title-matcher narrows `allowedRoots` to just that target subtree, drops `refDepths` (calibrated to a broader root), and passes `siblingScopeNarrow=true` to relax the strict ambiguity-gap and "no shared segments" rejections — both calibrated against a wider candidate pool that the scoping has already eliminated. The AI matcher unions the same sibling-scope target indices into its same-section soft hint per batch (never replacing URL-bucket / breadcrumb hints). (2) An optional `Excludes` workbook sheet (`Tab,EN,FR,RU,AR` header; cells are HE source path prefixes split by newline/semicolon/comma) marks selected row+language combinations as `excluded-config` before matching, skipping them from the pipeline entirely. (3) After matching, an HE-only auto-detect pass groups still-unmatched rows by 3-segment HE source prefix and, for each (prefix, lang), marks them `excluded-auto` only when zero reference rows under that prefix have a translation for the language AND zero constructed candidates from a sample of ≤5 rows are present in the target inventory. Both exclusion methods surface in the saved match-method column without overwriting any actual match. Per-language sibling-scope telemetry (rows scoped, median scoped pool size, accepted matches) is logged at the end of the title-match stage.
 -   **Scalability**: The job-based architecture allows for asynchronous processing, separating long-running tasks from the main request-response cycle.
 
+## Diagnostics
+
+### Per-row "why" trace (Task #84)
+Every (row, lang) the matcher considers ends up with a `RowLangTrace` entry
+in `mapping_results.details[lang].trace` (JSONB; no schema change). Shape:
+`{ stage, outcome, topUrl?, topScore?, topN?: [{url, score} x ≤3], note? }`.
+
+`stage` values: `"title" | "title-semantic" | "ai" | "excluded"`.
+`outcome` values:
+- `matched` — committed
+- `no-candidates` — title stage produced nothing (note categorizes: no
+  inventory / no translation / top candidate score below floor); when a
+  candidate did exist below threshold, `topN` lists the top-3 URLs+scores
+- `below-threshold` — paired or single-lang similarity floor not met
+- `cross-validation` — paired-language tail-overlap check failed
+- `sibling-fence` — per-row scope fence rejected the URL
+- `section-mismatch` — pair-mapping section guard rejected (Task #84 fix)
+- `known-url` — candidate already a reference URL for this lang
+- `ai-null` / `ai-not-in-inventory` / `ai-already-used` / `ai-outside-root` /
+  `ai-section-mismatch` — AI rejection categories
+
+The latest diagnostic report (RU recall + false-positive analysis from job
+1f83dc53, top unmatched buckets, audit of all 31 new RU matches, expected
+fix impact) lives at `.local/diagnostics/recall-precision-report.md`. The
+`.local/` tree is gitignored at the system level so it does not appear in
+the git diff, but the file is always present in the workspace.
+
 ## External Dependencies
 
 ### Required Services

@@ -730,6 +730,12 @@ export interface RowLangTrace {
   outcome: TraceOutcome;
   topUrl?: string;
   topScore?: number;
+  // Task #84: top-N candidates the matcher actually considered for this
+  // (row, lang), URL + score. For "no-candidates" outcomes this lets a
+  // post-run query distinguish "no inventory hit at all" (empty topN) from
+  // "candidate existed but its score was below the floor" (topN populated
+  // with score < threshold). Cap N=3 to keep details payload bounded.
+  topN?: Array<{ url: string; score: number }>;
   note?: string;
 }
 
@@ -2761,6 +2767,12 @@ export function matchByTitleSemantic(
   sourceSegments?: Set<string>,
   disableSegmentRail: boolean = false,
   siblingScopeNarrow: boolean = false,
+  // Task #84: optional out-array. When provided, on a null return we push
+  // the top-3 scored candidates (by cosine) regardless of whether they
+  // cleared minCosine. Same purpose as the matchByTitle topNOut: lets the
+  // trace distinguish "no candidate close" from "candidate existed but
+  // below threshold".
+  topNOut?: Array<{ url: string; score: number }>,
 ): TitleMatchResult | null {
   if (!inventory.titleEmbeddings || inventory.titleEmbeddings.size === 0) return null;
 
@@ -2798,7 +2810,14 @@ export function matchByTitleSemantic(
     }
   });
 
-  if (!bestUrl) return null;
+  // Task #84: helper to push the top-3 scored candidates into topNOut on
+  // any null-return path. No-op when caller didn't ask.
+  const emitTopN = () => {
+    if (!topNOut) return;
+    const top3 = scored.slice().sort((a, b) => b.sim - a.sim).slice(0, 3);
+    for (const t of top3) topNOut.push({ url: t.url, score: t.sim });
+  };
+  if (!bestUrl) { emitTopN(); return null; }
 
   const confidenceFor = (s: number) => Math.min(Math.round(70 + s * 25), 95);
 
@@ -2832,6 +2851,7 @@ export function matchByTitleSemantic(
       }
     }
     log(`    Semantic match REJECTED (ambiguous): best=${bestSim.toFixed(3)} second=${secondBestSim.toFixed(3)} gap=${gap.toFixed(3)}`);
+    emitTopN();
     return null;
   }
 
@@ -2845,9 +2865,11 @@ export function matchByTitleSemantic(
         for (const seg of matchNorms) if (sourceSegments.has(seg)) shared++;
         if (shared === 0 && matchNorms.length > 2 && bestSim < 0.65) {
           log(`    Semantic match REJECTED (no shared segments AND cos<0.65): "${bestUrl}" cos=${bestSim.toFixed(3)}`);
+          emitTopN();
           return null;
         }
       } catch {
+        emitTopN();
         return null;
       }
     }
@@ -3130,10 +3152,19 @@ export function matchByTitle(
   sourceSegments?: Set<string>,
   disableSegmentRail: boolean = false,
   siblingScopeNarrow: boolean = false,
+  // Task #84: optional out-array. When provided, the matcher pushes the
+  // top-3 candidates by similarity (after root/depth filters) regardless
+  // of whether they cleared minSimilarity. Used by the title-stage
+  // no-candidates trace to distinguish "nothing came close" from
+  // "candidate existed but was below threshold".
+  topNOut?: Array<{ url: string; score: number }>,
 ): TitleMatchResult | null {
   let bestMatch: TitleMatchResult | null = null;
   let bestSimilarity = minSimilarity;
   let secondBestSimilarity = 0;
+  // Tracks top-3 candidates by sim, regardless of minSimilarity threshold.
+  // Only allocated when caller asked (topNOut !== undefined).
+  const tracked: Array<{ url: string; score: number }> | null = topNOut ? [] : null;
 
   const minDepth = refDepths && refDepths.length > 0 ? Math.min(...refDepths) - 2 : 0;
   const maxDepth = refDepths && refDepths.length > 0 ? Math.max(...refDepths) + 2 : Infinity;
@@ -3212,7 +3243,25 @@ export function matchByTitle(
     } else if (sim > secondBestSimilarity) {
       secondBestSimilarity = sim;
     }
+    // Task #84: track top-3 by score regardless of threshold (only when
+    // caller wants the trace; for hot-path matchByTitle calls without
+    // topNOut this is a no-op).
+    if (tracked) {
+      if (tracked.length < 3 || sim > tracked[tracked.length - 1].score) {
+        const dupIdx = tracked.findIndex(t => t.url === url);
+        if (dupIdx >= 0) {
+          if (sim > tracked[dupIdx].score) tracked[dupIdx].score = sim;
+        } else {
+          tracked.push({ url, score: sim });
+        }
+        tracked.sort((a, b) => b.score - a.score);
+        if (tracked.length > 3) tracked.length = 3;
+      }
+    }
   });
+  if (tracked && topNOut) {
+    for (const t of tracked) topNOut.push(t);
+  }
 
   const finalMatch = bestMatch as TitleMatchResult | null;
   if (finalMatch) {
@@ -3472,6 +3521,13 @@ export async function titleMatchUnmatched(
     } catch {}
 
     const rowMatches: Record<TargetLang, TitleMatchResult | null> = { en: null, fr: null, ru: null, ar: null };
+    // Task #84: per-(row, lang) top-3 candidates from the title/semantic
+    // matchers. Populated when matchByTitle/matchByTitleSemantic actually
+    // ran for that lang; consumed below in the no-candidates trace site so
+    // the JSONB row-level details can show what was actually considered.
+    const rowTopN: Record<TargetLang, Array<{ url: string; score: number }>> = {
+      en: [], fr: [], ru: [], ar: [],
+    };
     let hasMatch = false;
 
     for (const lang of langs) {
@@ -3536,7 +3592,11 @@ export async function titleMatchUnmatched(
           // root and excludes valid sibling pages whose depth differs.
           // (Stays gated on scopeNarrow since it pairs with effectiveRoots.)
           const effectiveDepths = scopeNarrow ? undefined : refDepths?.[lang];
-          rowMatches[lang] = matchByTitle(translated, inv, minSim, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow);
+          // Task #84: collect top-3 candidates so the no-candidates trace
+          // below can show "candidate existed but score N below floor F".
+          const cheapTopN: Array<{ url: string; score: number }> = [];
+          rowMatches[lang] = matchByTitle(translated, inv, minSim, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow, cheapTopN);
+          rowTopN[lang] = cheapTopN;
           if (rowMatches[lang]) {
             hasMatch = true;
             if (scopeNarrow) siblingTitleAccepted[lang]++;
@@ -3560,7 +3620,23 @@ export async function titleMatchUnmatched(
             const minCosBase = (lang === "ru" || lang === "ar") ? 0.55 : 0.58;
             const minCos = siblingScope ? minCosBase - 0.05 : minCosBase;
             const effectiveDepths = scopeNarrow ? undefined : refDepths?.[lang];
-            const semMatch = matchByTitleSemantic(trEmb, inv, minCos, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow);
+            // Task #84: collect top-3 semantic candidates. Merge with the
+            // cheap-pass topN (cheap ran first); cap at 3 by score.
+            const semTopN: Array<{ url: string; score: number }> = [];
+            const semMatch = matchByTitleSemantic(trEmb, inv, minCos, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow, semTopN);
+            if (semTopN.length > 0) {
+              const merged = [...rowTopN[lang], ...semTopN];
+              merged.sort((a, b) => b.score - a.score);
+              const seen = new Set<string>();
+              const dedup: Array<{ url: string; score: number }> = [];
+              for (const c of merged) {
+                if (seen.has(c.url)) continue;
+                seen.add(c.url);
+                dedup.push(c);
+                if (dedup.length === 3) break;
+              }
+              rowTopN[lang] = dedup;
+            }
             if (semMatch) {
               // Note: semanticAccepted is NOT incremented here — only after the
               // match survives cross-validation, knownUrl filter, and dedup at
@@ -3624,15 +3700,26 @@ export async function titleMatchUnmatched(
       const inv = inventories[l];
       const hadInv = inv && inv.titleIndex.size > 0;
       const hadTrans = translations[l].get(row.title) !== undefined;
+      const top = rowTopN[l];
       let note = "no inventory or roots for lang";
-      if (hadInv && hadTrans) note = "no candidate above title/semantic threshold";
+      if (hadInv && hadTrans) {
+        note = top.length > 0
+          ? `top candidate ${top[0].score.toFixed(3)} below floor`
+          : "no candidate above title/semantic threshold";
+      }
       else if (hadInv && !hadTrans) note = "title translation missing";
       else if (!hadInv) note = "no inventory for lang";
-      setTrace(traceOut, row.rowIndex, l, {
+      const entry: RowLangTrace = {
         stage: "title",
         outcome: "no-candidates",
         note,
-      });
+      };
+      if (top.length > 0) {
+        entry.topUrl = top[0].url;
+        entry.topScore = top[0].score;
+        entry.topN = top.slice(0, 3);
+      }
+      setTrace(traceOut, row.rowIndex, l, entry);
     }
 
     if (hasMatch) {
