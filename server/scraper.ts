@@ -753,7 +753,17 @@ export function setTrace(
     row = {};
     trace.set(rowIndex, row);
   }
-  // Always overwrite — later stages have more authoritative info than earlier ones.
+  // Task #84: later stages (e.g. AI) have more authoritative outcome info,
+  // but the title-stage `topN` evidence (top-3 inventory candidates the
+  // matcher actually saw) is still the answer to "what was considered for
+  // this row?" — independent of which stage produced the final outcome.
+  // Preserve `topN` from a prior entry when the new entry doesn't carry
+  // its own; this keeps the diagnostic context intact for unmatched rows
+  // that proceeded through both title and AI stages.
+  const prior = row[lang];
+  if (prior && prior.topN && prior.topN.length > 0 && (!entry.topN || entry.topN.length === 0)) {
+    entry = { ...entry, topN: prior.topN };
+  }
   row[lang] = entry;
 }
 
