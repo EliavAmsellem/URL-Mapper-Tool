@@ -3587,6 +3587,13 @@ export async function titleMatchUnmatched(
           if (!isUrlUnderTgtDir(rowMatches[lang]!.url, siblingScope.mappedTgtDir)) {
             const tgtPrefix = "/" + siblingScope.mappedTgtDir.join("/") + "/";
             log(`    Title FENCE REJECTED ${lang.toUpperCase()} (out-of-scope): "${rowMatches[lang]!.url}" not under ${tgtPrefix} (row ${row.rowIndex} src=${row.sourceUrl})`);
+            setTrace(traceOut, row.rowIndex, lang, {
+              stage: (rowMatches[lang]!.method || "").includes("semantic") ? "title-semantic" : "title",
+              outcome: "sibling-fence",
+              topUrl: rowMatches[lang]!.url,
+              topScore: rowMatches[lang]!.similarity,
+              note: `out of scope ${tgtPrefix}`,
+            });
             rowMatches[lang] = null;
             siblingFence[lang].rejected++;
             siblingFence[lang].markedRowIndices.add(row.rowIndex);
@@ -3609,6 +3616,23 @@ export async function titleMatchUnmatched(
       if (rowMatches[l] !== null) continue;
       if (siblingFence[l].markedRowIndices.has(row.rowIndex)) continue;
       siblingFence[l].nonFenceFailureRowIndices.add(row.rowIndex);
+      // Task #84: persist a "why" trace for every (row, lang) the title stage
+      // looked at and produced nothing. We don't have per-candidate scores
+      // here (matchByTitle returns null without telling us how close it got),
+      // so the trace records the broad outcome and the AI stage will overwrite
+      // it later with more specific info if it processes this row+lang.
+      const inv = inventories[l];
+      const hadInv = inv && inv.titleIndex.size > 0;
+      const hadTrans = translations[l].get(row.title) !== undefined;
+      let note = "no inventory or roots for lang";
+      if (hadInv && hadTrans) note = "no candidate above title/semantic threshold";
+      else if (hadInv && !hadTrans) note = "title translation missing";
+      else if (!hadInv) note = "no inventory for lang";
+      setTrace(traceOut, row.rowIndex, l, {
+        stage: "title",
+        outcome: "no-candidates",
+        note,
+      });
     }
 
     if (hasMatch) {
@@ -3664,14 +3688,36 @@ export async function titleMatchUnmatched(
             const bSem = (m[lb]!.method || "").includes("semantic");
             if (aSem && !bSem) {
               log(`    Cross-validation REJECTED ${la.toUpperCase()} (semantic) vs ${lb.toUpperCase()} (cheap kept): "${m[la]!.url}"`);
+              setTrace(traceOut, candidate.rowIndex, la, {
+                stage: "title-semantic", outcome: "cross-validation",
+                topUrl: m[la]!.url, topScore: m[la]!.similarity,
+                note: `no tail overlap with ${lb.toUpperCase()} cheap pick`,
+              });
               m[la] = null;
               rejected.crossValidation++;
             } else if (bSem && !aSem) {
               log(`    Cross-validation REJECTED ${lb.toUpperCase()} (semantic) vs ${la.toUpperCase()} (cheap kept): "${m[lb]!.url}"`);
+              setTrace(traceOut, candidate.rowIndex, lb, {
+                stage: "title-semantic", outcome: "cross-validation",
+                topUrl: m[lb]!.url, topScore: m[lb]!.similarity,
+                note: `no tail overlap with ${la.toUpperCase()} cheap pick`,
+              });
               m[lb] = null;
               rejected.crossValidation++;
             } else {
               log(`    Cross-validation REJECTED BOTH: ${la.toUpperCase()} "${m[la]!.url}" vs ${lb.toUpperCase()} "${m[lb]!.url}" (no tail overlap)`);
+              setTrace(traceOut, candidate.rowIndex, la, {
+                stage: (m[la]!.method || "").includes("semantic") ? "title-semantic" : "title",
+                outcome: "cross-validation",
+                topUrl: m[la]!.url, topScore: m[la]!.similarity,
+                note: `no tail overlap with ${lb.toUpperCase()}`,
+              });
+              setTrace(traceOut, candidate.rowIndex, lb, {
+                stage: (m[lb]!.method || "").includes("semantic") ? "title-semantic" : "title",
+                outcome: "cross-validation",
+                topUrl: m[lb]!.url, topScore: m[lb]!.similarity,
+                note: `no tail overlap with ${la.toUpperCase()}`,
+              });
               m[la] = null;
               m[lb] = null;
               rejected.crossValidation += 2;
@@ -3698,6 +3744,12 @@ export async function titleMatchUnmatched(
         const pairedFloor = scopedHere ? 0.55 : 0.60;
         if (shouldGate && m[l]!.similarity < pairedFloor) {
           log(`    Paired ${l.toUpperCase()} REJECTED (similarity ${m[l]!.similarity.toFixed(3)} < ${pairedFloor}, method=${m[l]!.method}): "${m[l]!.url}"`);
+          setTrace(traceOut, candidate.rowIndex, l, {
+            stage: (m[l]!.method || "").includes("semantic") ? "title-semantic" : "title",
+            outcome: "below-threshold",
+            topUrl: m[l]!.url, topScore: m[l]!.similarity,
+            note: `paired floor ${pairedFloor.toFixed(2)} not met`,
+          });
           m[l] = null;
           rejected.crossValidation++;
         }
@@ -3711,6 +3763,12 @@ export async function titleMatchUnmatched(
       const minSim = scopedHere ? minSimBase - 0.05 : minSimBase;
       if (m[l]!.similarity < minSim) {
         log(`    Single-lang ${l.toUpperCase()} REJECTED (similarity ${m[l]!.similarity.toFixed(3)} < ${minSim}): "${m[l]!.url}"`);
+        setTrace(traceOut, candidate.rowIndex, l, {
+          stage: (m[l]!.method || "").includes("semantic") ? "title-semantic" : "title",
+          outcome: "below-threshold",
+          topUrl: m[l]!.url, topScore: m[l]!.similarity,
+          note: `single-lang floor ${minSim.toFixed(2)} not met`,
+        });
         m[l] = null;
         rejected.crossValidation++;
       }
