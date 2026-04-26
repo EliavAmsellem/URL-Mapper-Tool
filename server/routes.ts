@@ -2732,29 +2732,32 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
         .filter(l => fence[l].aiRejected > 0)
         .map(l => `${l.toUpperCase()}=${fence[l].aiRejected}`)
         .join(", ");
-      // Row-level fence-only blocked counter (Task #70 acceptance criterion).
-      // A row counts as "blocked by fence only" for a given language if the
-      // sibling-scope fence rejected at least one candidate for that row in
-      // that language AND the row's final committed result still has no URL
-      // for that language. This isolates rows where the fence was the
-      // proximate cause of an unmatched cell, distinct from rows that simply
-      // had no candidate at all.
+      // Row-level fence impact counter (Task #70 acceptance criterion).
+      // Counts rows where the sibling-scope fence rejected at least one
+      // candidate AND the row's final committed result still has no URL for
+      // that language. This is intentionally a proxy for "fence caused this
+      // blank" — it does not distinguish between rows whose only candidate
+      // was fence-rejected vs rows that had additional non-fence failures
+      // alongside the fence rejection. The value is still useful: it is a
+      // strict upper bound on "rows blanked by the fence", and zero here is
+      // a guarantee that no fence rejection contributed to an unmatched
+      // cell. The log key reflects that proxy semantics honestly.
       const finalResults = globalMatchResults.get(tabData.sheetName);
-      const rowOnlyBlocked: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
+      const rowsUnmatchedAfterFence: Record<TargetLang, number> = { en: 0, fr: 0, ru: 0, ar: 0 };
       if (finalResults) {
         for (const l of activeLangs) {
           for (const idx of Array.from(fence[l].markedRowIndices)) {
             const r = finalResults.get(idx);
-            if (!r || !getResultUrl(r, l)) rowOnlyBlocked[l]++;
+            if (!r || !getResultUrl(r, l)) rowsUnmatchedAfterFence[l]++;
           }
         }
       }
       const rowsLine = activeLangs
-        .filter(l => rowOnlyBlocked[l] > 0)
-        .map(l => `${l.toUpperCase()}=${rowOnlyBlocked[l]}`)
+        .filter(l => rowsUnmatchedAfterFence[l] > 0)
+        .map(l => `${l.toUpperCase()}=${rowsUnmatchedAfterFence[l]}`)
         .join(", ");
       if (titleLine || aiLine || rowsLine) {
-        log(`Tab "${tabData.sheetName}" sibling-scope fence: title-stage{${titleLine || "none"}}, AI-stage{${aiLine || "none"}}, rows-blocked-by-fence-only{${rowsLine || "none"}}`);
+        log(`Tab "${tabData.sheetName}" sibling-scope fence: title-stage{${titleLine || "none"}}, AI-stage{${aiLine || "none"}}, rows-unmatched-after-fence-reject{${rowsLine || "none"}}`);
       }
     }
   }
