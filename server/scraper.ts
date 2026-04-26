@@ -2773,6 +2773,12 @@ export function matchByTitleSemantic(
   // trace distinguish "no candidate close" from "candidate existed but
   // below threshold".
   topNOut?: Array<{ url: string; score: number }>,
+  // Task #84: optional rejection-reason out-bag. Set to { ambiguous: true }
+  // when the matcher returns null because top-2 candidates were within the
+  // close-tie gap and could not be disambiguated by source-segment overlap.
+  // The caller's no-candidates trace sweep uses this to emit an `ambiguous`
+  // outcome instead of folding it into the generic `no-candidates` bucket.
+  metaOut?: { ambiguous?: boolean; rejectedReason?: string },
 ): TitleMatchResult | null {
   if (!inventory.titleEmbeddings || inventory.titleEmbeddings.size === 0) return null;
 
@@ -2852,6 +2858,7 @@ export function matchByTitleSemantic(
     }
     log(`    Semantic match REJECTED (ambiguous): best=${bestSim.toFixed(3)} second=${secondBestSim.toFixed(3)} gap=${gap.toFixed(3)}`);
     emitTopN();
+    if (metaOut) { metaOut.ambiguous = true; metaOut.rejectedReason = `gap ${gap.toFixed(3)} < 0.03 between top-2 semantic candidates`; }
     return null;
   }
 
@@ -3158,6 +3165,10 @@ export function matchByTitle(
   // no-candidates trace to distinguish "nothing came close" from
   // "candidate existed but was below threshold".
   topNOut?: Array<{ url: string; score: number }>,
+  // Task #84: see matchByTitleSemantic for purpose. Set to ambiguous=true
+  // when the matcher returns null because top-2 candidates were within
+  // gap < 0.05 and could not be disambiguated by source-segment overlap.
+  metaOut?: { ambiguous?: boolean; rejectedReason?: string },
 ): TitleMatchResult | null {
   let bestMatch: TitleMatchResult | null = null;
   let bestSimilarity = minSimilarity;
@@ -3316,6 +3327,7 @@ export function matchByTitle(
         }
       }
       log(`    Title match REJECTED (ambiguous): "${translatedTitle}" best=${bestSimilarity.toFixed(3)} second=${secondBestSimilarity.toFixed(3)} gap=${gap.toFixed(3)}`);
+      if (metaOut) { metaOut.ambiguous = true; metaOut.rejectedReason = `gap ${gap.toFixed(3)} < 0.05 between top-2 title candidates`; }
       return null;
     }
 
@@ -3528,6 +3540,11 @@ export async function titleMatchUnmatched(
     const rowTopN: Record<TargetLang, Array<{ url: string; score: number }>> = {
       en: [], fr: [], ru: [], ar: [],
     };
+    // Task #84: per-(row, lang) rejection metadata from the title/semantic
+    // matchers. Currently records gap-based ambiguity rejections, which
+    // should surface as `ambiguous` in the trace rather than collapsing
+    // into the generic `no-candidates` bucket.
+    const rowMeta: Partial<Record<TargetLang, { ambiguous?: boolean; rejectedReason?: string }>> = {};
     let hasMatch = false;
 
     for (const lang of langs) {
@@ -3595,8 +3612,13 @@ export async function titleMatchUnmatched(
           // Task #84: collect top-3 candidates so the no-candidates trace
           // below can show "candidate existed but score N below floor F".
           const cheapTopN: Array<{ url: string; score: number }> = [];
-          rowMatches[lang] = matchByTitle(translated, inv, minSim, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow, cheapTopN);
+          const cheapMeta: { ambiguous?: boolean; rejectedReason?: string } = {};
+          rowMatches[lang] = matchByTitle(translated, inv, minSim, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow, cheapTopN, cheapMeta);
           rowTopN[lang] = cheapTopN;
+          if (cheapMeta.ambiguous) {
+            (rowMeta[lang] = rowMeta[lang] || {}).ambiguous = true;
+            rowMeta[lang]!.rejectedReason = cheapMeta.rejectedReason;
+          }
           if (rowMatches[lang]) {
             hasMatch = true;
             if (scopeNarrow) siblingTitleAccepted[lang]++;
@@ -3623,7 +3645,12 @@ export async function titleMatchUnmatched(
             // Task #84: collect top-3 semantic candidates. Merge with the
             // cheap-pass topN (cheap ran first); cap at 3 by score.
             const semTopN: Array<{ url: string; score: number }> = [];
-            const semMatch = matchByTitleSemantic(trEmb, inv, minCos, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow, semTopN);
+            const semMeta: { ambiguous?: boolean; rejectedReason?: string } = {};
+            const semMatch = matchByTitleSemantic(trEmb, inv, minCos, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow, semTopN, semMeta);
+            if (semMeta.ambiguous) {
+              (rowMeta[lang] = rowMeta[lang] || {}).ambiguous = true;
+              rowMeta[lang]!.rejectedReason = semMeta.rejectedReason;
+            }
             if (semTopN.length > 0) {
               const merged = [...rowTopN[lang], ...semTopN];
               merged.sort((a, b) => b.score - a.score);
@@ -3701,8 +3728,16 @@ export async function titleMatchUnmatched(
       const hadInv = inv && inv.titleIndex.size > 0;
       const hadTrans = translations[l].get(row.title) !== undefined;
       const top = rowTopN[l];
+      const meta = rowMeta[l];
+      // Task #84: distinguish ambiguity (top-2 within close-tie gap) from
+      // generic "no candidates above threshold". The matchers set
+      // metaOut.ambiguous when their gap-based rejection branch fires.
+      let outcome: TraceOutcome = "no-candidates";
       let note = "no inventory or roots for lang";
-      if (hadInv && hadTrans) {
+      if (meta?.ambiguous) {
+        outcome = "ambiguous";
+        note = meta.rejectedReason ?? "top-2 candidates within close-tie gap";
+      } else if (hadInv && hadTrans) {
         note = top.length > 0
           ? `top candidate ${top[0].score.toFixed(3)} below floor`
           : "no candidate above title/semantic threshold";
@@ -3711,7 +3746,7 @@ export async function titleMatchUnmatched(
       else if (!hadInv) note = "no inventory for lang";
       const entry: RowLangTrace = {
         stage: "title",
-        outcome: "no-candidates",
+        outcome,
         note,
       };
       if (top.length > 0) {
