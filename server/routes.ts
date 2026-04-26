@@ -3132,6 +3132,16 @@ async function processJob(jobId: string, _threshold: number, control: JobControl
           if (trace.topUrl) traceEntry.topUrl = trace.topUrl;
           if (typeof trace.topScore === "number") traceEntry.topScore = Math.round(trace.topScore * 1000) / 1000;
           if (trace.note) traceEntry.note = trace.note;
+          // Task #84: persist actual top inventory candidates (≤3) so post-run
+          // diagnostics can answer "what did the matcher see?" not just "what
+          // was the best score?". Bounded by the matcher (top 3 by score) and
+          // each entry is small ({url, score}), keeping JSONB row size modest.
+          if (trace.topN && trace.topN.length > 0) {
+            traceEntry.topN = trace.topN.slice(0, 3).map(c => ({
+              url: c.url,
+              score: Math.round(c.score * 1000) / 1000,
+            }));
+          }
           entry.trace = traceEntry;
         }
         perLangDetails[l] = entry;
