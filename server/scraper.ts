@@ -886,7 +886,13 @@ function computeRootMapping(
       const sNorm = normalizeSegment(src[sIdx]);
       const tNorm = normalizeSegment(tgt[tIdx]);
       if (sNorm !== tNorm) {
-        segMap.set(sNorm, tgt[tIdx]);
+        // Only record positional segment mappings when at least one shared tail
+        // segment anchors the alignment. Without a confirmed tail anchor the
+        // positional pairing is speculative: for RU/AR transliterated slugs it
+        // frequently pairs unrelated segments and pollutes the segment map.
+        if (tailMatches > 0) {
+          segMap.set(sNorm, tgt[tIdx]);
+        }
       }
     }
 
@@ -1635,7 +1641,11 @@ export async function crawlDirectory(
           } else {
             let effectiveTitle = pageTitle || $("h1").first().text().trim();
             if (effectiveTitle) {
-              effectiveTitle = effectiveTitle.replace(/\s*\|\s*ביטוח לאומי\s*$/, "").trim();
+              effectiveTitle = effectiveTitle
+                .replace(/\s*\|\s*ביטוח לאומי\s*$/, "")
+                .replace(/\s*\|\s*Национальное страхование\s*$/i, "")
+                .replace(/\s*\|\s*المؤسسة للتأمين الوطني\s*$/u, "")
+                .trim();
               inventory.titleIndex.set(url, effectiveTitle);
             }
           }
@@ -1761,7 +1771,11 @@ export async function verifySeedUrls(
       addToInventory(inventory, url);
       let effectiveTitle = pageTitle || $("h1").first().text().trim();
       if (effectiveTitle) {
-        effectiveTitle = effectiveTitle.replace(/\s*\|\s*ביטוח לאומי\s*$/, "").trim();
+        effectiveTitle = effectiveTitle
+          .replace(/\s*\|\s*ביטוח לאומי\s*$/, "")
+          .replace(/\s*\|\s*Национальное страхование\s*$/i, "")
+          .replace(/\s*\|\s*المؤسسة للتأمين الوطني\s*$/u, "")
+          .trim();
         inventory.titleIndex.set(url, effectiveTitle);
       }
       stats.added++;
@@ -2940,7 +2954,7 @@ export function lastMeaningfulUrlContext(url: string): string | undefined {
 async function translateWithOpenAI(
   text: string,
   targetLang: TargetLang,
-  urlContext: string,
+  urlContext: string | undefined,
   signal?: AbortSignal,
 ): Promise<string | null> {
   const client = getEmbedClient();
@@ -2948,6 +2962,9 @@ async function translateWithOpenAI(
   const langName: Record<TargetLang, string> = { en: "English", fr: "French", ru: "Russian", ar: "Arabic" };
   const { signal: combined, cleanup } = combineSignals(signal, 12000);
   try {
+    const userContent = urlContext
+      ? `Source URL path: ${urlContext}. Use this only as a disambiguation hint for short or ambiguous words.\n\nHebrew title: ${text}`
+      : `Hebrew title: ${text}`;
     const resp = await client.chat.completions.create({
       model: "gpt-4.1-mini",
       temperature: 0,
@@ -2958,7 +2975,7 @@ async function translateWithOpenAI(
         },
         {
           role: "user",
-          content: `Source URL path: ${urlContext}. Use this only as a disambiguation hint for short or ambiguous words.\n\nHebrew title: ${text}`,
+          content: userContent,
         },
       ],
     }, { signal: combined });
@@ -3003,18 +3020,30 @@ async function translateText(
   signal?: AbortSignal,
   urlContext?: string,
 ): Promise<string | null> {
+  const cacheKey = `${text}|${targetLang}`;
+
+  // Short Hebrew text + URL context → OpenAI with disambiguation hint (existing behaviour).
   const useUrlContext =
     !!urlContext && URL_CONTEXT_TRANSLATION_ENABLED && isShortHebrewText(text);
-  const cacheKey = `${text}|${targetLang}`;
-  if (!useUrlContext && translationCache.has(cacheKey)) return translationCache.get(cacheKey)!;
 
-  if (useUrlContext) {
-    const aiResult = await translateWithOpenAI(text, targetLang, urlContext!, signal);
-    if (aiResult) return aiResult;
+  // For Cyrillic/Arabic targets, GTX quality is significantly weaker than for
+  // Latin targets (EN/FR). Route ALL RU/AR texts through OpenAI when the key is
+  // available, using the URL context as an optional hint when present.
+  const isCrossScript = targetLang === "ru" || targetLang === "ar";
+  const useOpenAi = useUrlContext || (isCrossScript && !!getEmbedClient());
+
+  if (!useOpenAi && translationCache.has(cacheKey)) return translationCache.get(cacheKey)!;
+
+  if (useOpenAi) {
+    const aiResult = await translateWithOpenAI(text, targetLang, urlContext, signal);
+    if (aiResult) {
+      if (!useUrlContext) {
+        // Cache RU/AR translations so subsequent calls skip OpenAI.
+        translationCache.set(cacheKey, aiResult);
+      }
+      return aiResult;
+    }
     if (signal?.aborted) return null;
-    // Fall through to GTX as a fallback, but still bypass cache for this call.
-    const gtxFallback = await translateWithGTX(text, "he", targetLang, signal);
-    return gtxFallback ?? null;
   }
 
   const result = await translateWithGTX(text, "he", targetLang, signal);
@@ -3118,10 +3147,13 @@ export async function batchTranslate(
     }
 
     const batch = needsTranslation.slice(i, i + TRANSLATE_CONCURRENCY);
+    const isCrossScriptBatch = targetLang === "ru" || targetLang === "ar";
     const batchResults = await Promise.all(
       batch.map((text) => {
         const useCtx = usesUrlContext(text);
-        const ctx = useCtx ? contextByText.get(text) : undefined;
+        // For RU/AR, always forward the URL context as a hint even for longer texts
+        // so OpenAI can use the path slug as a disambiguation signal.
+        const ctx = (useCtx || isCrossScriptBatch) ? contextByText.get(text) : undefined;
         return translateText(text, targetLang, signal, ctx).then((r) => ({ text, result: r, bypassCache: useCtx }));
       })
     );
@@ -4701,13 +4733,46 @@ export async function aiMatchUnmatched(
         if (sectionHintSet.has(i)) hintAvailable.push(inventoryEntries[l][i]);
         else restAvailable.push(inventoryEntries[l][i]);
       }
-      const available = [...hintAvailable, ...restAvailable];
-      const availableCount = available.length;
-      const shown = available.length <= INVENTORY_PER_LANG_CAP
-        ? available
-        : available.slice(0, INVENTORY_PER_LANG_CAP);
-      const truncatedNote = available.length > shown.length
-        ? `\n... (${available.length - shown.length} more available; not shown to keep prompt size sane)`
+      const availableCount = hintAvailable.length + restAvailable.length;
+
+      // When restAvailable exceeds what we can show, rank by max titleSimilarity
+      // against the batch's translated titles so the most-relevant candidates
+      // surface instead of an arbitrary crawl-order head-of-list. For RU/AR this
+      // is critical: crawl order is deterministic but unrelated to relevance.
+      const restCap = Math.max(0, INVENTORY_PER_LANG_CAP - hintAvailable.length);
+      let shownRest: string[];
+      if (restAvailable.length > restCap) {
+        const batchTranslatedTitles = batch
+          .map(r => allTranslations[l].get(r.title) ?? "")
+          .filter(Boolean);
+        if (batchTranslatedTitles.length > 0) {
+          const scored = restAvailable.map(entry => {
+            let bestSim = 0;
+            try {
+              const obj = JSON.parse(entry) as { title?: string };
+              if (obj.title) {
+                for (const bt of batchTranslatedTitles) {
+                  const sim = titleSimilarity(bt, obj.title);
+                  if (sim > bestSim) bestSim = sim;
+                }
+              }
+            } catch {}
+            return { entry, score: bestSim };
+          });
+          scored.sort((a, b) => b.score - a.score);
+          shownRest = scored.slice(0, restCap).map(s => s.entry);
+        } else {
+          shownRest = restAvailable.slice(0, restCap);
+        }
+      } else {
+        shownRest = restAvailable;
+      }
+
+      const available = [...hintAvailable, ...shownRest];
+      const shown = available;
+      const droppedRest = restAvailable.length - shownRest.length;
+      const truncatedNote = droppedRest > 0
+        ? `\n... (${droppedRest} more available; not shown to keep prompt size sane)`
         : "";
       // When the sibling-scope hard fence is active for this lang, label the
       // block STRICTLY RESTRICTED so the model treats it as a closed-world
