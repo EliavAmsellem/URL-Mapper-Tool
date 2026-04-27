@@ -4051,14 +4051,7 @@ export async function titleMatchUnmatched(
   return { matches: results, siblingFence, loosenedAccepted };
 }
 
-// Task #92 — lowered from 15 to 10 in response to Phase 1 trace data.
-// On job 418f371e the model omitted 309/834 (37%) AI-eligible (row,lang)
-// pairs from its responses — i.e. asked about 15 rows, returned suggestions
-// for ~10. Smaller batches reduce the per-batch cognitive load on the model
-// and bring the omission rate down without proportionally raising API spend
-// (we still pack the same total rows into ~50% more batches; concurrency
-// hides the latency).
-const AI_BATCH_SIZE = 10;
+const AI_BATCH_SIZE = 15;
 const AI_CONCURRENCY = 2;
 
 interface AiMatchInput {
