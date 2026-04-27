@@ -4051,7 +4051,14 @@ export async function titleMatchUnmatched(
   return { matches: results, siblingFence, loosenedAccepted };
 }
 
-const AI_BATCH_SIZE = 15;
+// Task #92 — lowered from 15 to 10 in response to Phase 1 trace data.
+// On job 418f371e the model omitted 309/834 (37%) AI-eligible (row,lang)
+// pairs from its responses — i.e. asked about 15 rows, returned suggestions
+// for ~10. Smaller batches reduce the per-batch cognitive load on the model
+// and bring the omission rate down without proportionally raising API spend
+// (we still pack the same total rows into ~50% more batches; concurrency
+// hides the latency).
+const AI_BATCH_SIZE = 10;
 const AI_CONCURRENCY = 2;
 
 interface AiMatchInput {
@@ -5157,9 +5164,23 @@ Return ONLY the JSON array, no other text.`;
 
     if (batchMatches === 0) {
       consecutiveZeroBatches++;
-      // Guard: don't early-exit too soon. Require we've already worked
-      // through at least 1/3 of the planned batches (or 8, whichever is
-      // larger), so a slow start on a long run doesn't bail prematurely.
+      // Task #92 — the zero-match early-exit was the dominant source of AI
+      // candidate starvation: on job 418f371e it accounted for 434/834 (52%)
+      // of AI-eligible (row,lang) pairs being silently skipped (BTL benefits
+      // alone lost 285 rows this way). The rationale for the original cutoff
+      // — "save API budget when the model can't find anything" — turns out
+      // to be wrong on real data: low title overlap in one section is a
+      // poor predictor of recall in subsequent sections of the same tab,
+      // because each batch operates on a different rows-by-section slice
+      // with a different visible-inventory window.
+      //
+      // We keep the counter increment for log visibility (and the
+      // context-length and consecutive-auth-failure aborts elsewhere in
+      // commitBatch are untouched — those are real outage signals, not
+      // recall-vs-spend trade-offs). But we no longer return earlyExit
+      // for zero-match batches: the post-loop never-launched-trace pass
+      // in the driver becomes a no-op when nothing triggers earlyExit,
+      // so behavior is equivalent to "process every batch".
       const minBatchesBeforeEarlyExit = Math.max(8, Math.floor(batches.length / 3));
       if (
         consecutiveZeroBatches >= ZERO_BATCH_EARLY_EXIT &&
@@ -5167,8 +5188,7 @@ Return ONLY the JSON array, no other text.`;
         batchIdx < batches.length - 1
       ) {
         const remaining = batches.length - batchIdx - 1;
-        log(`  AI matching EARLY EXIT: ${consecutiveZeroBatches} consecutive batches yielded 0 matches after ${batchIdx + 1}/${batches.length} batches. Skipping remaining ${remaining} batches.`);
-        return { earlyExit: true };
+        log(`  AI matching: ${consecutiveZeroBatches} consecutive zero-match batches at ${batchIdx + 1}/${batches.length} (${remaining} remaining). Continuing — early-exit disabled per Task #92.`);
       }
     } else {
       consecutiveZeroBatches = 0;
