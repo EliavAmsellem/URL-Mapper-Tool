@@ -9,22 +9,6 @@ channel = "stable-24_05"
 localPort = 5000
 externalPort = 80
 
-[[ports]]
-localPort = 15994
-externalPort = 3003
-
-[[ports]]
-localPort = 15995
-externalPort = 3002
-
-[[ports]]
-localPort = 15996
-externalPort = 3000
-
-[[ports]]
-localPort = 15997
-externalPort = 3001
-
 [env]
 PORT = "5000"
 
@@ -59,12 +43,3 @@ waitForPort = 5000
 stack = "MOCKUP_JS"
 mockupState = "FULLSTACK"
 integrations = ["javascript_openai_ai_integrations:2.0.0"]
-
-[postMerge]
-path = "scripts/post-merge.sh"
-timeoutMs = 180000
-
-[userenv]
-
-[userenv.shared]
-AI_PROMPT_DUMP = "1"

@@ -4,17 +4,16 @@ import {
   mappingJobs, mappingResults, translationCache,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, and, inArray, asc } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 
 export interface IStorage {
   createJob(job: InsertMappingJob): Promise<MappingJob>;
   getJob(id: string): Promise<MappingJob | undefined>;
-  getStuckJobs(): Promise<MappingJob[]>;
   updateJob(id: string, updates: Partial<InsertMappingJob>): Promise<MappingJob | undefined>;
   createResult(result: InsertMappingResult): Promise<MappingResult>;
   createResults(results: InsertMappingResult[]): Promise<void>;
   deleteResultsByJob(jobId: string): Promise<void>;
-  getResultsByJob(jobId: string, sinceCount?: number): Promise<MappingResult[]>;
+  getResultsByJob(jobId: string): Promise<MappingResult[]>;
   getCachedTranslation(sourceText: string, targetLang: string): Promise<string | null>;
   getCachedTranslations(targetLang: string): Promise<Map<string, string>>;
   saveCachedTranslations(entries: { sourceText: string; targetLang: string; translatedText: string }[]): Promise<void>;
@@ -31,20 +30,8 @@ export class DatabaseStorage implements IStorage {
     return job;
   }
 
-  async getStuckJobs(): Promise<MappingJob[]> {
-    return db.select().from(mappingJobs)
-      .where(inArray(mappingJobs.status, ["processing", "pending"]));
-  }
-
   async updateJob(id: string, updates: Partial<InsertMappingJob>): Promise<MappingJob | undefined> {
-    // Always touch updatedAt so timestamps reflect the latest state change
-    // (status transitions, currentStep updates, save-phase progress). This
-    // is what makes "how long did the save phase take?" answerable from the
-    // DB alone, without trawling logs.
-    const [updated] = await db.update(mappingJobs)
-      .set({ ...updates, updatedAt: new Date() })
-      .where(eq(mappingJobs.id, id))
-      .returning();
+    const [updated] = await db.update(mappingJobs).set(updates).where(eq(mappingJobs.id, id)).returning();
     return updated;
   }
 
@@ -65,18 +52,8 @@ export class DatabaseStorage implements IStorage {
     await db.delete(mappingResults).where(eq(mappingResults.jobId, jobId));
   }
 
-  async getResultsByJob(jobId: string, sinceCount?: number): Promise<MappingResult[]> {
-    // Stable, deterministic ordering by (sheet_name, row_index) so the
-    // delta-polling cursor (`since=<count>`) can OFFSET safely. Without an
-    // explicit ORDER BY, Postgres is free to return rows in any order and
-    // an offset would skip arbitrary rows on each poll.
-    const q = db.select().from(mappingResults)
-      .where(eq(mappingResults.jobId, jobId))
-      .orderBy(asc(mappingResults.sheetName), asc(mappingResults.rowIndex));
-    if (typeof sinceCount === "number" && sinceCount > 0) {
-      return q.offset(sinceCount);
-    }
-    return q;
+  async getResultsByJob(jobId: string): Promise<MappingResult[]> {
+    return db.select().from(mappingResults).where(eq(mappingResults.jobId, jobId));
   }
 
   async getCachedTranslation(sourceText: string, targetLang: string): Promise<string | null> {
