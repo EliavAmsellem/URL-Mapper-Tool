@@ -6,3 +6,9 @@ id = "f1cu3yXVWPCsUUFOuY3-d"
 uri = "file://benefits_results.xlsx"
 type = "table"
 title = "Benefits URL Mapping Results (82 URLs, 43 new matches)"
+
+[[outputs]]
+id = "oOJJq5X--2S4Ub7RvL4lv"
+uri = "file://attached_assets/exports/btl-RU-1325matches.xlsx"
+type = "table"
+title = "BTL Russian Mapping — 1325 matches"

@@ -5,6 +5,7 @@ export interface JobStatus {
   totalUrls: number;
   processedUrls: number;
   matchedUrls: number;
+  prefilledUrls: number;
   targetLanguages: string[];
   currentStep: string;
   createdAt: string;
@@ -23,15 +24,24 @@ export interface MappingResultRow {
   arabicUrl: string | null;
   confidenceEn: number | null;
   confidenceFr: number | null;
+  confidenceRu: number | null;
+  confidenceAr: number | null;
   matchMethodEn: string | null;
   matchMethodFr: string | null;
+  matchMethodRu: string | null;
+  matchMethodAr: string | null;
   details: any;
 }
 
-export async function uploadFile(file: File, languages: string[] = ["en", "fr"]): Promise<{ jobId: string; totalUrls: number; sheets: string[] }> {
+export async function uploadFile(
+  file: File,
+  languages: string[] = ["en", "fr", "ru", "ar"],
+  crawlPageCap: number | "auto" = "auto",
+): Promise<{ jobId: string; totalUrls: number; sheets: string[] }> {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("languages", languages.join(","));
+  formData.append("crawlPageCap", String(crawlPageCap));
 
   const res = await fetch("/api/upload", { method: "POST", body: formData });
   if (!res.ok) {
@@ -59,8 +69,12 @@ export async function getJobStatus(jobId: string): Promise<JobStatus> {
   return res.json();
 }
 
-export async function getJobResults(jobId: string): Promise<MappingResultRow[]> {
-  const res = await fetch(`/api/jobs/${jobId}/results`);
+export async function getJobResults(
+  jobId: string,
+  since?: number,
+): Promise<MappingResultRow[]> {
+  const qs = typeof since === "number" && since > 0 ? `?since=${since}` : "";
+  const res = await fetch(`/api/jobs/${jobId}/results${qs}`);
   if (!res.ok) throw new Error("Failed to fetch results");
   return res.json();
 }

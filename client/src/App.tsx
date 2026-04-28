@@ -2,28 +2,51 @@ import { useState, useCallback } from "react";
 import { FileUpload } from "@/components/dashboard/file-upload";
 import { ProcessingView } from "@/components/dashboard/processing-view";
 import { ResultsView } from "@/components/dashboard/results-view";
-import { Globe, Languages, Sparkles, Settings } from "lucide-react";
+import { Globe, Languages, Sparkles } from "lucide-react";
 import { uploadFile, startJob } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import heroBg from "./assets/hero-bg.png";
+
+const ALL_LANGS = [
+  { code: "en", label: "English", flag: "EN" },
+  { code: "fr", label: "French", flag: "FR" },
+  { code: "ru", label: "Russian", flag: "RU" },
+  { code: "ar", label: "Arabic", flag: "AR" },
+] as const;
 
 function App() {
   const [appState, setAppState] = useState<"idle" | "uploading" | "processing" | "results">("idle");
   const [file, setFile] = useState<File | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selectedLangs, setSelectedLangs] = useState<Set<string>>(new Set(["en", "fr", "ru", "ar"]));
+  const [crawlPageCap, setCrawlPageCap] = useState<number | "auto">("auto");
 
   const handleFileSelect = (selectedFile: File) => {
     setFile(selectedFile);
     setError(null);
   };
 
+  const toggleLang = (code: string) => {
+    setSelectedLangs(prev => {
+      const next = new Set(prev);
+      if (next.has(code)) {
+        next.delete(code);
+      } else {
+        next.add(code);
+      }
+      return next;
+    });
+  };
+
   const handleStartProcessing = async () => {
-    if (!file) return;
+    if (!file || selectedLangs.size === 0) return;
     setError(null);
     setAppState("uploading");
 
     try {
-      const result = await uploadFile(file, ["en", "fr"]);
+      const langs = ALL_LANGS.filter(l => selectedLangs.has(l.code)).map(l => l.code);
+      const result = await uploadFile(file, langs, crawlPageCap);
       setJobId(result.jobId);
       await startJob(result.jobId, 85);
       setAppState("processing");
@@ -42,7 +65,22 @@ function App() {
     setFile(null);
     setJobId(null);
     setError(null);
+    setSelectedLangs(new Set(["en", "fr", "ru", "ar"]));
+    setCrawlPageCap("auto");
   };
+
+  const CAP_OPTIONS: { value: number | "auto"; label: string }[] = [
+    { value: "auto", label: "Auto" },
+    { value: 1000, label: "1k" },
+    { value: 3000, label: "3k" },
+    { value: 6000, label: "6k" },
+    { value: 10000, label: "10k" },
+  ];
+
+  const headerLangLabel = ALL_LANGS
+    .filter(l => selectedLangs.has(l.code))
+    .map(l => l.flag)
+    .join(", ") || "None";
 
   return (
     <div className="min-h-screen bg-background relative overflow-hidden font-sans text-foreground">
@@ -63,10 +101,10 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-4">
-            <button className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors px-3 py-1.5 rounded-lg hover:bg-muted/50" data-testid="button-languages">
+            <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground px-3 py-1.5 rounded-lg" data-testid="button-languages">
               <Languages className="w-4 h-4" />
-              <span>Target: EN, FR</span>
-            </button>
+              <span>Target: {headerLangLabel}</span>
+            </div>
           </div>
         </header>
 
@@ -86,6 +124,64 @@ function App() {
               <div className="space-y-6">
                 <FileUpload onFileSelect={handleFileSelect} isProcessing={appState === "uploading"} />
 
+                {file && appState === "idle" && (
+                  <div className="space-y-4">
+                    <div className="bg-card/80 backdrop-blur-sm border border-border rounded-xl p-5 max-w-md mx-auto" data-testid="panel-language-selection">
+                      <p className="text-sm font-medium text-foreground mb-3">Select target languages to map</p>
+                      <div className="flex flex-wrap justify-center gap-2">
+                        {ALL_LANGS.map(lang => {
+                          const active = selectedLangs.has(lang.code);
+                          return (
+                            <button
+                              key={lang.code}
+                              onClick={() => toggleLang(lang.code)}
+                              data-testid={`toggle-lang-${lang.code}`}
+                              className={cn(
+                                "px-4 py-2 rounded-lg text-sm font-medium border transition-all duration-200",
+                                active
+                                  ? "bg-primary text-primary-foreground border-primary shadow-sm shadow-primary/20"
+                                  : "bg-muted/50 text-muted-foreground border-border hover:border-primary/40 hover:text-foreground"
+                              )}
+                            >
+                              {lang.flag} — {lang.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {selectedLangs.size === 0 && (
+                        <p className="text-xs text-destructive mt-3" data-testid="text-lang-warning">
+                          Select at least one language to continue
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="bg-card/80 backdrop-blur-sm border border-border rounded-xl p-5 max-w-md mx-auto" data-testid="panel-crawl-cap">
+                      <p className="text-sm font-medium text-foreground mb-1">Crawl depth (pages per section)</p>
+                      <p className="text-xs text-muted-foreground mb-3">Higher = more inventory, slower runs. Auto scales to your file size.</p>
+                      <div className="flex flex-wrap justify-center gap-2">
+                        {CAP_OPTIONS.map(opt => {
+                          const active = crawlPageCap === opt.value;
+                          return (
+                            <button
+                              key={String(opt.value)}
+                              onClick={() => setCrawlPageCap(opt.value)}
+                              data-testid={`toggle-cap-${opt.value}`}
+                              className={cn(
+                                "px-4 py-2 rounded-lg text-sm font-medium border transition-all duration-200",
+                                active
+                                  ? "bg-primary text-primary-foreground border-primary shadow-sm shadow-primary/20"
+                                  : "bg-muted/50 text-muted-foreground border-border hover:border-primary/40 hover:text-foreground"
+                              )}
+                            >
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {error && (
                   <div className="text-destructive text-sm bg-destructive/10 p-3 rounded-lg" data-testid="text-error">
                     {error}
@@ -95,8 +191,14 @@ function App() {
                 {file && appState === "idle" && (
                   <button
                     onClick={handleStartProcessing}
+                    disabled={selectedLangs.size === 0}
                     data-testid="button-start"
-                    className="group inline-flex items-center gap-2 px-8 py-3 bg-primary text-primary-foreground rounded-full font-medium shadow-lg shadow-primary/25 hover:bg-primary/90 hover:scale-105 transition-all duration-300"
+                    className={cn(
+                      "group inline-flex items-center gap-2 px-8 py-3 rounded-full font-medium shadow-lg transition-all duration-300",
+                      selectedLangs.size > 0
+                        ? "bg-primary text-primary-foreground shadow-primary/25 hover:bg-primary/90 hover:scale-105"
+                        : "bg-muted text-muted-foreground shadow-none cursor-not-allowed"
+                    )}
                   >
                     <Sparkles className="w-4 h-4 group-hover:animate-pulse" />
                     Start Mapping Process
