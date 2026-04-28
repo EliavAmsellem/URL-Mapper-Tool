@@ -138,7 +138,7 @@ function App() {
                   </div>
                 </div>
 
-                <FileUpload onFileSelect={handleFileSelect} isProcessing={appState === "uploading"} />
+                <FileUpload onFileSelect={handleFileSelect} onFileClear={() => setFile(null)} isProcessing={appState === "uploading"} />
 
                 {error && (
                   <div className="text-destructive text-sm bg-destructive/10 p-3 rounded-lg" data-testid="text-error">

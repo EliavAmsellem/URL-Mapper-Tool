@@ -5,10 +5,11 @@ import { cn } from "@/lib/utils";
 
 interface FileUploadProps {
   onFileSelect: (file: File) => void;
+  onFileClear?: () => void;
   isProcessing?: boolean;
 }
 
-export function FileUpload({ onFileSelect, isProcessing }: FileUploadProps) {
+export function FileUpload({ onFileSelect, onFileClear, isProcessing }: FileUploadProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
 
@@ -58,6 +59,7 @@ export function FileUpload({ onFileSelect, isProcessing }: FileUploadProps) {
   const clearFile = (e: React.MouseEvent) => {
     e.stopPropagation();
     setSelectedFile(null);
+    onFileClear?.();
   };
 
   return (
