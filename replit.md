@@ -21,55 +21,17 @@ LinguaMap employs a sophisticated pattern-based URL construction engine. This en
 1.  **Pattern Learning**: Identifies source and target roots and segment-level translations from reference URLs.
 2.  **URL Construction**: Generates candidate URLs from ALL applicable per-pair root mappings (not just the longest match) via `constructAllTargetUrls`, handling cases where reference data has conflicting mappings for the same source subsection.
 3.  **Crawl Inventory Matching**: Prioritizes matching against an inventory of URLs discovered by crawling target language sections, including SharePoint-specific directory discovery. This also includes global deduplication to ensure each target URL is mapped only once.
-3a. **Cross-Script Tab Detection** (`detectCrossScriptLangs`): Per (tab, lang), measures how many reference (sourceUrl, targetUrl) pairs share at least one normalized path segment. When fewer than 30% of ≥5 pairs share any segment (e.g. EN sources `/benefits/Disability` vs RU inventory `/Benefits_ru/Nehut_ru/` Hebrew transliterations), the lang is flagged "cross-script" and the title-match "no shared segments → reject" safety rail is disabled for that lang in matchByTitle / matchByTitleSemantic. The ambiguity-gap rejection still applies, so spurious matches are still filtered.
-3b. **Pass 1.5 — Alternate-Link Harvest** (`harvestAlternateLinks`): For rows that pattern+crawl couldn't place, fetch each source URL once (concurrency 6, capped at 1500/tab) and extract `<link rel="alternate" hreflang="…">` tags plus `<a hreflang="…">` switcher anchors. Resolved hrefs are validated against the per-lang crawl inventory; only inventory hits become matches (tagged `alternate-link`, confidence 95). This stage runs only on tabs where at least one active lang is flagged cross-script, bounding the HTTP cost. Harvested matches feed back into reference rows for subsequent multi-passes, where `learnTabPatterns` then discovers new segment translations from the harvested pairs. The harvest uses a per-job `AlternateLinkCache` (Map<sourceUrl, parsedAlternates>) shared across passes so identical source URLs are fetched at most once per job. Apply phase gates on per-row needs so that when multiple rows share the same source URL, only rows that actually need a given language can claim that lang's inventory URL — preventing one row from starving its siblings via the global `usedUrls` dedup. Telemetry logged: attempted, fetched, cacheHits, pagesWithAnyAlternate, pagesWithInventoryHit, plus per-lang accepted and rejected-not-in-inventory counts.
 4.  **Batch HEAD Verification**: Validates constructed URLs using HTTP HEAD requests (10 concurrent, 12s timeout, 200ms delay between batches), filtering out non-existent or invalid URLs. Source-derived crawl seeds are also generated from all constructed candidates for orphan page discovery.
-5.  **Title-Based Matching**: Extracts page titles from `<title>` tags with `<h1>` fallback (for SharePoint sites with empty titles), translates them (Hebrew→EN/FR/RU/AR via GTX), and fuzzy-matches against the crawl inventory with section awareness using Jaccard word overlap. Common site-specific suffixes (e.g., `| ביטוח לאומי`) are stripped for cleaner matching. **Semantic fallback**: rows the Jaccard pass cannot match are scored with OpenAI `text-embedding-3-small` cosine similarity. To get sharp scores, the pipeline pivots through the GTX translation and embeds both the *translated* source title and the inventory titles in the **same** target language (cross-lingual HE↔target embeddings measured at ~0.4 even for true matches; same-language embeddings measured at 0.66–1.00). Reuses all root/depth/ambiguity/URL-segment gates and tags accepted matches as `inventory-title-semantic`. Disabled cleanly when `OPENAI_API_KEY` is absent or `LINGUAMAP_DISABLE_SEMANTIC=1`. Hard cap at 50,000 titles per job to bound cost.
-6.  **AI-Powered Matching**: As a final fallback, an AI agent (GPT-5-mini) suggests matches from the crawl inventory for URLs still unmatched, emphasizing accuracy over completeness. The prompt is tuned per active language: examples and pattern context are filtered to active target languages so single-language runs aren't distracted by inactive ones; the "already used" list is sized at 300 per language with all generic index pages always included (preventing the model from re-proposing `/Pages/default.aspx` as a fallback); and a Russian/Arabic addendum tells the model that those URL slugs are Latin transliterations of Hebrew (so the Cyrillic/Arabic page title shown after `  |  ` is the only reliable signal). A per-language summary is logged at the end of the AI stage (attempted, accepted, rejected by reason) for prompt-tuning visibility.
+5.  **Title-Based Matching**: Extracts page titles from `<title>` tags with `<h1>` fallback (for SharePoint sites with empty titles), translates them (Hebrew→EN/FR), and fuzzy-matches against the crawl inventory with section awareness. Common site-specific suffixes (e.g., `| ביטוח לאומי`) are stripped for cleaner matching.
+6.  **AI-Powered Matching**: As a final fallback, an AI agent (GPT-5-mini) suggests matches from the crawl inventory for URLs still unmatched, emphasizing accuracy over completeness.
 
 The system supports multi-pass processing, where newly matched URLs in each pass act as additional reference data to refine patterns, improving subsequent matching attempts. Data structures like `TabPatterns` and `RootMapping` store learned patterns and root transformations.
-
-**Recursive coverage + inventory-mined segments** (Task #64): when the per-tab coverage diagnostic detects a "missing subtree" (≥50 predicted target URLs absent from inventory under the same 3-segment prefix), that prefix path is captured as a *feedback anchor* and persisted across passes. On the next pass, `matchTab` HEAD-probes each anchor's `path/` and `path/Pages/default.aspx`; surviving URLs are added to crawl seeds AND their section root is added to `anchorRoots` so `crawlDirectory`'s scope-prefix gate doesn't drop them. Independently, after each per-tab inventory is built, `mineSegmentsFromInventory` pairs unmatched HE source URLs with target-language inventory URLs of equal inner-segment length sharing at least one identical positional segment; for each pairing it votes on the differing positions and promotes (heSeg→targetSeg) when supported by ≥2 distinct pairings with a strict winner over runner-up. Mined segments merge into `tabPatterns.segmentMap` (without overwriting confirmed entries) and accumulate into a job-wide `globalMinedSegments` pool that's re-injected into `globalPatterns` after every rebuild from confirmed pairs. The multi-pass stop condition continues if a pass produced new matches OR new mined segments OR new feedback anchors.
 
 ### System Design Choices
 -   **Database**: PostgreSQL is used as the primary database for storing job details, mapping results, and translation cache. Drizzle ORM manages schema and interactions.
 -   **Concurrency**: Batch HEAD requests and title translations are handled with controlled concurrency and rate limiting.
 -   **Error Handling**: AI matching includes retry logic with exponential backoff and early termination for persistent errors.
--   **AI Matching Strategy (Task #55, Apr 2026)**: AI matching shows the model the FULL unused per-language inventory (cap 4000 entries), with same-section candidates listed first as a soft hint rather than a hard filter. Inventory-membership and already-used remain hard rejects; outside-root and section-context checks are hard rejects for EN/FR but warnings only for RU/AR (whose URL slugs are Latin transliterations and frequently break the section-translation map). HEAD-verification of AI picks was removed entirely — picks come from the crawled inventory, so existence is already proven, and re-checking HEAD breaks on sites like BTL that return 4xx for valid pages.
--   **Crawler Inventory Filter (Task #56, Apr 2026)**: SharePoint folder-listing UI URLs (`/Pages/Forms/AllItems.aspx`) are no longer ingested into the crawl inventory. They all share the generic site-wide title regardless of language and accounted for ~14% of the RU inventory shown to the AI matcher, drowning real candidates and pushing the model toward null. The crawler now (a) does not enqueue them when expanding `/Pages/default.aspx` parents, (b) filters them out of `extractLinks` results, and (c) defensively removes them from the inventory if reached directly. An env-controlled one-shot prompt dump (`AI_PROMPT_DUMP=1` writes `/tmp/ai_prompt_dump_<ts>.txt`) plus per-batch translation samples and a once-per-run inventory-title-health log were added in `aiMatchUnmatched` for future debugging.
--   **AI Same-Section Hint Fix for Nested Roots (Apr 2026)**: The AI matcher's same-section hint mechanism was producing `hint=0` for almost every Russian section because it bucketed inventory URLs by ONLY the first path segment after the learned target root. For BTL the RU root learns as `/RussianHomePage/Odot_ru/`, so first-after-root segments end up being wrapper words like `mitsuiZchuyot` / `iruimBeChaim`, never the literal section name (e.g. `HaravotBarzel1`) that lives several levels deeper. The literal-source-section fallback in `targetSectionsForSource` then queried an empty bucket. Fix: bucket each inventory URL under EVERY non-trivial segment after the root (deduped per URL, skipping `pages`, `default.aspx`, file-extension and numeric-only segments). A new `[diag] <LANG> section buckets built` log lists the 5 largest buckets per active language for verification.
--   **URL-Context-Aware Title Translation (Apr 2026)**: For short, ambiguous Hebrew titles (≤3 tokens), the translator now optionally receives the deepest meaningful URL segment as a disambiguation hint and routes through OpenAI gpt-4.1-mini instead of GTX. Example: "חוזרים" in `/Insurance/HozrimBituah/...` should now translate as "circulars/директивы" instead of "returnees/возвращение". Cache is bypassed for short-text + URL-context calls so the URL hint cannot poison the shared (text, lang) cache. Toggle via env `LINGUAMAP_URL_CONTEXT_TRANSLATION` (default ON).
--   **AI Prompt Rule Tuning (Apr 2026)**: Rule 7 ("when in doubt return null") was loosened to add an explicit exception: when the translated source title clearly maps to a single inventory candidate's title, prefer committing over null. A new rule 9 reinforces this for RU/AR specifically — opaque Latin-transliteration URL slugs do not block a confident title match, since the inventory is closed-world. The hard rejects (verbatim-from-inventory, fresh-only, no fallback to `/Pages/default.aspx`) remain in force.
--   **Job Concurrency & Diagnostics (Task #77, Apr 2026)**: Only one job runs at a time per server process — matchers share global in-process caches (translation, alternate-link, inventory) reset by `clearAllCaches()` at the start of every `processJob`, so two concurrent jobs would corrupt those caches. To keep one user from accidentally killing another user's run, `/api/jobs/:id/start` now **refuses** (HTTP 409) to start a new job while another is active; the operator can pass `?force=1` (or `force: true` in the body) to fall back to the legacy "cancel the other job and start anyway" behaviour. The Stop button (`/api/jobs/:id/stop`) only cancels the job whose ID is in the URL, never others. `processJob` runs inside a try/finally that always clears the `activeJobs` entry — even on throw, where it also flips the job to `status="error"` with the exception message — so stale entries can't accumulate. On boot, `reconcileStuckJobs()` marks any job left in `processing`/`pending` (orphaned by a previous server restart) as `status="error"` with a "please re-run" `currentStep` so the UI doesn't show phantom progress. `storage.updateJob()` now always touches `mapping_jobs.updated_at`, so the gap between the last `currentStep` write and `status="completed"` is the save-phase duration. Persisted diagnostics: RU/AR confidence and match-method are saved alongside EN/FR (new columns `confidence_ru/ar`, `match_method_ru/ar`), and `mapping_results.details` JSONB is populated per language with `{stage, reason, scoped, crossScript}` — `stage` and `reason` are derived from the match-method string, the two flags are captured at `setResultMatch` time. The user-facing Excel export is unchanged; this metadata is for in-DB auditing only. Indexes added: btree on `mapping_results.job_id` and a unique index on `translation_cache(source_text, source_lang, target_lang)`.
--   **Sibling-Scoped Matching + HE-Only Excludes (Task #65, Apr 2026)**: Two changes that together fix RU mapping for sibling pages under confirmed directory mappings while preventing false matches under HE-only subpaths. (1) `computeSiblingScope(sourceUrl, lang, tabPatterns)` finds the most-specific per-pair (sourceRoot → targetRoot) mapping covering a row's source URL. When more specific than `langSrcRoot`, the title-matcher narrows `allowedRoots` to just that target subtree, drops `refDepths` (calibrated to a broader root), and passes `siblingScopeNarrow=true` to relax the strict ambiguity-gap and "no shared segments" rejections — both calibrated against a wider candidate pool that the scoping has already eliminated. The AI matcher unions the same sibling-scope target indices into its same-section soft hint per batch (never replacing URL-bucket / breadcrumb hints). (2) An optional `Excludes` workbook sheet (`Tab,EN,FR,RU,AR` header; cells are HE source path prefixes split by newline/semicolon/comma) marks selected row+language combinations as `excluded-config` before matching, skipping them from the pipeline entirely. (3) After matching, an HE-only auto-detect pass groups still-unmatched rows by 3-segment HE source prefix and, for each (prefix, lang), marks them `excluded-auto` only when zero reference rows under that prefix have a translation for the language AND zero constructed candidates from a sample of ≤5 rows are present in the target inventory. Both exclusion methods surface in the saved match-method column without overwriting any actual match. Per-language sibling-scope telemetry (rows scoped, median scoped pool size, accepted matches) is logged at the end of the title-match stage.
 -   **Scalability**: The job-based architecture allows for asynchronous processing, separating long-running tasks from the main request-response cycle.
-
-## Diagnostics
-
-### Per-row "why" trace (Task #84)
-Every (row, lang) the matcher considers ends up with a `RowLangTrace` entry
-in `mapping_results.details[lang].trace` (JSONB; no schema change). Shape:
-`{ stage, outcome, topUrl?, topScore?, topN?: [{url, score} x ≤3], note? }`.
-
-`stage` values: `"title" | "title-semantic" | "ai" | "excluded"`.
-`outcome` values:
-- `matched` — committed
-- `no-candidates` — title stage produced nothing (note categorizes: no
-  inventory / no translation / top candidate score below floor); when a
-  candidate did exist below threshold, `topN` lists the top-3 URLs+scores
-- `below-threshold` — paired or single-lang similarity floor not met
-- `cross-validation` — paired-language tail-overlap check failed
-- `sibling-fence` — per-row scope fence rejected the URL
-- `section-mismatch` — pair-mapping section guard rejected (Task #84 fix)
-- `known-url` — candidate already a reference URL for this lang
-- `ai-null` / `ai-not-in-inventory` / `ai-already-used` / `ai-outside-root` /
-  `ai-section-mismatch` — AI rejection categories
-
-The latest diagnostic report (RU recall + false-positive analysis from job
-1f83dc53, top unmatched buckets, audit of all 31 new RU matches, expected
-fix impact) lives at `.local/diagnostics/recall-precision-report.md`. The
-`.local/` tree is gitignored at the system level so it does not appear in
-the git diff, but the file is always present in the workspace.
 
 ## External Dependencies
 
@@ -87,35 +49,4 @@ the git diff, but the file is always present in the workspace.
 
 ### External Web Requests
 -   HTTP HEAD requests are made to verify the existence of constructed target URLs.
--   Google Translate (GTX endpoint) is used for Hebrew→EN/FR/RU/AR title translations.
-
-### Optional `Seeds` sheet
-Workbooks may include an extra sheet named `Seeds` (or `Seed`, case-insensitive) to override the per-tab crawl anchor for any target language. This is useful when the data sheet has zero reference rows for that language (the planner would otherwise skip the tab) or when the auto-derived anchors leak into unrelated sections.
-
-Layout:
-- Row 1 = header. Recognized columns: `Tab` (or `Sheet`/`Name`), `EN`, `FR`, `RU`, `AR`. If headers are missing, columns are read positionally as `Tab, EN, FR, RU, AR`.
-- One row per data tab. Cells may contain a full URL or a path; both are normalized to a path. Empty cells = no override.
-
-Example:
-| Tab | EN | RU |
-|---|---|---|
-| BTL About | | /RussianHomePage/Odot_ru/ |
-| BTL war updates | | /RussianHomePage/Odot_ru/mitsuiZchuyot/IruimBeChaim/HaravotBarzel1/ |
-
-When a `(tab, lang)` cell is filled, that path becomes the **sole** crawl anchor for that tab + language; auto-inferred anchors falling outside it are dropped (no cross-tab leakage), and the "no learned root → skip whole tab" early-return is bypassed. Empty cells fall back to today's auto-derivation. Tab names that don't match any data sheet are warned about and ignored. If the `Seeds` sheet is absent, the workbook works exactly as before.
-
-### Performance tuning
-
-- `LINGUAMAP_AI_PARALLEL` (default `1`): number of OpenAI batch calls
-  to overlap during the AI matching phase. The default of `1` runs the
-  AI stage as a strict serial pipeline, which guarantees byte-identical
-  match output across runs (the canonical mode for reproducibility runs
-  and regression comparisons). Setting it to `3`–`5` overlaps the
-  network latency of the OpenAI calls and is recommended for routine
-  production runs where the wall-clock win matters more than
-  bit-for-bit determinism. Commit-time hard rejects keep the output
-  *correct* in either mode, but the model's visible inventory differs
-  when batches are in flight, so picks can diverge.
-
-### Target Languages
-The system supports four target languages: English (EN), French (FR), Russian (RU), and Arabic (AR). Source language is always Hebrew. Excel columns: 0=Title, 1=Source, 2=EN, 3=FR, 4=RU, 5=AR. The `TargetLang` type alias (`"en" | "fr" | "ru" | "ar"`) and helper functions (`langRoot`, `langSrcRoot`, `langCrawlScope`, `getResultUrl`, `getResultConf`, `getResultMethod`, `setResultMatch`, `clearResultMatch`, `emptyBatchResult`) centralize language-specific access to pattern data and match results, avoiding duplicated EN/FR ternaries.
+-   Google Translate (GTX endpoint) is used for Hebrew→EN/FR title translations.
