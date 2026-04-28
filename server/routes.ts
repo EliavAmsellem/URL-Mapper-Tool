@@ -359,7 +359,8 @@ export async function registerRoutes(
       const job = await storage.getJob(jobId);
       if (!job) return res.status(404).json({ message: "Job not found" });
 
-      const threshold = parseInt(req.body?.threshold as string) || 85;
+      const parsedThreshold = parseInt(req.body?.threshold as string, 10);
+      const threshold = Number.isFinite(parsedThreshold) ? Math.max(0, Math.min(100, parsedThreshold)) : 85;
 
       // Single-tenant safeguard: matchers share global in-process caches
       // (translation cache, alternate-link cache, inventory caches) reset by
@@ -505,17 +506,17 @@ export async function registerRoutes(
           const result = sheetResults.get(rowNumber - 1);
           if (!result) return;
 
-          if (result.englishUrl && !row.getCell(3).value) {
-            row.getCell(3).value = result.englishUrl;
+          if (result.englishUrl && !row.getCell(COL_EN).value) {
+            row.getCell(COL_EN).value = result.englishUrl;
           }
-          if (result.frenchUrl && !row.getCell(4).value) {
-            row.getCell(4).value = result.frenchUrl;
+          if (result.frenchUrl && !row.getCell(COL_FR).value) {
+            row.getCell(COL_FR).value = result.frenchUrl;
           }
-          if (result.russianUrl && !row.getCell(5).value) {
-            row.getCell(5).value = result.russianUrl;
+          if (result.russianUrl && !row.getCell(COL_RU).value) {
+            row.getCell(COL_RU).value = result.russianUrl;
           }
-          if (result.arabicUrl && !row.getCell(6).value) {
-            row.getCell(6).value = result.arabicUrl;
+          if (result.arabicUrl && !row.getCell(COL_AR).value) {
+            row.getCell(COL_AR).value = result.arabicUrl;
           }
         });
       }
@@ -557,6 +558,14 @@ export async function registerRoutes(
 
 const DB_BATCH_SIZE = 200;
 const MAX_PASSES = 3;
+
+// Expected workbook column layout (1-based for ExcelJS getCell; 0-based for array index = COL_* - 1)
+const COL_TITLE  = 1;  // A: page title
+const COL_SOURCE = 2;  // B: source (HE) URL
+const COL_EN     = 3;  // C: English URL
+const COL_FR     = 4;  // D: French URL
+const COL_RU     = 5;  // E: Russian URL
+const COL_AR     = 6;  // F: Arabic URL
 
 interface RowData {
   rowIndex: number;
@@ -631,12 +640,12 @@ function parseSheet(
 
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
-    const title = (row[0] || "").toString().trim();
-    const rawSource = (row[1] || "").toString().trim();
-    const existingEn = (row[2] || "").toString().trim();
-    const existingFr = (row[3] || "").toString().trim();
-    const existingRu = (row[4] || "").toString().trim();
-    const existingAr = (row[5] || "").toString().trim();
+    const title      = (row[COL_TITLE  - 1] || "").toString().trim();
+    const rawSource  = (row[COL_SOURCE - 1] || "").toString().trim();
+    const existingEn = (row[COL_EN     - 1] || "").toString().trim();
+    const existingFr = (row[COL_FR     - 1] || "").toString().trim();
+    const existingRu = (row[COL_RU     - 1] || "").toString().trim();
+    const existingAr = (row[COL_AR     - 1] || "").toString().trim();
 
     let sourceUrl = rawSource;
     if (!sourceUrl.startsWith("http") && sourceUrl.includes("|")) {

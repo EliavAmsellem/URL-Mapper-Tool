@@ -29,6 +29,8 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
   const [job, setJob] = useState<JobStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<"all" | "matched" | "unmatched">("all");
+  const [displayLimit, setDisplayLimit] = useState(100);
+  const PAGE_SIZE = 100;
 
   useEffect(() => {
     let cancelled = false;
@@ -110,7 +112,7 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
         {(["all", "matched", "unmatched"] as const).map((f) => (
           <button
             key={f}
-            onClick={() => setFilter(f)}
+            onClick={() => { setFilter(f); setDisplayLimit(PAGE_SIZE); }}
             data-testid={`button-filter-${f}`}
             className={cn(
               "px-3 py-1.5 text-xs font-medium rounded-full border transition-colors capitalize",
@@ -139,7 +141,7 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
-              {filtered.slice(0, 100).map((row, idx) => {
+              {filtered.slice(0, displayLimit).map((row, idx) => {
                 const confs = activeLangs.map((l) => num(row[LANG_META[l].confKey]) || 0);
                 const bestConfidence = confs.length ? Math.max(...confs) : 0;
                 const method =
@@ -200,9 +202,17 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
             </tbody>
           </table>
         </div>
-        {filtered.length > 100 && (
-          <div className="p-4 text-center text-sm text-muted-foreground border-t border-border">
-            Showing first 100 of {filtered.length} results. Download the Excel file for the full dataset.
+        {filtered.length > displayLimit && (
+          <div className="p-4 text-center border-t border-border">
+            <p className="text-xs text-muted-foreground mb-2">
+              Showing {displayLimit} of {filtered.length} results
+            </p>
+            <button
+              onClick={() => setDisplayLimit((n) => n + PAGE_SIZE)}
+              className="px-4 py-1.5 text-xs font-medium rounded-lg border border-border bg-card text-muted-foreground hover:bg-muted/50 transition-colors"
+            >
+              Load more
+            </button>
           </div>
         )}
       </div>

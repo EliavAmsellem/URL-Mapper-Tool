@@ -226,10 +226,24 @@ function combineSignals(parent: AbortSignal | undefined, timeoutMs: number): { s
   };
 }
 
+function isPrivateHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h === "::1") return true;
+  if (/^127\./.test(h)) return true;
+  if (/^169\.254\./.test(h)) return true;
+  if (/^10\./.test(h)) return true;
+  if (/^192\.168\./.test(h)) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(h)) return true;
+  if (/^fe80:/i.test(h) || /^f[cd]/i.test(h)) return true;
+  return false;
+}
+
 function parseHttpUrl(url: string): URL | null {
   if (typeof url !== "string" || !/^https?:\/\//i.test(url)) return null;
   try {
-    return new URL(url);
+    const parsed = new URL(url);
+    if (isPrivateHost(parsed.hostname)) return null;
+    return parsed;
   } catch {
     return null;
   }
@@ -1472,6 +1486,11 @@ type FetchOutcome = { html: string | null; reason: "ok" | "http_4xx" | "http_5xx
 
 async function fetchPageDetailed(url: string, signal?: AbortSignal): Promise<FetchOutcome> {
   if (signal?.aborted) return { html: null, reason: "aborted" };
+  try {
+    if (isPrivateHost(new URL(url).hostname)) return { html: null, reason: "http_4xx", status: 403 };
+  } catch {
+    return { html: null, reason: "error" };
+  }
   const { signal: combined, cleanup } = combineSignals(signal, CRAWL_TIMEOUT);
   try {
     const response = await fetch(url, {
