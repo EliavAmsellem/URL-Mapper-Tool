@@ -2,7 +2,6 @@ import { motion } from "framer-motion";
 import { Check, Loader2, Search, GitMerge, Save, Brain, Square } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useEffect, useState, useRef } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { getJobStatus, stopJob, type JobStatus } from "@/lib/api";
 
 interface ProcessingViewProps {
@@ -30,87 +29,73 @@ function parseStep(currentStep: string): { phase: string; tabName: string | null
   if (currentStep === "saving") {
     return { phase: "saving", tabName: null, passNum: null };
   }
-  if (currentStep === "saving-partial") {
-    return { phase: "saving-partial", tabName: null, passNum: null };
-  }
-  if (currentStep === "stopping") {
-    return { phase: "stopping", tabName: null, passNum: null };
-  }
   return { phase: currentStep, tabName: null, passNum: null };
 }
 
-const TERMINAL_STATUSES = new Set(["completed", "error", "cancelled"]);
-
 export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
+  const [job, setJob] = useState<JobStatus | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
-  const [isStopping, setIsStopping] = useState(false);
+  const pollRef = useRef<NodeJS.Timeout | null>(null);
   const prevStepRef = useRef<string>("");
   const prevMatchedRef = useRef<number>(0);
-  const completedRef = useRef<boolean>(false);
 
-  // React Query polling: refetch every 2s while the job is processing,
-  // and automatically stop polling once the status is terminal (completed
-  // / error / cancelled). Cleanup on unmount is handled by the hook —
-  // no manual setInterval / clearInterval book-keeping required.
-  const { data: job } = useQuery<JobStatus>({
-    queryKey: ["/api/jobs", jobId],
-    queryFn: () => getJobStatus(jobId),
-    refetchInterval: (query) => {
-      const status = query.state.data?.status;
-      if (status && TERMINAL_STATUSES.has(status)) return false;
-      return 2000;
-    },
-    refetchIntervalInBackground: true,
-    refetchOnMount: "always",
-  });
+  const steps = [
+    { id: "learning", title: "Learning Patterns", icon: Search, desc: "Extracting URL patterns from reference rows..." },
+    { id: "matching", title: "URL Matching", icon: GitMerge, desc: "Constructing & verifying target URLs..." },
+    { id: "ai-matching", title: "AI Matching", icon: Brain, desc: "Using AI to match remaining URLs..." },
+    { id: "saving", title: "Saving Results", icon: Save, desc: "Writing results to database..." },
+  ];
 
-  // Drive the existing log-derivation effect from the polled query data.
-  // We compare against refs so we only push a log line when the upstream
-  // value changes between polls — same behavior as the previous setInterval.
   useEffect(() => {
-    if (!job) return;
+    const poll = async () => {
+      try {
+        const status = await getJobStatus(jobId);
+        setJob(status);
 
-    const { phase, tabName, passNum } = parseStep(job.currentStep);
-    const stepKey = job.currentStep;
+        const { phase, tabName, passNum } = parseStep(status.currentStep);
+        const stepKey = status.currentStep;
 
-    if (stepKey !== prevStepRef.current) {
-      prevStepRef.current = stepKey;
+        if (stepKey !== prevStepRef.current) {
+          prevStepRef.current = stepKey;
 
-      if (phase === "matching" && tabName) {
-        const passLabel = passNum && passNum > 1 ? ` (Pass ${passNum})` : "";
-        setLogs(prev => [`Processing tab: "${tabName}"${passLabel}`, ...prev].slice(0, 10));
-      } else if (phase === "ai-matching") {
-        const aiMsg = tabName ? `AI matching: "${tabName}"` : "Starting AI matching for unmatched URLs...";
-        setLogs(prev => [aiMsg, ...prev].slice(0, 10));
-      } else if (phase === "saving") {
-        setLogs(prev => ["Saving results to database...", ...prev].slice(0, 10));
-      } else if (phase === "saving-partial") {
-        setLogs(prev => ["Saving partial results...", ...prev].slice(0, 10));
-      } else if (phase === "stopping") {
-        setLogs(prev => ["Stopping job, finalizing partial results...", ...prev].slice(0, 10));
+          if (phase === "matching" && tabName) {
+            const passLabel = passNum && passNum > 1 ? ` (Pass ${passNum})` : "";
+            setLogs(prev => [`Processing tab: "${tabName}"${passLabel}`, ...prev].slice(0, 10));
+          } else if (phase === "ai-matching") {
+            const aiMsg = tabName ? `AI matching: "${tabName}"` : "Starting AI matching for unmatched URLs...";
+            setLogs(prev => [aiMsg, ...prev].slice(0, 10));
+          } else if (phase === "saving") {
+            setLogs(prev => ["Saving results to database...", ...prev].slice(0, 10));
+          }
+        }
+
+        if (status.matchedUrls > prevMatchedRef.current) {
+          const diff = status.matchedUrls - prevMatchedRef.current;
+          prevMatchedRef.current = status.matchedUrls;
+          setLogs(prev => [`Found ${diff} new matches (${status.matchedUrls} total)`, ...prev].slice(0, 10));
+        }
+
+        if (status.status === "completed" || status.status === "error" || status.status === "cancelled") {
+          if (pollRef.current) clearInterval(pollRef.current);
+          if (status.status === "completed") {
+            setLogs(prev => [`Completed! ${status.matchedUrls} matches found across ${status.totalUrls} URLs`, ...prev].slice(0, 10));
+          } else if (status.status === "cancelled") {
+            setLogs(prev => [`Job stopped. ${status.matchedUrls} matches found so far.`, ...prev].slice(0, 10));
+          }
+          setTimeout(onComplete, 1000);
+        }
+      } catch (err) {
+        console.error("Poll error:", err);
       }
-    }
+    };
 
-    if (job.currentStep === "stopping" || job.currentStep === "saving-partial") {
-      setIsStopping(true);
-    }
+    poll();
+    pollRef.current = setInterval(poll, 2000);
 
-    if (job.matchedUrls > prevMatchedRef.current) {
-      const diff = job.matchedUrls - prevMatchedRef.current;
-      prevMatchedRef.current = job.matchedUrls;
-      setLogs(prev => [`Found ${diff} new matches (${job.matchedUrls} total)`, ...prev].slice(0, 10));
-    }
-
-    if (TERMINAL_STATUSES.has(job.status) && !completedRef.current) {
-      completedRef.current = true;
-      if (job.status === "completed") {
-        setLogs(prev => [`Completed! ${job.matchedUrls} matches found across ${job.totalUrls} URLs`, ...prev].slice(0, 10));
-      } else if (job.status === "cancelled") {
-        setLogs(prev => [`Job stopped. ${job.matchedUrls} matches found so far.`, ...prev].slice(0, 10));
-      }
-      setTimeout(onComplete, 1000);
-    }
-  }, [job, onComplete]);
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, [jobId, onComplete]);
 
   const progress = job ? (job.totalUrls > 0 ? Math.round((job.processedUrls / job.totalUrls) * 100) : 0) : 0;
 
@@ -144,7 +129,7 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
         <div className="flex justify-between text-xs text-muted-foreground font-mono">
           <span data-testid="text-progress">{progress}% Complete</span>
           <span data-testid="text-status">
-            {job?.status === "completed" ? "Done!" : job?.status === "error" ? "Error" : job?.status === "cancelled" ? "Stopped" : isStopping ? "Stopping..." : currentTabName ? `Working on: ${currentTabName}` : "Running..."}
+            {job?.status === "completed" ? "Done!" : job?.status === "error" ? "Error" : currentTabName ? `Working on: ${currentTabName}` : "Running..."}
           </span>
         </div>
       </div>
@@ -199,31 +184,22 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
 
         {job && (
           <div className="flex justify-between items-center text-sm text-muted-foreground">
-            <div className="flex items-center gap-4">
-              <span data-testid="text-matches">Matches found: <strong className="text-foreground">{job.matchedUrls}</strong></span>
-              {job.prefilledUrls > 0 && (
-                <span data-testid="text-prefilled">Already mapped: <strong className="text-foreground">{job.prefilledUrls}</strong></span>
-              )}
-            </div>
+            <span data-testid="text-matches">Matches found: <strong className="text-foreground">{job.matchedUrls}</strong></span>
             <div className="flex items-center gap-3">
               <span>File: <strong className="text-foreground">{job.fileName}</strong></span>
               {job.status === "processing" && (
                 <button
                   data-testid="button-stop-job"
-                  disabled={isStopping}
                   onClick={async () => {
-                    setIsStopping(true);
                     try {
                       await stopJob(jobId);
                       setLogs(prev => ["Stopping job...", ...prev].slice(0, 10));
-                    } catch {
-                      setIsStopping(false);
-                    }
+                    } catch {}
                   }}
-                  className="px-3 py-1 text-xs font-medium bg-destructive/10 text-destructive border border-destructive/20 rounded-md hover:bg-destructive/20 transition-colors flex items-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed"
+                  className="px-3 py-1 text-xs font-medium bg-destructive/10 text-destructive border border-destructive/20 rounded-md hover:bg-destructive/20 transition-colors flex items-center gap-1"
                 >
-                  {isStopping ? <Loader2 className="w-3 h-3 animate-spin" /> : <Square className="w-3 h-3" />}
-                  {isStopping ? "Stopping..." : "Stop"}
+                  <Square className="w-3 h-3" />
+                  Stop
                 </button>
               )}
             </div>
@@ -233,10 +209,3 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
     </div>
   );
 }
-
-const steps = [
-  { id: "learning", title: "Learning Patterns", icon: Search, desc: "Extracting URL patterns from reference rows..." },
-  { id: "matching", title: "URL Matching", icon: GitMerge, desc: "Constructing & verifying target URLs..." },
-  { id: "ai-matching", title: "AI Matching", icon: Brain, desc: "Using AI to match remaining URLs..." },
-  { id: "saving", title: "Saving Results", icon: Save, desc: "Writing results to database..." },
-];
