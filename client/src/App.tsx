@@ -2,8 +2,9 @@ import { useState, useCallback } from "react";
 import { FileUpload } from "@/components/dashboard/file-upload";
 import { ProcessingView } from "@/components/dashboard/processing-view";
 import { ResultsView } from "@/components/dashboard/results-view";
-import { Globe, Languages, Sparkles, Settings } from "lucide-react";
-import { uploadFile, startJob } from "@/lib/api";
+import { Globe, Languages, Sparkles } from "lucide-react";
+import { uploadFile, startJob, LANG_OPTIONS, type LangCode } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import heroBg from "./assets/hero-bg.png";
 
 function App() {
@@ -11,19 +12,37 @@ function App() {
   const [file, setFile] = useState<File | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selectedLangs, setSelectedLangs] = useState<LangCode[]>(["en"]);
 
   const handleFileSelect = (selectedFile: File) => {
     setFile(selectedFile);
     setError(null);
   };
 
+  const toggleLang = (code: LangCode) => {
+    setSelectedLangs((prev) => {
+      if (prev.includes(code)) {
+        if (prev.length === 1) return prev;
+        return prev.filter((c) => c !== code);
+      }
+      const ordered = LANG_OPTIONS.map((o) => o.code).filter(
+        (c) => prev.includes(c) || c === code
+      );
+      return ordered;
+    });
+  };
+
   const handleStartProcessing = async () => {
     if (!file) return;
+    if (selectedLangs.length === 0) {
+      setError("Pick at least one target language.");
+      return;
+    }
     setError(null);
     setAppState("uploading");
 
     try {
-      const result = await uploadFile(file, ["en", "fr"]);
+      const result = await uploadFile(file, selectedLangs);
       setJobId(result.jobId);
       await startJob(result.jobId, 85);
       setAppState("processing");
@@ -44,6 +63,8 @@ function App() {
     setError(null);
   };
 
+  const targetLabel = selectedLangs.map((c) => c.toUpperCase()).join(", ") || "—";
+
   return (
     <div className="min-h-screen bg-background relative overflow-hidden font-sans text-foreground">
       <div className="absolute inset-0 z-0 opacity-40 pointer-events-none">
@@ -63,10 +84,13 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-4">
-            <button className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors px-3 py-1.5 rounded-lg hover:bg-muted/50" data-testid="button-languages">
+            <div
+              className="flex items-center gap-2 text-sm font-medium text-muted-foreground px-3 py-1.5 rounded-lg bg-muted/30"
+              data-testid="text-target-languages"
+            >
               <Languages className="w-4 h-4" />
-              <span>Target: EN, FR</span>
-            </button>
+              <span>Target: {targetLabel}</span>
+            </div>
           </div>
         </header>
 
@@ -84,6 +108,36 @@ function App() {
               </div>
 
               <div className="space-y-6">
+                <div className="space-y-3">
+                  <p className="text-sm font-medium text-muted-foreground">Target language(s)</p>
+                  <div className="flex justify-center gap-2 flex-wrap" data-testid="lang-picker">
+                    {LANG_OPTIONS.map((opt) => {
+                      const active = selectedLangs.includes(opt.code);
+                      const onlyOne = active && selectedLangs.length === 1;
+                      return (
+                        <button
+                          key={opt.code}
+                          type="button"
+                          onClick={() => toggleLang(opt.code)}
+                          disabled={appState === "uploading" || onlyOne}
+                          data-testid={`button-lang-${opt.code}`}
+                          aria-pressed={active}
+                          title={onlyOne ? `${opt.name} — at least one language must stay selected` : opt.name}
+                          className={cn(
+                            "px-4 py-2 text-sm font-semibold rounded-full border transition-colors",
+                            active
+                              ? "bg-primary text-primary-foreground border-primary shadow-sm"
+                              : "bg-card text-muted-foreground border-border hover:bg-muted/50",
+                            (appState === "uploading" || onlyOne) && "cursor-not-allowed opacity-90"
+                          )}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 <FileUpload onFileSelect={handleFileSelect} isProcessing={appState === "uploading"} />
 
                 {error && (

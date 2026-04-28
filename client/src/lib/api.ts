@@ -5,6 +5,7 @@ export interface JobStatus {
   totalUrls: number;
   processedUrls: number;
   matchedUrls: number;
+  prefilledUrls: number;
   targetLanguages: string[];
   currentStep: string;
   createdAt: string;
@@ -23,12 +24,16 @@ export interface MappingResultRow {
   arabicUrl: string | null;
   confidenceEn: number | null;
   confidenceFr: number | null;
+  confidenceRu: number | null;
+  confidenceAr: number | null;
   matchMethodEn: string | null;
   matchMethodFr: string | null;
+  matchMethodRu: string | null;
+  matchMethodAr: string | null;
   details: any;
 }
 
-export async function uploadFile(file: File, languages: string[] = ["en", "fr"]): Promise<{ jobId: string; totalUrls: number; sheets: string[] }> {
+export async function uploadFile(file: File, languages: string[]): Promise<{ jobId: string; totalUrls: number; sheets: string[] }> {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("languages", languages.join(","));
@@ -76,3 +81,24 @@ export async function stopJob(jobId: string): Promise<void> {
 export function getDownloadUrl(jobId: string): string {
   return `/api/jobs/${jobId}/download`;
 }
+
+export const LANG_OPTIONS = [
+  { code: "en", label: "EN", name: "English" },
+  { code: "fr", label: "FR", name: "French" },
+  { code: "ru", label: "RU", name: "Russian" },
+  { code: "ar", label: "AR", name: "Arabic" },
+] as const;
+
+export type LangCode = typeof LANG_OPTIONS[number]["code"];
+
+export const LANG_META: Record<string, {
+  label: string;
+  urlKey: keyof MappingResultRow;
+  confKey: keyof MappingResultRow;
+  methodKey: keyof MappingResultRow;
+}> = {
+  en: { label: "English URL", urlKey: "englishUrl", confKey: "confidenceEn", methodKey: "matchMethodEn" },
+  fr: { label: "French URL", urlKey: "frenchUrl", confKey: "confidenceFr", methodKey: "matchMethodFr" },
+  ru: { label: "Russian URL", urlKey: "russianUrl", confKey: "confidenceRu", methodKey: "matchMethodRu" },
+  ar: { label: "Arabic URL", urlKey: "arabicUrl", confKey: "confidenceAr", methodKey: "matchMethodAr" },
+};

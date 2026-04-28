@@ -10,9 +10,12 @@ export const mappingJobs = pgTable("mapping_jobs", {
   totalUrls: integer("total_urls").notNull().default(0),
   processedUrls: integer("processed_urls").notNull().default(0),
   matchedUrls: integer("matched_urls").notNull().default(0),
+  prefilledUrls: integer("prefilled_urls").notNull().default(0),
   targetLanguages: text("target_languages").array().notNull().default(sql`ARRAY['en','fr']`),
+  crawlPageCap: integer("crawl_page_cap").notNull().default(0),
   currentStep: text("current_step").default("idle"),
   createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
 });
 
 export const mappingResults = pgTable("mapping_results", {
@@ -28,8 +31,12 @@ export const mappingResults = pgTable("mapping_results", {
   arabicUrl: text("arabic_url"),
   confidenceEn: integer("confidence_en"),
   confidenceFr: integer("confidence_fr"),
+  confidenceRu: integer("confidence_ru"),
+  confidenceAr: integer("confidence_ar"),
   matchMethodEn: text("match_method_en"),
   matchMethodFr: text("match_method_fr"),
+  matchMethodRu: text("match_method_ru"),
+  matchMethodAr: text("match_method_ar"),
   details: jsonb("details"),
 });
 
@@ -42,7 +49,7 @@ export const translationCache = pgTable("translation_cache", {
   createdAt: timestamp("created_at").defaultNow(),
 });
 
-export const insertMappingJobSchema = createInsertSchema(mappingJobs).omit({ id: true, createdAt: true });
+export const insertMappingJobSchema = createInsertSchema(mappingJobs).omit({ id: true, createdAt: true, updatedAt: true });
 export const insertMappingResultSchema = createInsertSchema(mappingResults).omit({ id: true });
 export const insertTranslationCacheSchema = createInsertSchema(translationCache).omit({ id: true, createdAt: true });
 

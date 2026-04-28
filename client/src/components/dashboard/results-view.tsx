@@ -1,7 +1,14 @@
 import { motion } from "framer-motion";
 import { Download, RotateCcw } from "lucide-react";
 import { useEffect, useState } from "react";
-import { getJobResults, getDownloadUrl, type MappingResultRow } from "@/lib/api";
+import {
+  getJobResults,
+  getJobStatus,
+  getDownloadUrl,
+  LANG_META,
+  type MappingResultRow,
+  type JobStatus,
+} from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 interface ResultsViewProps {
@@ -9,31 +16,70 @@ interface ResultsViewProps {
   onReset: () => void;
 }
 
+function num(v: unknown): number | null {
+  return typeof v === "number" ? v : null;
+}
+
+function str(v: unknown): string | null {
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
 export function ResultsView({ jobId, onReset }: ResultsViewProps) {
   const [results, setResults] = useState<MappingResultRow[]>([]);
+  const [job, setJob] = useState<JobStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<"all" | "matched" | "unmatched">("all");
 
   useEffect(() => {
+    let cancelled = false;
     getJobResults(jobId)
-      .then(setResults)
+      .then((rows) => { if (!cancelled) setResults(rows); })
       .catch(console.error)
-      .finally(() => setLoading(false));
+      .finally(() => { if (!cancelled) setLoading(false); });
+    getJobStatus(jobId)
+      .then((status) => { if (!cancelled) setJob(status); })
+      .catch(console.error);
+    return () => { cancelled = true; };
   }, [jobId]);
 
+  const langsFromRows = (() => {
+    const seen = new Set<string>();
+    for (const r of results) {
+      for (const l of Object.keys(LANG_META)) {
+        if (str(r[LANG_META[l].urlKey]) || num(r[LANG_META[l].confKey]) !== null) {
+          seen.add(l);
+        }
+      }
+    }
+    return Array.from(seen);
+  })();
+
+  const activeLangs = (
+    job?.targetLanguages?.length
+      ? job.targetLanguages
+      : langsFromRows.length
+        ? langsFromRows
+        : ["en", "fr"]
+  ).filter((l) => LANG_META[l]);
+
+  const rowHasMatch = (r: MappingResultRow) =>
+    activeLangs.some((l) => num(r[LANG_META[l].confKey]) !== null);
+
+  const rowHasUrl = (r: MappingResultRow) =>
+    activeLangs.some((l) => str(r[LANG_META[l].urlKey]) !== null);
+
   const filtered = results.filter((r) => {
-    if (filter === "matched") return r.confidenceEn !== null || r.confidenceFr !== null;
-    if (filter === "unmatched") return r.confidenceEn === null && r.confidenceFr === null && !r.englishUrl && !r.frenchUrl;
+    if (filter === "matched") return rowHasMatch(r);
+    if (filter === "unmatched") return !rowHasMatch(r) && !rowHasUrl(r);
     return true;
   });
 
-  const matchedCount = results.filter((r) => r.confidenceEn !== null || r.confidenceFr !== null).length;
-  const prefilledCount = results.filter((r) => (r.englishUrl || r.frenchUrl) && r.confidenceEn === null && r.confidenceFr === null).length;
+  const matchedCount = results.filter(rowHasMatch).length;
+  const prefilledCount = results.filter((r) => rowHasUrl(r) && !rowHasMatch(r)).length;
+  const unmatchedCount = results.length - matchedCount - prefilledCount;
 
   if (loading) {
-    return (
-      <div className="text-center py-12 text-muted-foreground">Loading results...</div>
-    );
+    return <div className="text-center py-12 text-muted-foreground">Loading results...</div>;
   }
 
   return (
@@ -41,8 +87,11 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
       <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-semibold tracking-tight" data-testid="text-results-title">Mapping Results</h2>
-          <p className="text-muted-foreground text-sm">
+          <p className="text-muted-foreground text-sm" data-testid="text-results-summary">
             {results.length} URLs processed. {matchedCount} new matches found. {prefilledCount} already mapped.
+            {activeLangs.length > 0 && (
+              <> Target: <span className="font-medium text-foreground">{activeLangs.map((l) => l.toUpperCase()).join(", ")}</span>.</>
+            )}
           </p>
         </div>
         <div className="flex gap-3">
@@ -68,7 +117,7 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
               filter === f ? "bg-primary text-primary-foreground border-primary" : "bg-card text-muted-foreground border-border hover:bg-muted/50"
             )}
           >
-            {f} {f === "all" ? `(${results.length})` : f === "matched" ? `(${matchedCount})` : `(${results.length - matchedCount - prefilledCount})`}
+            {f} {f === "all" ? `(${results.length})` : f === "matched" ? `(${matchedCount})` : `(${unmatchedCount})`}
           </button>
         ))}
       </div>
@@ -80,16 +129,23 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
               <tr>
                 <th className="px-4 py-3 w-[60px]">#</th>
                 <th className="px-4 py-3">Source URL</th>
-                <th className="px-4 py-3">English URL</th>
-                <th className="px-4 py-3">French URL</th>
+                {activeLangs.map((l) => (
+                  <th key={l} className="px-4 py-3" data-testid={`th-${l}`}>
+                    {LANG_META[l].label}
+                  </th>
+                ))}
                 <th className="px-4 py-3 text-center w-[100px]">Confidence</th>
-                <th className="px-4 py-3 text-right w-[80px]">Method</th>
+                <th className="px-4 py-3 text-right w-[100px]">Method</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
               {filtered.slice(0, 100).map((row, idx) => {
-                const bestConfidence = Math.max(row.confidenceEn || 0, row.confidenceFr || 0);
-                const method = row.matchMethodEn || row.matchMethodFr || "";
+                const confs = activeLangs.map((l) => num(row[LANG_META[l].confKey]) || 0);
+                const bestConfidence = confs.length ? Math.max(...confs) : 0;
+                const method =
+                  activeLangs
+                    .map((l) => str(row[LANG_META[l].methodKey]))
+                    .find((m) => m && m.length > 0) || "";
 
                 return (
                   <motion.tr
@@ -104,12 +160,19 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
                     <td className="px-4 py-3 font-mono text-xs text-foreground/80 max-w-[220px] truncate" title={row.sourceUrl}>
                       {row.sourceUrl}
                     </td>
-                    <td className="px-4 py-3 font-mono text-xs text-muted-foreground max-w-[220px] truncate" title={row.englishUrl || ""}>
-                      {row.englishUrl || <span className="italic opacity-50">—</span>}
-                    </td>
-                    <td className="px-4 py-3 font-mono text-xs text-muted-foreground max-w-[220px] truncate" title={row.frenchUrl || ""}>
-                      {row.frenchUrl || <span className="italic opacity-50">—</span>}
-                    </td>
+                    {activeLangs.map((l) => {
+                      const url = str(row[LANG_META[l].urlKey]);
+                      return (
+                        <td
+                          key={l}
+                          className="px-4 py-3 font-mono text-xs text-muted-foreground max-w-[220px] truncate"
+                          title={url || ""}
+                          data-testid={`cell-${l}-${row.id}`}
+                        >
+                          {url || <span className="italic opacity-50">—</span>}
+                        </td>
+                      );
+                    })}
                     <td className="px-4 py-3 text-center">
                       {bestConfidence > 0 ? (
                         <div className="flex items-center justify-center gap-2">
