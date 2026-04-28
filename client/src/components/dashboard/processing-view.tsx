@@ -110,7 +110,17 @@ export function ProcessingView({ jobId, onComplete }: ProcessingViewProps) {
     <div className="w-full max-w-2xl mx-auto bg-card border border-border rounded-xl overflow-hidden shadow-sm" data-testid="processing-view">
       <div className="p-6 border-b border-border bg-muted/30">
         <div className="flex items-center justify-between mb-4">
-          <h3 className="font-medium text-foreground">Processing Engine</h3>
+          <div className="flex items-center gap-3">
+            <h3 className="font-medium text-foreground">Processing Engine</h3>
+            {job && job.targetLanguages?.length > 0 && (
+              <span
+                className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-primary/10 text-primary border border-primary/20"
+                data-testid="text-job-languages"
+              >
+                Target: {job.targetLanguages.map((l) => l.toUpperCase()).join(", ")}
+              </span>
+            )}
+          </div>
           {job && (
             <span className="text-xs font-mono text-muted-foreground" data-testid="text-url-count">
               {job.processedUrls}/{job.totalUrls} URLs
