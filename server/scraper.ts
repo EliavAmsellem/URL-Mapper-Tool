@@ -587,7 +587,10 @@ export function mineSegmentsFromInventory(
   opts?: { pairingCap?: number; minVotes?: number },
 ): { segments: Map<string, string>; pairings: number; promoted: number } {
   const pairingCap = opts?.pairingCap ?? 10000;
-  const minVotes = opts?.minVotes ?? 2;
+  // 3 independent pairings required to promote a mined segment — two is easy
+  // to reach spuriously with RU/AR transliterations; a third support reduces
+  // false-positive segment pollution significantly.
+  const minVotes = opts?.minVotes ?? 3;
   const confirmed = tabPatterns.segmentMap.get(lang) || new Map<string, string>();
   const tgtRoot = langRoot(tabPatterns, lang);
   const srcRoot = langSrcRoot(tabPatterns, lang);
@@ -1404,6 +1407,33 @@ export function mergeInventories(invs: (CrawlInventory | null | undefined)[]): C
     }
   }
   return merged;
+}
+
+/**
+ * Return a new CrawlInventory containing only the entries from `parent` whose
+ * URL path starts with `scopePath` (e.g. "/RussianHomePage/Benefits/"). Used
+ * to coalesce crawl results across tabs: when a broader parent scope was
+ * already crawled, a child scope can reuse the subset rather than re-crawling.
+ */
+export function filterInventoryToScope(parent: CrawlInventory, scopePath: string): CrawlInventory {
+  const child: CrawlInventory = {
+    urls: new Set(),
+    normalizedIndex: new Map(),
+    tailIndex: new Map(),
+    titleIndex: new Map(),
+    lastSegWordIndex: new Map(),
+  };
+  const lower = scopePath.replace(/\/?$/, "/").toLowerCase();
+  for (const url of Array.from(parent.urls)) {
+    try {
+      const p = new URL(url).pathname.toLowerCase();
+      if (!p.startsWith(lower)) continue;
+    } catch { continue; }
+    addToInventory(child, url);
+    const title = parent.titleIndex.get(url);
+    if (title) child.titleIndex.set(url, title);
+  }
+  return child;
 }
 
 function normalizeUrlPath(url: string): string {
@@ -2565,6 +2595,12 @@ function normalizeTitle(title: string): string {
   return title
     .toLowerCase()
     .replace(/[-–—_|:]/g, " ")
+    // Arabic: remove diacritics (harakat) and tatweel so ضَمان and ضمان tokenize identically
+    .replace(/[ً-ٟـ]/gu, "")
+    // Arabic: normalize Hamza variants (أ إ ء آ) to bare alef so root-form tokens collide
+    .replace(/[أإءآ]/gu, "ا")
+    // Arabic: strip the definite article ال prefix from each word
+    .replace(/(^|\s)ال(\S)/gu, "$1$2")
     .replace(/\s+/g, " ")
     .replace(/\b(the|a|an|le|la|les|un|une|des|de|du|et|and|or|ou|in|en|à|au|aux)\b/g, "")
     .replace(/\b(и|в|на|с|по|из|для|это|как|что|но|от|до|не|он|она|они|его|её|их|был|быть|о|к|за)\b/g, "")
@@ -3661,7 +3697,12 @@ export async function titleMatchUnmatched(
           // below can show "candidate existed but score N below floor F".
           const cheapTopN: Array<{ url: string; score: number }> = [];
           const cheapMeta: { ambiguous?: boolean; rejectedReason?: string } = {};
-          rowMatches[lang] = matchByTitle(translated, inv, minSim, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow, cheapTopN, cheapMeta);
+          // Disable the segment rail for RU/AR unconditionally: Latin
+          // transliterations of HE slugs share zero tokens with RU/AR slug
+          // transliterations regardless of whether the tab was detected as
+          // cross-script. The tab-level flag may be false on tabs with too
+          // few ref pairs, incorrectly leaving the rail active for RU/AR.
+          rowMatches[lang] = matchByTitle(translated, inv, minSim, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang] || lang === "ru" || lang === "ar", scopeNarrow, cheapTopN, cheapMeta);
           rowTopN[lang] = cheapTopN;
           if (cheapMeta.ambiguous) {
             (rowMeta[lang] = rowMeta[lang] || {}).ambiguous = true;
@@ -3694,7 +3735,7 @@ export async function titleMatchUnmatched(
             // cheap-pass topN (cheap ran first); cap at 3 by score.
             const semTopN: Array<{ url: string; score: number }> = [];
             const semMeta: { ambiguous?: boolean; rejectedReason?: string } = {};
-            const semMatch = matchByTitleSemantic(trEmb, inv, minCos, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang], scopeNarrow, semTopN, semMeta);
+            const semMatch = matchByTitleSemantic(trEmb, inv, minCos, effectiveRoots, effectiveDepths, sourceSegments, isCrossScript[lang] || lang === "ru" || lang === "ar", scopeNarrow, semTopN, semMeta);
             if (semMeta.ambiguous) {
               (rowMeta[lang] = rowMeta[lang] || {}).ambiguous = true;
               rowMeta[lang]!.rejectedReason = semMeta.rejectedReason;
@@ -4642,7 +4683,21 @@ export async function aiMatchUnmatched(
       for (const l of langs) {
         const t = allTranslations[l].get(row.title);
         if (t) parts.push(`  Title (${langLabels[l]} translation): ${t}`);
-        if (row.needs[l]) parts.push(`  Needs: ${langNeedLabel[l]}`);
+        if (row.needs[l]) {
+          parts.push(`  Needs: ${langNeedLabel[l]}`);
+          // For mixed-scope batches: if this row has a confirmed sibling scope
+          // for this lang but the batch has no uniform fence, add an explicit
+          // per-row constraint so the model doesn't pick from the wrong subtree.
+          // (For uniformly-scoped batches the STRICTLY RESTRICTED inventory
+          // block already carries this constraint; this is the mixed-scope gap.)
+          if (batchScope[l] === null) {
+            const rowScope = computeSiblingScope(row.sourceUrl, l, tabPatterns);
+            if (rowScope) {
+              const tgtPath = "/" + rowScope.mappedTgtDir.join("/") + "/";
+              parts.push(`  CONSTRAINT: ${langLabels[l]} URL must be under ${tgtPath} (or null)`);
+            }
+          }
+        }
       }
       return parts.join("\n");
     }).join("\n\n");

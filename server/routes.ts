@@ -47,6 +47,7 @@ import {
   mineSegmentsFromInventory,
   computeSiblingScope,
   isUrlUnderTgtDir,
+  filterInventoryToScope,
   type MatchTrace,
   type RowLangTrace,
   setTrace,
@@ -1141,6 +1142,28 @@ async function matchTab(
         log(`    [${langLabels[l]}] anchor ${scopePath}/ cached: fetched=${inv.urls.size} titled=${inv.titleIndex.size}`);
         continue;
       }
+      // Check if a broader parent scope was already crawled for this lang.
+      // If so, filter it down to this scope rather than re-crawling. This
+      // avoids redundant HTTP requests when different tabs share a common
+      // target root but each infer a slightly narrower anchor.
+      const scopeLower = (scopePath + "/").toLowerCase();
+      let parentHit: CrawlInventory | null = null;
+      for (const [key, cachedInv] of Array.from(crawlCache.entries())) {
+        const pfx = `${origin}|${l}:`;
+        if (!key.startsWith(pfx)) continue;
+        const cachedScopeLower = ("/" + key.slice(pfx.length) + "/").toLowerCase();
+        if (scopeLower.startsWith(cachedScopeLower) && cachedScopeLower.length < scopeLower.length) {
+          parentHit = cachedInv;
+          break;
+        }
+      }
+      if (parentHit) {
+        const sub = filterInventoryToScope(parentHit, scopePath);
+        crawlCache.set(cacheKey, sub);
+        perLangInvs[l].push(sub);
+        log(`    [${langLabels[l]}] anchor ${scopePath}/ reused from parent crawl: ${sub.urls.size} URLs (${parentHit.urls.size} in parent)`);
+        continue;
+      }
       const anchorSeeds = crawlScopes.length === 1
         ? allSeeds
         : allSeeds.filter(s => {
@@ -1184,8 +1207,10 @@ async function matchTab(
   // seeding `Pages/`, `Pages/default.aspx`, and `Pages/Forms/AllItems.aspx`
   // (the listing page now exposes its child links since the scraper change).
   const COVERAGE_MIN_THRESHOLD = 3;
-  const BACKFILL_CAP_PER_SUBTREE = 200;
-  const MAX_BACKFILL_SUBTREES_PER_LANG = 50;
+  // Defaults raised (200→500, 50→100) to cover deeper RU/AR subtrees that the
+  // initial crawl misses. Override with env vars when profiling cost vs. recall.
+  const BACKFILL_CAP_PER_SUBTREE = parseInt(process.env.LINGUAMAP_BACKFILL_CAP_PER_SUBTREE || "500", 10);
+  const MAX_BACKFILL_SUBTREES_PER_LANG = parseInt(process.env.LINGUAMAP_MAX_BACKFILL_SUBTREES || "100", 10);
   const coverageStats: Record<TargetLang, { totalInventory: number; mappedSubtrees: number; sparseBefore: number; sparseAfter: number; backfilledUrls: number }> = {
     en: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
     fr: { totalInventory: 0, mappedSubtrees: 0, sparseBefore: 0, sparseAfter: 0, backfilledUrls: 0 },
@@ -1391,7 +1416,7 @@ async function matchTab(
         const inv = inventories[l];
         if (!inv) continue;
         const beforeSize = tabPatterns.segmentMap.get(l)?.size || 0;
-        const result = mineSegmentsFromInventory(unmatchedSources, inv, tabPatterns, l, { pairingCap: 10000, minVotes: 2 });
+        const result = mineSegmentsFromInventory(unmatchedSources, inv, tabPatterns, l, { pairingCap: 10000 });
         if (result.promoted > 0) {
           let segMap = tabPatterns.segmentMap.get(l);
           if (!segMap) { segMap = new Map(); tabPatterns.segmentMap.set(l, segMap); }
@@ -1579,9 +1604,14 @@ async function matchTab(
   // and look for `<link rel="alternate" hreflang>` (and `<a hreflang>`) that
   // points into our crawled inventory. This is especially valuable on
   // cross-script tabs where the segment learner has no usable training pairs.
-  // We only run harvest for tabs that have at least one cross-script lang
-  // among the active langs, to bound the cost (one HTTP GET per missed row).
-  const harvestNeeded = langs.some(l => crossScriptLangs[l] && inventories[l]);
+  // Run harvest whenever any lang still has unmatched rows and a crawled
+  // inventory. The 1500-source cap already bounds cost. The old gate
+  // (crossScriptLangs only) skipped tabs with too few RU/AR ref pairs —
+  // exactly the tabs where hreflang discovery matters most.
+  const harvestNeeded = langs.some(l => inventories[l] && needsMatching.some(r => {
+    const m = matchResults.get(r.rowIndex);
+    return r[needsKey[l]] && (!m || !getResultUrl(m, l));
+  }));
   if (harvestNeeded) {
     // Group missed rows by sourceUrl so duplicate sources are fetched once and
     // every row sharing that source benefits from any found alternate links.
